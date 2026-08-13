@@ -1,0 +1,12 @@
+.env
+.mcp.json
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+.claude/
+.venv/
+node_modules/
+*.png
+# Gli screenshot della dashboard sono generati da un mock e vanno versionati.
+!docs/img/*.png

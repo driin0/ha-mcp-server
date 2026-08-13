@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+.env.sample
+.mcp.json
+.claude
+__pycache__
+*.py[cod]
+.pytest_cache
+.DS_Store
+docs
+compose.yaml
+deploy.sh
+README.md
