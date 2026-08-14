@@ -107,8 +107,15 @@ jobs:
           for f in /tmp/digests/*; do
             REFS="$REFS ${IMAGE}@$(cat "$f")"
           done
+          # Le label del build finiscono solo nei config delle immagini per
+          # architettura: l'index che le raccoglie nasce senza. GitHub legge
+          # l'index, e senza image.source non collega il package a questo
+          # repository — lo lascia dov'era quando il nome è stato registrato.
           # shellcheck disable=SC2086
           docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.source=https://github.com/driin0/ha-mcp-server" \
+            --annotation "index:org.opencontainers.image.licenses=AGPL-3.0-or-later" \
+            --annotation "index:org.opencontainers.image.description=MCP server for Home Assistant" \
             -t "${IMAGE}:${{ steps.version.outputs.value }}" \
             -t "${IMAGE}:latest" \
             $REFS
