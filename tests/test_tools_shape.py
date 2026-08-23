@@ -99,7 +99,7 @@ def test_device_triggers_wraps_a_success(fake_ha):
 def test_trace_list_says_traces_are_volatile(fake_ha):
     from tools.automations import get_automation_trace
 
-    fake_ha.ws_result("automation/trace/list", [])
+    fake_ha.ws_result("trace/list", [])
 
     result = get_automation_trace("automation.nas_shutdown")
 
@@ -169,6 +169,58 @@ def test_blueprints_reports_a_ws_failure_as_an_error(fake_ha):
     assert "blueprints" not in result
 
 
+def test_create_automation_from_blueprint_posts_to_the_rest_config_endpoint(fake_ha):
+    """config/automation/config/save does not exist as a WebSocket command -
+    Home Assistant only exposes automation config writes over REST, at the
+    same endpoint create_automation() already posts to. A WS-shaped
+    assertion (fake_ha.ws_calls) would pass this vacuously even on the old,
+    broken implementation, so this checks the REST call fakeha.py records
+    instead."""
+    import json as _json
+
+    from tools.automations import create_automation_from_blueprint
+
+    fake_ha.rest_responses["/api/config/automation/config/"] = (
+        200, {"result": "ok"})
+
+    result = create_automation_from_blueprint(
+        blueprint_path="homeassistant/motion_trigger.yaml",
+        alias="Hallway motion",
+        input_values={"motion_entity": "binary_sensor.hallway",
+                     "light_entity": "light.hallway"},
+    )
+
+    sent = fake_ha.rest_calls[-1]
+    assert sent.url.path == "/api/config/automation/config/hallway_motion"
+    assert sent.method == "POST"
+    body = _json.loads(sent.content)
+    assert body["alias"] == "Hallway motion"
+    assert body["use_blueprint"] == {
+        "path": "homeassistant/motion_trigger.yaml",
+        "input": {"motion_entity": "binary_sensor.hallway",
+                  "light_entity": "light.hallway"},
+    }
+    assert result["automation_id"] == "hallway_motion"
+    assert result["entity_id"] == "automation.hallway_motion"
+
+
+def test_create_automation_from_blueprint_raises_on_a_failed_call(fake_ha):
+    import httpx
+    import pytest
+
+    from tools.automations import create_automation_from_blueprint
+
+    fake_ha.fail_rest("/api/config/automation/config/", status=400,
+                      message="Message malformed: not a file")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        create_automation_from_blueprint(
+            blueprint_path="homeassistant/motion_trigger.yaml",
+            alias="Hallway motion",
+            input_values={},
+        )
+
+
 def test_schedules_wraps_a_success(fake_ha):
     from tools.automations import list_schedules
 
@@ -216,7 +268,7 @@ def test_schedules_other_failure_surfaces_as_itself(fake_ha):
 def test_automation_trace_reports_a_ws_failure_as_an_error(fake_ha):
     from tools.automations import get_automation_trace
 
-    fake_ha.fail_ws("automation/trace/list", code="not_found",
+    fake_ha.fail_ws("trace/list", code="not_found",
                     message="Unknown automation")
 
     result = get_automation_trace("automation.nas_shutdown")
@@ -228,9 +280,9 @@ def test_automation_trace_reports_a_ws_failure_as_an_error(fake_ha):
 def test_automation_trace_limit_truncates(fake_ha):
     from tools.automations import get_automation_trace
 
-    fake_ha.ws_result("automation/trace/list", [
+    fake_ha.ws_result("trace/list", [
         {"run_id": f"run{n}", "state": "stopped", "timestamp": {},
-         "trigger": "time", "error": None, "script_execution": "finished"}
+         "last_step": "action/0", "error": None, "script_execution": "finished"}
         for n in range(5)
     ])
 
@@ -242,12 +294,30 @@ def test_automation_trace_limit_truncates(fake_ha):
     assert result["traces"][0]["run_id"] == "run0"
 
 
+def test_automation_trace_uses_trace_list_with_domain_and_item_id(fake_ha):
+    """automation/trace/list does not exist on Home Assistant - the real
+    command is trace/list, scoped to the automation domain via `domain`,
+    with the automation's object_id (no 'automation.' prefix) as `item_id`.
+    A shape-only assertion cannot catch a wrong command or a wrong argument
+    name, so this pins the actual outgoing request."""
+    from tools.automations import get_automation_trace
+
+    fake_ha.ws_result("trace/list", [])
+
+    get_automation_trace("automation.nas_shutdown")
+
+    sent = fake_ha.ws_calls[-1]
+    assert sent["type"] == "trace/list"
+    assert sent["domain"] == "automation"
+    assert sent["item_id"] == "nas_shutdown"
+
+
 # ---- tools/system.py --------------------------------------------------
 
 def test_config_entries_reports_the_failure_it_used_to_hide(fake_ha):
     from tools.system import list_config_entries
 
-    fake_ha.fail_ws("config_entries/list", code="unauthorized",
+    fake_ha.fail_ws("config_entries/get", code="unauthorized",
                     message="Admin required")
 
     result = list_config_entries()
@@ -259,7 +329,7 @@ def test_config_entries_reports_the_failure_it_used_to_hide(fake_ha):
 def test_config_entries_distinguishes_no_match_from_failure(fake_ha):
     from tools.system import list_config_entries
 
-    fake_ha.ws_result("config_entries/list", [
+    fake_ha.ws_result("config_entries/get", [
         {"entry_id": "1", "domain": "hue", "title": "Hue", "state": "loaded"},
     ])
 
@@ -277,7 +347,7 @@ def test_config_entries_survives_a_null_title(fake_ha):
     merge resolution that drops the other) still fails this test."""
     from tools.system import list_config_entries
 
-    fake_ha.ws_result("config_entries/list", [
+    fake_ha.ws_result("config_entries/get", [
         {"entry_id": "1", "domain": "hue", "title": None, "state": "loaded"},
         {"entry_id": "2", "domain": "hue", "title": "Hue", "state": "loaded"},
         {"entry_id": "3", "domain": None, "title": "Orphaned", "state": "loaded"},
@@ -293,11 +363,11 @@ def test_config_entries_uses_its_own_command(fake_ha):
     slip on the command name is invisible to a shape-only assertion."""
     from tools.system import list_config_entries
 
-    fake_ha.ws_result("config_entries/list", [])
+    fake_ha.ws_result("config_entries/get", [])
 
     list_config_entries()
 
-    assert fake_ha.ws_calls[-1]["type"] == "config_entries/list"
+    assert fake_ha.ws_calls[-1]["type"] == "config_entries/get"
 
 
 def test_repairs_wraps_a_success(fake_ha):
@@ -599,24 +669,44 @@ def test_list_entities_by_integration_reports_a_ws_failure_as_an_error(fake_ha):
 
 
 def test_get_entity_exposure_wraps_a_success(fake_ha):
+    """homeassistant/expose_entity/list answers with exposed_entities as a
+    dict keyed by entity_id (assistant_id -> bool), not a list of records -
+    a different shape from the nonexistent command this used to call."""
     from tools.diagnostics import get_entity_exposure
 
-    fake_ha.ws_result("conversation/expose_entity/list", {"exposed_entities": [
-        {"entity_id": "light.kitchen", "assistants": {"assist": True, "amazon_alexa": False}},
-        {"entity_id": "sensor.temp", "assistants": {}},
-    ]})
+    fake_ha.ws_result("homeassistant/expose_entity/list", {"exposed_entities": {
+        "light.kitchen": {"conversation": True, "cloud.alexa": False},
+        "sensor.temp": {},
+    }})
 
     result = get_entity_exposure()
 
     assert result["total"] == 1
     assert result["entities"][0]["entity_id"] == "light.kitchen"
-    assert fake_ha.ws_calls[-1]["type"] == "conversation/expose_entity/list"
+    assert result["entities"][0]["assistants"] == {"conversation": True, "cloud.alexa": False}
+
+
+def test_get_entity_exposure_uses_its_own_command_with_no_arguments(fake_ha):
+    """conversation/expose_entity/list does not exist on Home Assistant. The
+    real command is homeassistant/expose_entity/list, and - unlike the
+    command this used to send - it takes no arguments at all: Home
+    Assistant always reports every exposed entity, it cannot be scoped to
+    a set of entity_ids."""
+    from tools.diagnostics import get_entity_exposure
+
+    fake_ha.ws_result("homeassistant/expose_entity/list", {"exposed_entities": {}})
+
+    get_entity_exposure()
+
+    sent = fake_ha.ws_calls[-1]
+    assert sent["type"] == "homeassistant/expose_entity/list"
+    assert set(sent.keys()) == {"type"}
 
 
 def test_get_entity_exposure_reports_a_ws_failure_as_an_error(fake_ha):
     from tools.diagnostics import get_entity_exposure
 
-    fake_ha.fail_ws("conversation/expose_entity/list", code="unauthorized",
+    fake_ha.fail_ws("homeassistant/expose_entity/list", code="unauthorized",
                     message="Admin required")
 
     result = get_entity_exposure()

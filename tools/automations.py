@@ -231,8 +231,9 @@ def get_automation_trace(entity_id: str, limit: int = 5) -> dict:
     empty result means "no traces available", never "the automation never ran".
     """
     result = _ws({
-        "type": "automation/trace/list",
-        "automation_id": entity_id.replace("automation.", ""),
+        "type": "trace/list",
+        "domain": "automation",
+        "item_id": entity_id.replace("automation.", ""),
     })
     if err := ws_error(result):
         return err
@@ -241,7 +242,7 @@ def get_automation_trace(entity_id: str, limit: int = 5) -> dict:
             "run_id": t.get("run_id"),
             "state": t.get("state"),
             "timestamp": t.get("timestamp"),
-            "trigger": t.get("trigger"),
+            "last_step": t.get("last_step"),
             "error": t.get("error"),
             "script_execution": t.get("script_execution"),
         }
@@ -289,20 +290,33 @@ def create_automation_from_blueprint(
     blueprint_path: e.g. 'homeassistant/motion_trigger.yaml'
     alias: name for the new automation
     input_values: dict of blueprint input variables
+
+    Home Assistant has no WebSocket command for saving an automation config -
+    only a REST endpoint, the same one create_automation() uses.
     """
-    result = _ws({
-        "type": "config/automation/config/save",
-        "config": {
-            "alias": alias,
-            "use_blueprint": {
-                "path": blueprint_path,
-                "input": input_values,
-            },
+    automation_id = _slug(alias)
+    payload = {
+        "alias": alias,
+        "use_blueprint": {
+            "path": blueprint_path,
+            "input": input_values,
         },
-    })
-    if not result.get("success", True):
-        return {"error": result.get("error", {}).get("message", "unknown error")}
-    return {"created": True, "alias": alias, "blueprint": blueprint_path}
+    }
+    with httpx.Client() as client:
+        r = client.post(
+            f"{HA_URL}/api/config/automation/config/{automation_id}",
+            headers=HEADERS,
+            json=payload,
+            timeout=15,
+        )
+        r.raise_for_status()
+        return {
+            "automation_id": automation_id,
+            "entity_id": f"automation.{automation_id}",
+            "alias": alias,
+            "blueprint": blueprint_path,
+            "result": r.json(),
+        }
 
 
 @mcp.tool()

@@ -528,18 +528,25 @@ def get_entity_exposure() -> dict:
     (Assist, Alexa, Google Assistant, etc.).
 
     Returns: {total, returned, offset, note?, entities: [{entity_id,
-             assistants: {assist: bool, amazon_alexa: bool, google_assistant: bool}}]}
+             assistants: {<assistant_id>: bool, ...}}]}
     Only returns entities with at least one exposure setting configured.
+    assistant_id is whatever Home Assistant itself calls that integration -
+    typically "conversation" for Assist, "cloud.alexa" and
+    "cloud.google_assistant" for the Nabu Casa cloud integrations - passed
+    through unchanged rather than remapped to a fixed set of names, since
+    that set is not part of any stable API.
+    Home Assistant does not support filtering this list by entity_id: it
+    always reports every exposed entity.
     Useful to audit what the voice assistant can control.
     """
-    result = _ws({"type": "conversation/expose_entity/list"})
+    result = _ws({"type": "homeassistant/expose_entity/list"})
     if err := ws_error(result):
         return err
-    exposed = (result["result"] or {}).get("exposed_entities", [])
+    exposed = (result["result"] or {}).get("exposed_entities", {})
     out = [
-        {"entity_id": e.get("entity_id"), "assistants": e.get("assistants", {})}
-        for e in exposed
-        if e.get("assistants")
+        {"entity_id": entity_id, "assistants": assistants}
+        for entity_id, assistants in exposed.items()
+        if assistants
     ]
     out.sort(key=lambda x: x["entity_id"])
     return envelope(out, key="entities")

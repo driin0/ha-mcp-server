@@ -33,7 +33,7 @@ def list_config_entries(domain: str = "") -> dict:
     An empty `entries` with total 0 means the filter matched nothing. A failed
     call returns {error, detail} instead — the two used to look identical.
     """
-    result = _ws({"type": "config_entries/list"})
+    result = _ws({"type": "config_entries/get"})
     if err := ws_error(result):
         return err
     out = [
