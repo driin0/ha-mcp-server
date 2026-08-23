@@ -11,14 +11,18 @@ saved conversations assume a bare list, they need updating — see below.
 
 ### Changed — breaking
 
-- Every tool that used to return a bare list now returns an object instead:
-  `{total, returned, offset, note?, <collection>: [...]}`. A list return made
-  the MCP SDK emit one response block per element, and none at all for an
-  empty list, so a caller could not tell "no results" from "the call failed",
-  and a truncated result had nowhere to say so. Failures now arrive as
-  `{error, detail}` at the top level — never as an element of a result list.
-  This applies to 54 tools across 30 files; the full inventory is enforced by
-  a test that fails if any tool is missed.
+- Every tool that used to return a bare list now returns an object instead.
+  52 of the 54 converted tools get the shape
+  `{total, returned, offset, note?, <collection>: [...]}`; the other two are
+  exceptions with their own single-record shape — see two bullets below. A
+  list return made the MCP SDK emit one response block per element, and none
+  at all for an empty list, so a caller could not tell "no results" from "the
+  call failed", and a truncated result had nowhere to say so. Failures now
+  arrive as `{error, detail}` at the top level — never as an element of a
+  result list. This applies to 54 tools across 29 files (not counting
+  `tools/_base.py`, which holds `_ws_commands` and `_ws_multi` — helpers, not
+  tools); the full inventory is enforced by a test that fails if any tool is
+  missed.
 - `list_automations` gains `search`, `label`, `limit` (default 50, 0 for no
   limit) and `offset`, and reports each automation's `labels`. A prompt or
   script that called `list_automations()` expecting the complete set now
@@ -57,7 +61,14 @@ saved conversations assume a bare list, they need updating — see below.
   `hacs.py`, `tags.py`, `users.py`, `dashboards.py` and `automations.py`. In
   one documented case this was read as "the integration was removed" during
   an incident and produced a wrong diagnosis; it was actually an
-  unregistered command.
+  unregistered command. **This class of fault is not closed.** `.get("result",
+  [])` and its variants (`.get("result", {})`, `.get("result", r)`, …) remain
+  at 41 sites across 16 files — all inside tools that already returned
+  `dict` before this branch, and so fell outside this sweep, which only
+  touched tools returning a bare list or a list literal on failure. `areas.py`
+  is the largest single remainder, with 10 sites, even after this release
+  separately fixed four of its worst cases in `list_devices`, `list_labels`,
+  `list_floors` and `get_entity_registry`.
 - Ten tools returned their error as an element of the result list instead of
   as the top-level response, so a caller iterating results could read a
   failure as if it were a record: `list_device_triggers`,

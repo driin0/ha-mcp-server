@@ -3,11 +3,22 @@
 The os.environ block MUST run before anything imports tools._base, which
 raises RuntimeError when HA_URL or HA_TOKEN is missing. conftest.py is
 imported by pytest before the test modules, which is what makes this work.
+
+HA_URL and HA_TOKEN are forced, not defaulted with setdefault(): a
+maintainer with a real HA_URL exported in their shell (pointed at their
+own Home Assistant) would otherwise keep it, and the conformance sweep in
+test_conformance.py calls every zero-argument tool - including
+restart_homeassistant and create_backup. It is safe today only because
+httpx.Client, _ws and _ws_multi are all patched onto the in-process fake;
+forcing these two values here is the second, independent guard, in case a
+future tool ever reaches Home Assistant some other way (httpx.AsyncClient,
+requests, a raw socket) that the fixture in this file does not patch.
+MCP_SECRET is left as setdefault() - it never selects a real instance.
 """
 import os
 
-os.environ.setdefault("HA_URL", "http://fake-ha.test:8123")
-os.environ.setdefault("HA_TOKEN", "fake-token")
+os.environ["HA_URL"] = "http://fake-ha.test:8123"
+os.environ["HA_TOKEN"] = "fake-token"
 os.environ.setdefault("MCP_SECRET", "fake-secret")
 
 import sys  # noqa: E402

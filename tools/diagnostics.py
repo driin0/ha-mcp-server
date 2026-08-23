@@ -417,6 +417,9 @@ def get_live_context() -> dict:
     }
 
 
+_MAX_DEPENDENCY_PROBES = 200
+
+
 @mcp.tool()
 def get_entity_dependencies(entity_id: str) -> dict:
     """
@@ -425,8 +428,14 @@ def get_entity_dependencies(entity_id: str) -> dict:
     Searches through the full config of each automation and script (triggers,
     conditions, actions). Useful before renaming or deleting an entity.
 
-    Returns: {entity_id, automations: [...], scripts: [...], total_searched}
+    Returns: {entity_id, automations: [...], scripts: [...],
+             total_automations_searched, total_scripts_searched,
+             failed_checks, note?}
     Note: searches up to 200 automations and 200 scripts in parallel.
+    failed_checks counts probes that could not be completed (an
+    authorisation failure, a deleted config entry, a network error) - those
+    are not evidence the entity is unreferenced, and a non-zero count comes
+    with a note saying the result may be incomplete.
     """
     import concurrent.futures
     import json as _json
@@ -440,56 +449,76 @@ def get_entity_dependencies(entity_id: str) -> dict:
     scripts = [s for s in all_states if s["entity_id"].startswith("script.")]
 
     def _check_automation(state):
+        """Returns (match_or_None, ok). ok is False when the probe itself
+        could not be completed - a non-200 or a raised exception - which
+        must not be read as "this automation does not reference the
+        entity"."""
         slug = state["entity_id"].removeprefix("automation.")
         auto_id = state.get("attributes", {}).get("id") or slug
         try:
             with httpx.Client() as c:
                 r = c.get(f"{HA_URL}/api/config/automation/config/{auto_id}", headers=HEADERS, timeout=5)
                 if r.status_code != 200:
-                    return None
+                    return None, False
                 if entity_id in _json.dumps(r.json()):
                     return {
                         "entity_id": state["entity_id"],
                         "name": state.get("attributes", {}).get("friendly_name", state["entity_id"]),
                         "type": "automation",
-                    }
+                    }, True
         except Exception:
-            pass
-        return None
+            # Broad on purpose: one unreadable automation config must not
+            # crash the whole dependency search. The failure is no longer
+            # discarded, though - it is counted as a failed check below.
+            return None, False
+        return None, True
 
     def _check_script(state):
+        """See _check_automation: same (match_or_None, ok) contract."""
         slug = state["entity_id"].removeprefix("script.")
         try:
             with httpx.Client() as c:
                 r = c.get(f"{HA_URL}/api/config/script/config/{slug}", headers=HEADERS, timeout=5)
                 if r.status_code != 200:
-                    return None
+                    return None, False
                 if entity_id in _json.dumps(r.json()):
                     return {
                         "entity_id": state["entity_id"],
                         "name": state.get("attributes", {}).get("friendly_name", state["entity_id"]),
                         "type": "script",
-                    }
+                    }, True
         except Exception:
-            pass
-        return None
+            return None, False
+        return None, True
 
     dep_automations, dep_scripts = [], []
+    failed_checks = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
-        for res in pool.map(_check_automation, automations[:200]):
+        for res, ok in pool.map(_check_automation, automations[:_MAX_DEPENDENCY_PROBES]):
             if res:
                 dep_automations.append(res)
-        for res in pool.map(_check_script, scripts[:200]):
+            if not ok:
+                failed_checks += 1
+        for res, ok in pool.map(_check_script, scripts[:_MAX_DEPENDENCY_PROBES]):
             if res:
                 dep_scripts.append(res)
+            if not ok:
+                failed_checks += 1
 
-    return {
+    result = {
         "entity_id": entity_id,
         "automations": sorted(dep_automations, key=lambda x: x["name"]),
         "scripts": sorted(dep_scripts, key=lambda x: x["name"]),
-        "total_automations_searched": len(automations),
-        "total_scripts_searched": len(scripts),
+        "total_automations_searched": min(len(automations), _MAX_DEPENDENCY_PROBES),
+        "total_scripts_searched": min(len(scripts), _MAX_DEPENDENCY_PROBES),
+        "failed_checks": failed_checks,
     }
+    if failed_checks:
+        result["note"] = (
+            f"{failed_checks} probe(s) could not be completed - the result "
+            "may be incomplete"
+        )
+    return result
 
 
 @mcp.tool()

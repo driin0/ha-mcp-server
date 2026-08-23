@@ -406,16 +406,16 @@ def test_config_flows_wraps_a_success(fake_ha):
     assert fake_ha.ws_calls[-1]["type"] == "config_entries/flow/progress"
 
 
-def test_config_flows_reports_the_failure_instead_of_an_empty_list(fake_ha):
+def test_config_flows_ws_failure_and_rest_404_reports_the_failure(fake_ha):
     """Both the WS attempt and its REST fallback used to collapse into a
     bare `return []` on total failure — the same failure-hiding pattern
-    this task removes, found a second time in the same file."""
+    this task removes, found a second time in the same file. This exercises
+    the REST fallback's status_code != 200 branch: FakeHA has no route for
+    /api/config/config_entries/flow, so it 404s (a Response, not a raise)."""
     from tools.system import list_config_flows
 
     fake_ha.fail_ws("config_entries/flow/progress", code="unauthorized",
                     message="Admin required")
-    # FakeHA has no route for /api/config/config_entries/flow, so it 404s
-    # and the REST fallback fails too.
 
     result = list_config_flows()
 
@@ -423,23 +423,29 @@ def test_config_flows_reports_the_failure_instead_of_an_empty_list(fake_ha):
     assert "flows" not in result
 
 
-def test_config_flows_double_failure_reports_both_layers(fake_ha):
+def test_config_flows_ws_failure_and_rest_connection_error_reports_both_layers(fake_ha):
     """A bare `except Exception: pass` around the REST fallback used to
     discard its failure entirely, so a caller with both a broken WebSocket
     connection and a broken REST fallback could not tell the second layer
-    had even been tried. Both must now be visible in one response."""
+    had even been tried. Both must now be visible in one response.
+
+    This must exercise the except-Exception branch specifically, not the
+    status_code != 200 branch above: a 404 is a Response and never reaches
+    the except at all, so the REST call is made to raise instead - the way
+    a connection-level failure (refused connection, DNS failure) looks to
+    httpx, as opposed to a request that reached Home Assistant and got a
+    404 back."""
     from tools.system import list_config_flows
 
     fake_ha.fail_ws("config_entries/flow/progress", code="unauthorized",
                     message="Admin required")
-    # FakeHA has no route for /api/config/config_entries/flow -> 404,
-    # exercising the REST-also-failed branch.
+    fake_ha.raise_rest("/api/config/config_entries/flow")
 
     result = list_config_flows()
 
     assert result["error"] == "unauthorized"
     assert result["rest_detail"]
-    assert "404" in result["rest_detail"]
+    assert "raised" in result["rest_detail"]
     assert "flows" not in result
 
 
@@ -695,6 +701,68 @@ def test_call_service_raises_on_a_failed_call(fake_ha):
         call_service("light", "turn_on", entity_id="light.kitchen")
 
 
+def test_get_entity_dependencies_caps_the_searched_count_at_the_probe_limit(fake_ha):
+    """total_automations_searched used to report len(automations) - the
+    unsliced list - while the probe loop only ever walks automations[:200].
+    On an instance with more than 200 automations that overstated how much
+    was actually searched."""
+    from tools.diagnostics import get_entity_dependencies
+
+    fake_ha.states = [
+        {"entity_id": f"automation.a{n}", "state": "on",
+         "attributes": {"friendly_name": f"A{n}", "id": f"a{n}"}}
+        for n in range(250)
+    ]
+
+    result = get_entity_dependencies("light.kitchen")
+
+    assert result["total_automations_searched"] == 200
+    assert result["total_scripts_searched"] == 0
+
+
+def test_get_entity_dependencies_counts_failed_checks(fake_ha):
+    """FakeHA has no route for /api/config/automation/config/<id>, so every
+    probe 404s by default - a failed check, not evidence the automation
+    does not reference the entity. failed_checks must say so, and a note
+    must warn the answer may be incomplete."""
+    from tools.diagnostics import get_entity_dependencies
+
+    fake_ha.states = [
+        {"entity_id": "automation.a1", "state": "on",
+         "attributes": {"friendly_name": "A1", "id": "a1"}},
+        {"entity_id": "automation.a2", "state": "on",
+         "attributes": {"friendly_name": "A2", "id": "a2"}},
+    ]
+
+    result = get_entity_dependencies("light.kitchen")
+
+    assert result["failed_checks"] == 2
+    assert "may be incomplete" in result["note"]
+
+
+def test_get_entity_dependencies_failed_checks_rises_with_more_failed_probes(fake_ha):
+    """One probe succeeding and one failing must report exactly one failed
+    check, not zero (fails open) and not two (over-counts a good probe)."""
+    from tools.diagnostics import get_entity_dependencies
+
+    fake_ha.states = [
+        {"entity_id": "automation.a1", "state": "on",
+         "attributes": {"friendly_name": "A1", "id": "a1"}},
+        {"entity_id": "automation.a2", "state": "on",
+         "attributes": {"friendly_name": "A2", "id": "a2"}},
+    ]
+    # a1's probe succeeds (200, no reference inside); a2's has no fake
+    # route and 404s, the way an authorisation failure or a deleted
+    # automation would.
+    fake_ha.rest_responses["/api/config/automation/config/a1"] = (
+        200, {"trigger": [], "condition": [], "action": []})
+
+    result = get_entity_dependencies("light.kitchen")
+
+    assert result["failed_checks"] == 1
+    assert result["automations"] == []
+
+
 # ---- tools/areas.py -----------------------------------------------------
 
 def test_list_areas_wraps_a_success(fake_ha):
@@ -747,6 +815,72 @@ def test_list_areas_reports_a_floor_registry_failure_too(fake_ha):
 
     assert result["error"] == "unauthorized"
     assert "areas" not in result
+
+
+def test_list_devices_reports_a_ws_failure_as_an_error(fake_ha):
+    """A failed device registry read must not become an empty `devices: []`
+    - that reads as "no devices exist", not "the call failed"."""
+    from tools.areas import list_devices
+
+    fake_ha.fail_ws("config/device_registry/list", code="unauthorized",
+                    message="Admin required")
+
+    result = list_devices()
+
+    assert result["error"] == "unauthorized"
+    assert "devices" not in result
+
+
+def test_list_devices_wraps_a_success_through_the_shared_envelope(fake_ha):
+    """list_devices used to hand-roll its own {total, returned, offset,
+    devices} dict, which never emitted a truncation note. envelope() does."""
+    from tools.areas import list_devices
+
+    fake_ha.ws_result("config/device_registry/list", [
+        {"id": f"d{n}", "name": f"Device {n:02d}"} for n in range(5)
+    ])
+
+    result = list_devices(limit=2)
+
+    assert result["total"] == 5
+    assert result["returned"] == 2
+    assert "2 of 5" in result["note"]
+
+
+def test_list_labels_reports_a_ws_failure_as_an_error(fake_ha):
+    from tools.areas import list_labels
+
+    fake_ha.fail_ws("config/label_registry/list", code="unauthorized",
+                    message="Admin required")
+
+    result = list_labels()
+
+    assert result["error"] == "unauthorized"
+    assert "labels" not in result
+
+
+def test_list_floors_reports_a_ws_failure_as_an_error(fake_ha):
+    from tools.areas import list_floors
+
+    fake_ha.fail_ws("config/floor_registry/list", code="unauthorized",
+                    message="Admin required")
+
+    result = list_floors()
+
+    assert result["error"] == "unauthorized"
+    assert "floors" not in result
+
+
+def test_get_entity_registry_reports_a_ws_failure_as_an_error(fake_ha):
+    from tools.areas import get_entity_registry
+
+    fake_ha.fail_ws("config/entity_registry/get", code="not_found",
+                    message="Entity not registered")
+
+    result = get_entity_registry("light.ghost")
+
+    assert result["error"] == "not_found"
+    assert "entity_id" not in result
 
 
 def test_entity_labels_names_its_entity(fake_ha):
@@ -904,7 +1038,11 @@ def test_list_lovelace_resources_failure_is_an_error_not_a_record(fake_ha):
 
 # ---- tools/hacs.py ---------------------------------------------------------
 
-def test_hacs_failure_is_an_error_not_a_record(fake_ha):
+def test_list_hacs_repos_reports_hacs_not_installed(fake_ha):
+    """list_hacs_repos and search_hacs route their ws_error() failure
+    through hacs.py's _hacs_check, same as hacs_info and every other tool
+    in this file - an unknown_command (the custom component not loaded)
+    is reported as the friendly hacs_not_available, not the raw WS code."""
     from tools.hacs import list_hacs_repos
 
     fake_ha.fail_ws("hacs/repositories/list", code="unknown_command",
@@ -912,7 +1050,22 @@ def test_hacs_failure_is_an_error_not_a_record(fake_ha):
 
     result = list_hacs_repos()
 
-    assert result["error"] == "unknown_command"
+    assert result["error"] == "hacs_not_available"
+    assert "repositories" not in result
+
+
+def test_list_hacs_repos_reports_other_failures_unmodified(fake_ha):
+    """Only "the component isn't loaded" becomes hacs_not_available - any
+    other failure (e.g. a permissions error) must not be misdiagnosed as
+    HACS being absent."""
+    from tools.hacs import list_hacs_repos
+
+    fake_ha.fail_ws("hacs/repositories/list", code="unauthorized",
+                    message="Admin required")
+
+    result = list_hacs_repos()
+
+    assert result["error"] == "unauthorized"
     assert "repositories" not in result
 
 
@@ -973,7 +1126,9 @@ def test_search_hacs_reports_a_truthful_total_past_the_cap(fake_ha):
     assert "20 of 25" in result["note"]
 
 
-def test_search_hacs_failure_is_an_error_not_a_record(fake_ha):
+def test_search_hacs_reports_hacs_not_installed(fake_ha):
+    """Same translation as list_hacs_repos: an instance without HACS gets
+    the friendly hacs_not_available, not the raw WS unknown_command."""
     from tools.hacs import search_hacs
 
     fake_ha.fail_ws("hacs/repositories/list", code="unknown_command",
@@ -981,7 +1136,7 @@ def test_search_hacs_failure_is_an_error_not_a_record(fake_ha):
 
     result = search_hacs(query="anything")
 
-    assert result["error"] == "unknown_command"
+    assert result["error"] == "hacs_not_available"
     assert "repositories" not in result
 
 

@@ -95,13 +95,15 @@ def list_devices(area_id: str = "", search: str = "", limit: int = 50, offset: i
 
     area_id: filter by area (use list_areas() to find IDs)
     search:  filter by name substring (case-insensitive)
-    limit:   max devices to return (default 50)
+    limit:   max devices to return (default 50, 0 for no limit)
     offset:  skip first N devices (for pagination)
 
-    Returns: {total, returned, offset, devices: [{id, name, manufacturer, model, area_id, labels}]}
+    Returns: {total, returned, offset, note?, devices: [{id, name, manufacturer, model, area_id, labels}]}
     """
     r = _ws({"type": "config/device_registry/list"})
-    devices = r.get("result", [])
+    if err := ws_error(r):
+        return err
+    devices = r["result"]
     if area_id:
         devices = [d for d in devices if d.get("area_id") == area_id]
     trimmed = [
@@ -118,9 +120,7 @@ def list_devices(area_id: str = "", search: str = "", limit: int = 50, offset: i
     trimmed.sort(key=lambda x: x["name"].lower())
     if search:
         trimmed = [d for d in trimmed if search.lower() in d["name"].lower()]
-    total = len(trimmed)
-    page = trimmed[offset: offset + limit]
-    return {"total": total, "returned": len(page), "offset": offset, "devices": page}
+    return envelope(trimmed, key="devices", limit=limit, offset=offset)
 
 
 @mcp.tool()
@@ -156,7 +156,9 @@ def rename_entity(entity_id: str, name: str) -> dict:
 def list_labels() -> dict:
     """List all labels defined in Home Assistant, sorted by name."""
     r = _ws({"type": "config/label_registry/list"})
-    labels = sorted(r.get("result", []), key=lambda x: x.get("name", "").lower())
+    if err := ws_error(r):
+        return err
+    labels = sorted(r["result"], key=lambda x: x.get("name", "").lower())
     return {"total": len(labels), "labels": labels}
 
 
@@ -267,7 +269,9 @@ def bulk_set_entity_labels(entity_ids: list, labels: list) -> dict:
 def list_floors() -> dict:
     """List all floors defined in Home Assistant, sorted by level."""
     r = _ws({"type": "config/floor_registry/list"})
-    floors = sorted(r.get("result", []), key=lambda x: x.get("level", 0))
+    if err := ws_error(r):
+        return err
+    floors = sorted(r["result"], key=lambda x: x.get("level", 0))
     return {"total": len(floors), "floors": floors}
 
 
@@ -302,7 +306,9 @@ def get_entity_registry(entity_id: str) -> dict:
     Useful for diagnosing entity configuration or finding the device an entity belongs to.
     """
     r = _ws({"type": "config/entity_registry/get", "entity_id": entity_id})
-    result = r.get("result") or {}
+    if err := ws_error(r):
+        return err
+    result = r["result"]
     return {
         "entity_id": result.get("entity_id"),
         "name": result.get("name") or result.get("original_name"),

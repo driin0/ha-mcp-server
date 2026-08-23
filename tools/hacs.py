@@ -46,15 +46,17 @@ def list_hacs_repos(
              name, category, installed, installed_version, available_version,
              pending_upgrade, custom, stars, description}]}
 
-    A failed call (e.g. HACS not installed) returns {error, detail} instead -
-    the WebSocket command's own code and message, unmodified.
+    A failed call because HACS is not installed returns
+    {error: hacs_not_available, detail: ...}, same as every other HACS
+    tool in this file. Any other failure returns the WebSocket command's
+    own code and message, unmodified.
     """
     msg: dict = {"type": "hacs/repositories/list"}
     if category:
         msg["categories"] = [category]
     result = _ws(msg)
     if err := ws_error(result):
-        return err
+        return _hacs_check(result) or err
     repos = result["result"]
     if installed_only:
         repos = [r for r in repos if r.get("installed")]
@@ -95,16 +97,17 @@ def search_hacs(query: str, category: str = "", limit: int = 20) -> dict:
 
     `total` counts every repository that matched the query/category, not
     just the page returned - raise `limit` or narrow the query when it
-    exceeds `returned`. A failed call (e.g. HACS not installed) returns
-    {error, detail} instead - the WebSocket command's own code and message,
-    unmodified.
+    exceeds `returned`. A failed call because HACS is not installed returns
+    {error: hacs_not_available, detail: ...}, same as every other HACS tool
+    in this file. Any other failure returns the WebSocket command's own
+    code and message, unmodified.
     """
     msg: dict = {"type": "hacs/repositories/list"}
     if category:
         msg["categories"] = [category]
     result = _ws(msg)
     if err := ws_error(result):
-        return err
+        return _hacs_check(result) or err
     repos = result["result"]
     q = query.lower()
     matches = [

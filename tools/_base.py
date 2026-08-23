@@ -208,6 +208,8 @@ def envelope(items, *, key="items", total=None, offset=0, limit=None, note="") -
     if not note:
         if count == 0:
             note = f"no {key} found"
+        elif not page:
+            note = f"offset {offset} is past the end of {count} {key}"
         elif offset + len(page) < count:
             note = (f"{len(page)} of {count} shown - raise limit, "
                     f"advance offset, or refine the filters")

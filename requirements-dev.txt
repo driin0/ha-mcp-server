@@ -1,2 +1,5 @@
+# Not used by the pytest suite (tests/ runs entirely against an in-process
+# fake, no browser involved) - it's here for scripts/screenshots.py, which
+# drives a real Chromium against the dashboard mock to regenerate docs/img/.
 playwright>=1.62
 pytest>=8.0

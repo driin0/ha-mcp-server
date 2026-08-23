@@ -115,6 +115,23 @@ def test_the_last_page_is_not_reported_as_truncated():
     assert "note" not in result
 
 
+def test_offset_past_the_end_is_announced():
+    """An offset beyond the collection used to fall through both note
+    branches: count != 0 skips "no {key} found", and offset + len(page) <
+    count is false once page is empty (offset + 0 is not less than count).
+    The result was an empty page with no note at all - indistinguishable
+    from a bug rather than a caller-supplied offset with nothing left."""
+    rows = [{"n": n} for n in range(3)]
+
+    result = envelope(rows, key="rows", offset=10)
+
+    assert result["total"] == 3
+    assert result["returned"] == 0
+    assert result["rows"] == []
+    assert "note" in result
+    assert "offset 10" in result["note"]
+
+
 def test_total_and_limit_together_are_refused():
     with pytest.raises(ValueError):
         envelope([{"n": 1}], key="rows", total=99, limit=10)

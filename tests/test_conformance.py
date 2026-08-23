@@ -15,6 +15,15 @@ TOOLS_DIR = pathlib.Path(__file__).resolve().parents[1] / "tools"
 # The three tools that legitimately return a string.
 STRING_TOOLS = {"get_addon_logs", "get_error_log", "render_template"}
 
+# Zero-argument tools the runtime sweep below must never actually call, even
+# against the fake: they are safe today only because httpx.Client, _ws and
+# _ws_multi are all patched by the fake_ha fixture, and a future tool using
+# some other transport (httpx.AsyncClient, requests, a raw socket) would
+# turn a routine `pytest` run into a real restart - or backup job - against
+# whatever HA_URL happens to be set to. See tests/conftest.py for the other
+# half of this defence (HA_URL/HA_TOKEN forced, not defaulted).
+DESTRUCTIVE_TOOLS = {"restart_homeassistant", "create_backup"}
+
 # Tools still returning a list. Empty: the sweep is complete, and this check
 # now applies to all 182 tools, and to every tool written from here on.
 NOT_YET_CONVERTED = set()
@@ -102,7 +111,9 @@ def test_every_zero_arg_tool_actually_returns_a_dict_at_runtime(fake_ha):
     argument — the large majority of the 182, mostly the *_control /
     create_* / delete_* actions — and nothing about a tool that raises here
     (an unmapped WebSocket command, a REST route the fake does not serve, a
-    real bug). Both kinds are skipped, not failed. The breakdown is emitted
+    real bug). Both kinds are skipped, not failed. Tools in DESTRUCTIVE_TOOLS
+    are skipped too, on purpose: they are not called even against the fake
+    (see the comment on DESTRUCTIVE_TOOLS above). The breakdown is emitted
     as a warning (visible in the summary of a plain `pytest tests/` run, no
     flags needed) rather than only printed, so the gap stays visible instead
     of requiring `-s` to see it — a `print()` on a passing test is invisible
@@ -114,9 +125,13 @@ def test_every_zero_arg_tool_actually_returns_a_dict_at_runtime(fake_ha):
     covered = []
     skipped_needs_args = []
     skipped_raised = []
+    skipped_destructive = []
 
     for fname, node in _tools():
         if node.name in STRING_TOOLS:
+            continue
+        if node.name in DESTRUCTIVE_TOOLS:
+            skipped_destructive.append(node.name)
             continue
         module = importlib.import_module(f"tools.{fname[:-3]}")
         func = getattr(module, node.name)
@@ -149,7 +164,8 @@ def test_every_zero_arg_tool_actually_returns_a_dict_at_runtime(fake_ha):
     total_candidates = sum(
         1 for _, node in _tools() if node.name not in STRING_TOOLS
     )
-    assert len(covered) + len(skipped_needs_args) + len(skipped_raised) == total_candidates
+    assert (len(covered) + len(skipped_needs_args) + len(skipped_raised)
+            + len(skipped_destructive)) == total_candidates
     # A regression to near-zero coverage (e.g. every tool starting to raise
     # against the fake) would make the offenders check above vacuously pass.
     assert len(covered) >= 15, (
@@ -165,14 +181,18 @@ def test_every_zero_arg_tool_actually_returns_a_dict_at_runtime(fake_ha):
     print(
         f"\nruntime dict-shape sweep: {len(covered)} covered, "
         f"{len(skipped_needs_args)} skipped (need arguments), "
-        f"{len(skipped_raised)} skipped (raised against the fake)"
+        f"{len(skipped_raised)} skipped (raised against the fake), "
+        f"{len(skipped_destructive)} skipped (destructive, never called)"
     )
     print("skipped, need arguments:", sorted(skipped_needs_args))
     print("skipped, raised:", sorted(skipped_raised))
+    print("skipped, destructive:", sorted(skipped_destructive))
 
     warnings.warn(
         f"runtime shape check covered {len(covered)} of {total_candidates} "
         f"tools; {len(skipped_needs_args)} skipped (need arguments), "
-        f"{len(skipped_raised)} skipped (raised): {sorted(skipped_raised)}",
+        f"{len(skipped_raised)} skipped (raised): {sorted(skipped_raised)}; "
+        f"{len(skipped_destructive)} skipped (destructive, never called): "
+        f"{sorted(skipped_destructive)}",
         stacklevel=2,
     )

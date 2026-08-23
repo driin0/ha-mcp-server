@@ -87,6 +87,19 @@ The tools live in `tools/`, one module per area, and register themselves through
 `tools/_base.py`. `web.py` serves the dashboard; `stats.py` keeps the call
 counters behind it.
 
+### Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/
+```
+
+Runs against an in-process fake Home Assistant, no real instance needed. A
+normal run prints a warning stating how much of the tool surface the runtime
+conformance check actually covers (it calls every tool that takes no
+arguments and confirms it returns the expected shape) — that is a
+disclosure, not noise, so don't silence warnings to make it go away.
+
 ### A note on the base image
 
 The image is built on `python:3.13-alpine` **on purpose**, and its Alpine and

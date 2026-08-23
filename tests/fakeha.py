@@ -45,6 +45,12 @@ class FakeHA:
         # below, so a test can make any REST path - not just an unrouted one
         # - fail the way Home Assistant does.
         self.rest_responses = {}
+        # REST failures that never produce a Response at all - a connection
+        # refused, a DNS failure, a timeout. {"/api/config/...": ConnectError(...)}.
+        # Same fragment-matching rule as rest_responses, and checked first:
+        # a request the transport itself could not complete never reaches
+        # Home Assistant, so there is no status code to distinguish it by.
+        self.rest_raises = {}
         # /api/history/period/<start>: {entity_id: [state, state, ...]}.
         # Home Assistant's real shape is a list of lists, one inner list per
         # requested entity; an entity absent here means "no data", which is
@@ -73,6 +79,9 @@ class FakeHA:
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.rest_calls.append(request)
         path = request.url.path
+        for fragment, exc in self.rest_raises.items():
+            if fragment in path:
+                raise exc
         for fragment, (status, body) in self.rest_responses.items():
             if fragment in path:
                 return httpx.Response(status, json=body)
@@ -148,3 +157,12 @@ class FakeHA:
         way Home Assistant does for a rejected service call, a bad auth
         token, or a broken integration."""
         self.rest_responses[path_fragment] = (status, {"message": message})
+
+    def raise_rest(self, path_fragment: str, exc: Exception | None = None):
+        """Make any REST call whose path contains `path_fragment` raise
+        instead of returning a Response - a connection-level failure (the
+        request never reaches Home Assistant), as opposed to fail_rest()
+        which simulates a request that arrived and was rejected there.
+        Defaults to httpx.ConnectError, the shape httpx raises for a
+        refused connection."""
+        self.rest_raises[path_fragment] = exc or httpx.ConnectError("Connection refused")
