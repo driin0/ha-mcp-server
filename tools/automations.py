@@ -150,7 +150,10 @@ def create_automation(
 
     Returns: {automation_id, entity_id, enabled, verified, state, result} on
     a config Home Assistant accepted, or an error() envelope - "id_collision"
-    (see `overwrite` above) or "automation_not_registered"/
+    (see `overwrite` above), "collision_check_failed" when that check
+    itself could not be performed (a transient error reading the existing
+    config - nothing is created; pass overwrite=True to proceed without
+    the check if you are sure), or "automation_not_registered"/
     "automation_not_disabled"/"automation_state_unverified" when the
     entity's state after creation could not confirm what was requested.
 
@@ -176,11 +179,40 @@ def create_automation(
     if not overwrite:
         # automation_id doubles as its own slug here (nothing exists yet
         # to read a different config id from), so this is a single GET
-        # with no fallback attempt - see _fetch_config()'s docstring. A
-        # 404 (no such id) falls through as "no collision" the same way
-        # it always did.
-        with httpx.Client() as client:
-            _, existing = _fetch_config(automation_id, automation_id, client)
+        # with no fallback attempt: automation_id == slug, so
+        # _fetch_config()'s `if automation_id != slug` guard never fires
+        # and no second, identical request is sent - see its own
+        # docstring. A 404 (no such id) still falls through as "no
+        # collision", same as always.
+        #
+        # Every OTHER non-2xx status (a transient 500, an unauthorized
+        # 401) used to fall through the same way as a 404 - the old
+        # comment here said a transient failure "should not block a
+        # legitimate create". That was wrong: this check exists so a
+        # lossy slug cannot silently replace someone else's automation,
+        # and a check that cannot run and proceeds anyway has re-enabled
+        # exactly the silent replacement it guards against - the same
+        # shape of fault as an is_state() read on a renamed entity, in a
+        # different costume. It is not a fallthrough any more:
+        # _fetch_config() raises via its own raise_for_status() for
+        # anything but a 404, and that is caught here and reported as
+        # its own named error() - "the check could not be performed" -
+        # instead of either silently vouching for a state it never
+        # confirmed, or escaping as a bare, uncaught HTTPStatusError.
+        try:
+            with httpx.Client() as client:
+                _, existing = _fetch_config(automation_id, automation_id, client)
+        except httpx.HTTPStatusError as exc:
+            return error(
+                "collision_check_failed",
+                f"Could not confirm whether {entity_id!r} already holds a "
+                "different automation - the collision check itself failed "
+                f"({exc.response.status_code}), so nothing was created. "
+                "Pass overwrite=True to proceed deliberately without this "
+                "check, if you are sure no other automation occupies this id.",
+                automation_id=automation_id, entity_id=entity_id,
+                status=exc.response.status_code,
+            )
         if existing is not None:
             existing_alias = existing.get("alias", "")
             if existing_alias != name:

@@ -258,6 +258,67 @@ def test_create_automation_calling_again_with_the_same_name_is_not_a_collision(f
     assert fake_ha.automation_configs["morning_lights"]["trigger"] == ["updated"]
 
 
+def test_create_automation_collision_check_sends_exactly_one_request_when_absent(fake_ha):
+    """_fetch_config()'s slug-fallback is a no-op here: create_automation()
+    passes automation_id as both its own id and its own slug, so a 404 on
+    the first GET must never trigger a second, identical one - see
+    _fetch_config()'s own `if automation_id != slug` guard."""
+    from tools.automations import create_automation
+
+    create_automation("Morning lights", trigger=[], action=[])
+
+    config_gets = [
+        c for c in fake_ha.rest_calls
+        if c.method == "GET"
+        and c.url.path == "/api/config/automation/config/morning_lights"
+    ]
+    assert len(config_gets) == 1
+
+
+def test_create_automation_reports_a_failed_collision_check_instead_of_raising(fake_ha):
+    """A transient failure reading the existing config (a 500, an
+    unauthorized 401) used to fall through as "no collision", silently
+    re-enabling the exact lossy-slug replacement this check exists to
+    prevent. It must now refuse - named, not a bare HTTPStatusError - and
+    create nothing."""
+    from tools.automations import create_automation
+
+    fake_ha.fail_rest("/api/config/automation/config/", status=500,
+                      message="Internal Server Error")
+
+    result = create_automation("Morning lights", trigger=[], action=[])
+
+    assert result["error"] == "collision_check_failed"
+    assert result["status"] == 500
+    assert "morning_lights" not in fake_ha.automation_configs
+
+
+def test_create_automation_overwrite_proceeds_despite_a_failed_collision_check(fake_ha):
+    """overwrite=True skips the collision check entirely - a broken GET on
+    that same config endpoint must not stop a create that never attempts
+    to read it. Only the collision-check GET is broken here (not the
+    create POST that follows, to the same path), which fail_rest() cannot
+    express on its own since it is not method-aware."""
+    import httpx
+
+    from tools.automations import create_automation
+
+    real_handle = fake_ha.handle
+
+    def handle_get_fails(request):
+        if (request.method == "GET"
+                and request.url.path == "/api/config/automation/config/morning_lights"):
+            return httpx.Response(500, json={"message": "Internal Server Error"})
+        return real_handle(request)
+
+    fake_ha.handle = handle_get_fails
+
+    result = create_automation("Morning lights", trigger=[], action=[], overwrite=True)
+
+    assert "error" not in result
+    assert fake_ha.automation_configs["morning_lights"]["alias"] == "Morning lights"
+
+
 def test_create_script_refuses_a_colliding_name_by_default(fake_ha):
     from tools.scripts import create_script
 
