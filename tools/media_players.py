@@ -1,6 +1,6 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, ALEXA_KEYWORDS, default_language, _ws, envelope
+from tools._base import mcp, HA_URL, HEADERS, ALEXA_KEYWORDS, default_language, _ws, envelope, ws_error
 
 
 @mcp.tool()
@@ -244,10 +244,9 @@ def browse_media(
     if media_content_id:
         msg["media_content_id"] = media_content_id
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    data = result.get("result", {})
+    if err := ws_error(result):
+        return err
+    data = result["result"] or {}
     return {
         "title": data.get("title"),
         "media_content_type": data.get("media_content_type"),

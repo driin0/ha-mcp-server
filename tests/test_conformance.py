@@ -196,3 +196,57 @@ def test_every_zero_arg_tool_actually_returns_a_dict_at_runtime(fake_ha):
         f"{sorted(skipped_destructive)}",
         stacklevel=2,
     )
+
+
+def _success_defaulted_to_true_sites():
+    """Every `<expr>.get("success", True)` call anywhere in tools/*.py.
+
+    AST-based, not a grep, for two reasons: it must not trip on the prose in
+    tools/hacs.py's docstring that explains this very bug (a docstring is an
+    ast.Constant string, never an ast.Call, so it is structurally invisible
+    here — no filename allowlist needed); and it must still catch a rewrite
+    with single quotes, `.get('success', True)`, which a text grep tuned to
+    double quotes would miss but which parses to the identical ast.Constant
+    value "success".
+    """
+    sites = []
+    for path in sorted(TOOLS_DIR.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr == "get"):
+                continue
+            if len(node.args) < 2:
+                continue
+            key, default = node.args[0], node.args[1]
+            if not (isinstance(key, ast.Constant) and key.value == "success"):
+                continue
+            if isinstance(default, ast.Constant) and default.value is True:
+                sites.append(f"{path.name}:{node.lineno}")
+    return sites
+
+
+def test_no_ws_result_defaults_a_missing_success_key_to_true():
+    """`.get("success", True)` treats a dict with no "success" key at all as
+    a success — but that is exactly the shape `_ws()` returns when the
+    connection or the authentication fails: {"error": "Auth failed: ..."},
+    no "success" key anywhere in it. Defaulting the missing key to True
+    turns that transport failure into a false success instead of an error,
+    which is how delete_user(), create_user() and 22 other call sites used
+    to report success for a write that never reached Home Assistant.
+
+    The fix is `if err := ws_error(result): return err` (tools/_base.py),
+    which treats a missing "success" key as a failure to be reported, not
+    as a default to fall back on. This test is the net that keeps the fix
+    from being undone by the next tool written by copying a neighbour.
+    """
+    offenders = _success_defaulted_to_true_sites()
+    assert not offenders, (
+        "these sites default a missing \"success\" key to True, which "
+        "silently turns a _ws() transport failure into a false success "
+        "instead of an error — replace with "
+        "`if err := ws_error(result): return err`:\n"
+        + "\n".join(offenders)
+    )

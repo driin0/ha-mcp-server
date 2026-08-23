@@ -67,10 +67,9 @@ def get_dashboard(url_path: str = "") -> dict:
         msg["url_path"] = url_path
     msg["force"] = False
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", {})
+    if err := ws_error(result):
+        return err
+    return result["result"]
 
 
 @mcp.tool()
@@ -103,10 +102,9 @@ def create_dashboard(
     if icon:
         msg["icon"] = icon
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", result)
+    if err := ws_error(result):
+        return err
+    return result["result"]
 
 
 @mcp.tool()
@@ -141,10 +139,9 @@ def update_dashboard(
     if require_admin is not None:
         msg["require_admin"] = require_admin
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", result)
+    if err := ws_error(result):
+        return err
+    return result["result"]
 
 
 @mcp.tool()
@@ -175,9 +172,8 @@ def update_dashboard_config(url_path: str, config: dict) -> dict:
     if url_path:
         msg["url_path"] = url_path
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
+    if err := ws_error(result):
+        return err
     return {"saved": True, "url_path": url_path or "default"}
 
 
@@ -196,9 +192,8 @@ def delete_dashboard(url_path: str) -> dict:
         return {"error": "not_found", "url_path": url_path,
                 "detail": "No dashboard with that url_path. Use list_dashboards()."}
     result = _ws({"type": "lovelace/dashboards/delete", "dashboard_id": dashboard_id})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
+    if err := ws_error(result):
+        return err
     return {"deleted": url_path, "success": True}
 
 
@@ -242,10 +237,9 @@ def add_lovelace_resource(url: str, resource_type: str = "module") -> dict:
     Note: HACS-installed cards are added automatically — use this for manual installs.
     """
     result = _ws({"type": "lovelace/resources/create", "url": url, "res_type": resource_type})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", {"added": True, "url": url, "type": resource_type})
+    if err := ws_error(result):
+        return err
+    return result["result"] or {"added": True, "url": url, "type": resource_type}
 
 
 @mcp.tool()
@@ -256,7 +250,6 @@ def remove_lovelace_resource(resource_id: int) -> dict:
     resource_id: integer ID (use list_lovelace_resources() to find IDs)
     """
     result = _ws({"type": "lovelace/resources/delete", "id": resource_id})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
+    if err := ws_error(result):
+        return err
     return {"deleted": resource_id, "success": True}

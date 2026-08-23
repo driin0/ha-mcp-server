@@ -1,6 +1,6 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws, envelope
+from tools._base import mcp, HA_URL, HEADERS, _ws, envelope, ws_error
 
 
 @mcp.tool()
@@ -52,10 +52,9 @@ def create_person(
     if device_trackers:
         msg["device_trackers"] = device_trackers
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", result)
+    if err := ws_error(result):
+        return err
+    return result["result"]
 
 
 @mcp.tool()
@@ -82,10 +81,9 @@ def update_person(
     if device_trackers is not None:
         msg["device_trackers"] = device_trackers
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", result)
+    if err := ws_error(result):
+        return err
+    return result["result"]
 
 
 @mcp.tool()
@@ -99,7 +97,6 @@ def delete_person(person_id: str) -> dict:
     Note: only persons created via the UI (not imported from HA user accounts) can be deleted.
     """
     result = _ws({"type": "person/delete", "person_id": person_id})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
+    if err := ws_error(result):
+        return err
     return {"deleted": person_id, "success": True}

@@ -376,10 +376,9 @@ def import_blueprint(url: str) -> dict:
     create_automation_from_blueprint() to use it.
     """
     result = _ws({"type": "blueprint/import", "url": url})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", str(err))}
-    data = result.get("result") or {}
+    if err := ws_error(result):
+        return err
+    data = result["result"] or {}
     return {
         "imported": True,
         "url": url,

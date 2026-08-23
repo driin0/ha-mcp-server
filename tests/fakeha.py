@@ -180,6 +180,21 @@ class FakeHA:
         self.ws_responses[kind] = {"id": 1, "type": "result", "success": True,
                                    "result": payload}
 
+    def fail_ws_transport(self, kind: str,
+                          message: str = "Auth failed: {'type': 'auth_invalid'}"):
+        """Make one WebSocket command fail the way `_ws()` itself does when
+        the connection or authentication fails, not the way Home Assistant
+        answers a rejected command.
+
+        A rejected command gets a `{"id", "type", "success": False, "error":
+        {...}}` frame — see fail_ws(). A transport/auth failure never gets
+        that far: `_ws_commands` returns a bare `{"error": "Auth failed:
+        ..."}`, with no "success" key at all. A check written as
+        `result.get("success", True)` reads that missing key as a default
+        success, which is the bug this fixture exists to reproduce.
+        """
+        self.ws_responses[kind] = {"error": message}
+
     def fail_rest(self, path_fragment: str, status: int = 500,
                   message: str = "Internal Server Error"):
         """Make any REST call whose path contains `path_fragment` fail, the

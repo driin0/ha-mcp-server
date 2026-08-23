@@ -698,19 +698,31 @@ def get_system_health() -> dict:
     Useful for diagnosing connectivity issues with specific integrations.
     """
     result = _ws({"type": "system_health/info"})
-    if result.get("success", True) and result.get("result"):
+    if err := ws_error(result):
+        # An add-on/Supervisor-proxied connection can reject this command
+        # outright rather than just returning an empty result for it; any
+        # other failure (auth, permissions, timeout-shaped) is a different
+        # problem and must not be reported as a proxy limitation — see
+        # tools/hacs.py's _hacs_check for the same distinction made for HACS.
+        if err.get("error") not in ("unknown_command", "not_found"):
+            return err
+    else:
         data = result["result"]
-        # Flatten nested structure: {domain: {info: {key: value|{type,error}}}}
-        out = {}
-        for domain, section in data.items():
-            info = section.get("info", {}) if isinstance(section, dict) else {}
-            out[domain] = {
-                k: v if not isinstance(v, dict) else f"[{v.get('type', 'error')}] {v.get('error', '')}"
-                for k, v in info.items()
-            }
-        return out
+        if data:
+            # Flatten nested structure: {domain: {info: {key: value|{type,error}}}}
+            out = {}
+            for domain, section in data.items():
+                info = section.get("info", {}) if isinstance(section, dict) else {}
+                out[domain] = {
+                    k: v if not isinstance(v, dict) else f"[{v.get('type', 'error')}] {v.get('error', '')}"
+                    for k, v in info.items()
+                }
+            return out
+        # success but no data — the same Supervisor-proxy limitation the
+        # unknown_command branch above handles, just shaped differently.
 
-    # Fallback: WS returns null via Supervisor proxy — return basic info from REST config
+    # Fallback: system_health/info unavailable on this connection — return
+    # basic info from REST config instead.
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/config", headers=HEADERS, timeout=10)
         r.raise_for_status()

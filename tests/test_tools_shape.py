@@ -2474,3 +2474,138 @@ def test_list_users_failure_is_an_error_not_a_record(fake_ha):
 
     assert result["error"] == "unauthorized"
     assert "users" not in result
+
+
+# ─── Transport-failure frame: {"error": "..."} with no "success" key ────────
+#
+# _ws() returns this shape - not Home Assistant's {"success": False, "error":
+# {...}} - when the connection or the authentication itself fails. A check
+# written as `result.get("success", True)` reads the missing key as a
+# default success, which is how 24 call sites across these eight files used
+# to report success for a write that never reached Home Assistant. One
+# representative tool per file, reproducing that exact frame via
+# fake_ha.fail_ws_transport().
+
+def test_delete_assist_pipeline_reports_a_transport_failure_as_an_error(fake_ha):
+    from tools.assist import delete_assist_pipeline
+
+    fake_ha.fail_ws_transport("assist_pipeline/pipeline/delete")
+
+    result = delete_assist_pipeline("preferred")
+
+    assert "error" in result
+    assert "deleted" not in result
+
+
+def test_update_dashboard_config_reports_a_transport_failure_as_an_error(fake_ha):
+    from tools.dashboards import update_dashboard_config
+
+    fake_ha.fail_ws_transport("lovelace/config/save")
+
+    result = update_dashboard_config("does-not-exist", {"views": []})
+
+    assert "error" in result
+    assert "saved" not in result
+
+
+def test_delete_user_reports_a_transport_failure_as_an_error(fake_ha):
+    from tools.users import delete_user
+
+    fake_ha.fail_ws_transport("config/auth/delete")
+
+    result = delete_user("some-uid")
+
+    assert "error" in result
+    assert "deleted" not in result
+
+
+def test_delete_person_reports_a_transport_failure_as_an_error(fake_ha):
+    from tools.persons import delete_person
+
+    fake_ha.fail_ws_transport("person/delete")
+
+    result = delete_person("jane_doe")
+
+    assert "error" in result
+    assert "deleted" not in result
+
+
+def test_delete_tag_reports_a_transport_failure_as_an_error(fake_ha):
+    from tools.tags import delete_tag
+
+    fake_ha.fail_ws_transport("tag/delete")
+
+    result = delete_tag("abc123")
+
+    assert "error" in result
+    assert "deleted" not in result
+
+
+def test_browse_media_reports_a_transport_failure_as_an_error(fake_ha):
+    from tools.media_players import browse_media
+
+    fake_ha.fail_ws_transport("media_player/browse_media")
+
+    result = browse_media("media_player.living_room")
+
+    assert "error" in result
+    assert "children" not in result
+
+
+def test_import_blueprint_reports_a_transport_failure_as_an_error(fake_ha):
+    from tools.automations import import_blueprint
+
+    fake_ha.fail_ws_transport("blueprint/import")
+
+    result = import_blueprint("https://example.com/blueprint.yaml")
+
+    assert "error" in result
+    assert "imported" not in result
+
+
+def test_get_system_health_reports_a_transport_failure_as_an_error(fake_ha):
+    """The site that needed judgment rather than a mechanical swap: a plain
+    transport/auth failure must surface as itself, not be folded into the
+    "not available via Supervisor proxy" fallback note - that note asserts a
+    cause (a proxy limitation) this failure has not established."""
+    from tools.diagnostics import get_system_health
+
+    fake_ha.fail_ws_transport("system_health/info")
+
+    result = get_system_health()
+
+    assert "error" in result
+    assert "_note" not in result
+    assert "homeassistant" not in result
+
+
+def test_get_system_health_unknown_command_falls_back_to_rest_config(fake_ha):
+    """The one failure shape that *should* fall back: an unknown_command (or
+    not_found) response means this connection does not support the WS
+    command at all - e.g. a Supervisor-proxied add-on token - the same
+    discriminator tools/hacs.py's _hacs_check and list_schedules() use."""
+    from tools.diagnostics import get_system_health
+
+    fake_ha.fail_ws("system_health/info", code="unknown_command",
+                    message="Unknown command.")
+
+    result = get_system_health()
+
+    assert "error" not in result
+    assert "_note" in result
+    assert result["homeassistant"]["version"] == fake_ha.config["version"]
+
+
+def test_get_system_health_other_failure_does_not_fall_back(fake_ha):
+    """A real failure - e.g. missing permissions - must not be reported as
+    a Supervisor proxy limitation: that is a cause the tool has not
+    established."""
+    from tools.diagnostics import get_system_health
+
+    fake_ha.fail_ws("system_health/info", code="unauthorized",
+                    message="Admin required")
+
+    result = get_system_health()
+
+    assert result["error"] == "unauthorized"
+    assert "_note" not in result

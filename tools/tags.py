@@ -43,10 +43,9 @@ def create_tag(name: str, tag_id: str = "") -> dict:
     if tag_id:
         msg["tag_id"] = tag_id
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", result)
+    if err := ws_error(result):
+        return err
+    return result["result"]
 
 
 @mcp.tool()
@@ -58,10 +57,9 @@ def update_tag(tag_id: str, name: str) -> dict:
     name:   new display name
     """
     result = _ws({"type": "tag/update", "tag_id": tag_id, "name": name})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", {"tag_id": tag_id, "name": name})
+    if err := ws_error(result):
+        return err
+    return result["result"] or {"tag_id": tag_id, "name": name}
 
 
 @mcp.tool()
@@ -72,7 +70,6 @@ def delete_tag(tag_id: str) -> dict:
     tag_id: tag ID (use list_tags() to find it)
     """
     result = _ws({"type": "tag/delete", "tag_id": tag_id})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
+    if err := ws_error(result):
+        return err
     return {"deleted": tag_id, "success": True}

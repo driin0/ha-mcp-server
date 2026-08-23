@@ -55,10 +55,9 @@ def create_user(
         "group_ids": ["system-admin"] if is_admin else ["system-users"],
         "local_only": local_only,
     })
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", {}).get("user", result.get("result", {}))
+    if err := ws_error(result):
+        return err
+    return result["result"].get("user", result["result"])
 
 
 @mcp.tool()
@@ -90,10 +89,9 @@ def update_user(
     if local_only is not None:
         msg["local_only"] = local_only
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", {}).get("user", result.get("result", {}))
+    if err := ws_error(result):
+        return err
+    return result["result"].get("user", result["result"])
 
 
 @mcp.tool()
@@ -106,7 +104,6 @@ def delete_user(user_id: str) -> dict:
     Cannot delete the owner account or your own account.
     """
     result = _ws({"type": "config/auth/delete", "user_id": user_id})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
+    if err := ws_error(result):
+        return err
     return {"deleted": user_id, "success": True}
