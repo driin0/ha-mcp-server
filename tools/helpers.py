@@ -9,6 +9,18 @@ from tools._base import (
 # instance: start -> active, pause -> paused, cancel -> idle, finish -> idle.
 _TIMER_EXPECTED_STATE = {"start": "active", "pause": "paused", "cancel": "idle", "finish": "idle"}
 
+# Domains set_helper() accepts a fixed, small command vocabulary for - an
+# unrecognised value must be refused rather than folded to a default (see
+# set_helper()'s docstring). input_number/input_text/input_select/
+# input_datetime are deliberately absent: their values are free-form, not
+# drawn from a hardcoded set, so there is nothing here to validate against
+# - Home Assistant's own service call is what accepts or rejects those.
+_HELPER_FIXED_COMMANDS = {
+    "input_boolean": {"on", "off"},
+    "counter": {"increment", "decrement", "reset"},
+    "timer": set(_TIMER_EXPECTED_STATE),
+}
+
 
 def _counter_expected_value(prior_state: dict, command: str) -> float | None:
     """The value counter/{command} should produce, per Home Assistant's own
@@ -112,8 +124,21 @@ def set_helper(entity_id: str, value: str) -> dict:
     - timer:         value = 'start', 'pause', 'cancel', or 'finish'
 
     Returns: {entity_id, value, verified, state} on a call Home Assistant
-    accepted, or {error: "entity_not_found"/"unsupported_domain", ...}
-    otherwise.
+    accepted, or {error: "entity_not_found"/"unsupported_domain"/
+    "invalid_value", ...} otherwise.
+
+    input_boolean, counter and timer take a fixed, small set of commands
+    (see the domain list above) - an unrecognised `value` for one of these
+    is refused with "invalid_value" naming what is accepted, rather than
+    silently folded to a default. This used to substitute a different,
+    sometimes destructive-adjacent command instead: a timer command of
+    'stop' (not a real timer command) fell through to 'start', and a
+    typo'd 'decremnt' fell through to 'increment'. input_number, input_text,
+    input_select and input_datetime take free-form values with no fixed
+    set to validate against here - an out-of-range or unrecognised value
+    for those is either rejected by Home Assistant itself (a non-2xx
+    response, raised like any other refused call) or accepted and clamped/
+    truncated, which `verified: false` reports.
 
     `verified` is true only when the helper's own state, read back after
     the call, matches: exact string/numeric equality for input_boolean,
@@ -128,6 +153,15 @@ def set_helper(entity_id: str, value: str) -> dict:
     if domain not in HELPER_DOMAINS:
         return error("unsupported_domain", f"Unsupported helper domain: {domain}",
                      entity_id=entity_id, allowed=sorted(HELPER_DOMAINS))
+
+    if domain in _HELPER_FIXED_COMMANDS and value not in _HELPER_FIXED_COMMANDS[domain]:
+        return error(
+            "invalid_value",
+            f"Unrecognised value {value!r} for {domain} - "
+            f"accepted: {sorted(_HELPER_FIXED_COMMANDS[domain])}.",
+            entity_id=entity_id, value=value,
+            allowed=sorted(_HELPER_FIXED_COMMANDS[domain]),
+        )
 
     prior_state = None
     if domain == "counter":
@@ -162,17 +196,16 @@ def set_helper(entity_id: str, value: str) -> dict:
                             headers=HEADERS,
                             json={"entity_id": entity_id, "datetime": value}, timeout=10)
         elif domain == "counter":
-            svc = value if value in ("increment", "decrement", "reset") else "increment"
-            r = client.post(f"{HA_URL}/api/services/counter/{svc}",
+            # value is already validated against _HELPER_FIXED_COMMANDS above.
+            r = client.post(f"{HA_URL}/api/services/counter/{value}",
                             headers=HEADERS, json={"entity_id": entity_id}, timeout=10)
-        else:  # timer
-            svc = value if value in ("start", "pause", "cancel", "finish") else "start"
-            r = client.post(f"{HA_URL}/api/services/timer/{svc}",
+        else:  # timer - value is already validated against _HELPER_FIXED_COMMANDS above.
+            r = client.post(f"{HA_URL}/api/services/timer/{value}",
                             headers=HEADERS, json={"entity_id": entity_id}, timeout=10)
         r.raise_for_status()
 
     if domain == "input_boolean":
-        satisfied = lambda s: s["state"] == ("on" if value == "on" else "off")
+        satisfied = lambda s: s["state"] == value
     elif domain == "input_number":
         satisfied = lambda s: _numeric_match(s, value)
     elif domain in ("input_text", "input_select"):
@@ -186,14 +219,10 @@ def set_helper(entity_id: str, value: str) -> dict:
         satisfied = lambda s: bool(s["state"]) and s["state"] not in ("unknown", "unavailable") and (
             value.strip() in s["state"] or s["state"] in value.strip())
     elif domain == "counter":
-        # svc above already folds an unrecognised value to "increment" -
-        # the same fold applies here so the expected value matches the
-        # command that was actually sent.
-        counter_command = value if value in ("increment", "decrement", "reset") else "increment"
-        expected = _counter_expected_value(prior_state, counter_command)
+        expected = _counter_expected_value(prior_state, value)
         satisfied = lambda s: _numeric_match(s, expected)
     else:  # timer
-        expected = _TIMER_EXPECTED_STATE.get(value, _TIMER_EXPECTED_STATE["start"])
+        expected = _TIMER_EXPECTED_STATE[value]
         satisfied = lambda s: s["state"] == expected
 
     obs = observe_actuation(entity_id, satisfied)

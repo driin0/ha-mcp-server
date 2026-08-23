@@ -4,6 +4,8 @@ Tools reach Home Assistant two ways: httpx for the REST API and `_ws` for the
 WebSocket API. This module answers both from the same in-memory dataset, so a
 test can say "the registry contains X" once and have every tool see it.
 """
+import json
+
 import httpx
 
 DEFAULT_STATES = [
@@ -95,6 +97,21 @@ class FakeHA:
         # in tools/_base.py), as opposed to self.states, which answers every
         # read for that entity_id identically within one test.
         self.state_sequences = {}
+        # GET /api/states/<entity_id>: entity_ids here answer 404 for the
+        # next N reads, then fall through to the normal answer - models the
+        # gap between a config write (e.g. creating an automation) returning
+        # and Home Assistant's entity platform actually registering the
+        # entity. {entity_id: remaining_404_reads}. See delay_registration().
+        self.registration_delay = {}
+        # /api/config/automation/config/<id> and /api/config/script/config/<id>:
+        # id -> the payload last POSTed there, keyed exactly like Home
+        # Assistant's own config-storage API. A POST here also creates or
+        # updates a matching row in self.states, the way a real create
+        # immediately registers an entity (verified live) - automations
+        # default to "on" (armed) and scripts to "off" (idle), Home
+        # Assistant's own defaults for a freshly created one.
+        self.automation_configs = {}
+        self.script_configs = {}
         # Everything the tools sent, for assertions.
         self.rest_calls = []
         self.ws_calls = []
@@ -113,6 +130,9 @@ class FakeHA:
             return httpx.Response(200, json=self.states)
         if path.startswith("/api/states/"):
             wanted = path.removeprefix("/api/states/")
+            if self.registration_delay.get(wanted, 0) > 0:
+                self.registration_delay[wanted] -= 1
+                return httpx.Response(404, json={"message": "Entity not found."})
             if wanted in self.state_sequences:
                 seq = self.state_sequences[wanted]
                 state = seq.pop(0) if len(seq) > 1 else seq[0]
@@ -123,6 +143,49 @@ class FakeHA:
             return httpx.Response(404, json={"message": "Entity not found."})
         if path == "/api/config":
             return httpx.Response(200, json=self.config)
+        for domain, store, default_state in (
+            ("automation", self.automation_configs, "on"),
+            ("script", self.script_configs, "off"),
+        ):
+            prefix = f"/api/config/{domain}/config/"
+            if path.startswith(prefix):
+                item_id = path.removeprefix(prefix)
+                entity_id = f"{domain}.{item_id}"
+                if request.method == "POST":
+                    body = json.loads(request.content or b"{}")
+                    store[item_id] = body
+                    row = {"entity_id": entity_id, "state": default_state,
+                           "attributes": {"friendly_name": body.get("alias", item_id),
+                                         "id": item_id}}
+                    for i, s in enumerate(self.states):
+                        if s["entity_id"] == entity_id:
+                            self.states[i] = row
+                            break
+                    else:
+                        self.states.append(row)
+                    return httpx.Response(200, json={"result": "ok"})
+                if request.method == "GET":
+                    if item_id in store:
+                        return httpx.Response(200, json={"id": item_id, **store[item_id]})
+                    return httpx.Response(404, json={"message": "Resource not found"})
+                if request.method == "DELETE":
+                    # Home Assistant answers 400, not 404, for a config id
+                    # it does not have - measured live, see delete_automation().
+                    if item_id in store:
+                        del store[item_id]
+                        # Matches by entity_id (an automation this fake
+                        # itself created via POST, where slug == config id)
+                        # or by the `id` attribute (a UI-style automation a
+                        # test seeded directly into self.states, where the
+                        # config id differs from the entity_id's own slug -
+                        # see delete_automation()'s numeric-id resolution).
+                        self.states = [
+                            s for s in self.states
+                            if s["entity_id"] != entity_id
+                            and s.get("attributes", {}).get("id") != item_id
+                        ]
+                        return httpx.Response(200, json={"result": "ok"})
+                    return httpx.Response(400, json={"message": "Resource not found"})
         if path.startswith("/api/services/"):
             return httpx.Response(200, json=[])
         if path.startswith("/api/history/period/"):
@@ -212,6 +275,18 @@ class FakeHA:
         way Home Assistant does for a rejected service call, a bad auth
         token, or a broken integration."""
         self.rest_responses[path_fragment] = (status, {"message": message})
+
+    def delay_registration(self, entity_id: str, reads: int):
+        """Make GET /api/states/<entity_id> answer 404 for the next `reads`
+        calls, then fall through to the normal answer.
+
+        Models the gap between a config write (e.g. create_automation())
+        returning and Home Assistant's entity platform actually registering
+        the entity - the race create_automation()'s enabled=False path
+        waits out before disabling it, and delete_automation()'s numeric-id
+        resolution and toggle_automation() both also read across.
+        """
+        self.registration_delay[entity_id] = reads
 
     def sequence_states(self, entity_id: str, states: list):
         """Make successive GET /api/states/<entity_id> calls return `states`

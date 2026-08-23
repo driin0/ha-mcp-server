@@ -222,6 +222,111 @@ def test_create_automation_from_blueprint_raises_on_a_failed_call(fake_ha):
         )
 
 
+# ---- tools/automations.py & tools/scripts.py: _slug() id collisions (D2) ----------
+# "Morning lights" and "Morning, lights!" both slug to "morning_lights" -
+# create_automation()/create_script() must refuse the second by default
+# rather than silently replace the first's definition.
+
+def test_create_automation_refuses_a_colliding_name_by_default(fake_ha):
+    from tools.automations import create_automation
+
+    create_automation("Morning lights", trigger=[], action=[])
+    result = create_automation("Morning, lights!", trigger=[], action=[])
+
+    assert result["error"] == "id_collision"
+    assert result["existing_alias"] == "Morning lights"
+    assert result["requested_name"] == "Morning, lights!"
+
+
+def test_create_automation_overwrite_replaces_the_collision(fake_ha):
+    from tools.automations import create_automation
+
+    create_automation("Morning lights", trigger=[], action=[])
+    result = create_automation("Morning, lights!", trigger=[], action=[], overwrite=True)
+
+    assert "error" not in result
+    assert fake_ha.automation_configs["morning_lights"]["alias"] == "Morning, lights!"
+
+
+def test_create_automation_calling_again_with_the_same_name_is_not_a_collision(fake_ha):
+    from tools.automations import create_automation
+
+    create_automation("Morning lights", trigger=[], action=[])
+    result = create_automation("Morning lights", trigger=["updated"], action=[])
+
+    assert "error" not in result
+    assert fake_ha.automation_configs["morning_lights"]["trigger"] == ["updated"]
+
+
+def test_create_script_refuses_a_colliding_name_by_default(fake_ha):
+    from tools.scripts import create_script
+
+    create_script("Turn everything off", sequence=[])
+    result = create_script("Turn, everything off!", sequence=[])
+
+    assert result["error"] == "id_collision"
+    assert result["existing_alias"] == "Turn everything off"
+
+
+def test_create_script_overwrite_replaces_the_collision(fake_ha):
+    from tools.scripts import create_script
+
+    create_script("Turn everything off", sequence=[])
+    result = create_script("Turn, everything off!", sequence=[], overwrite=True)
+
+    assert "error" not in result
+    assert fake_ha.script_configs["turn_everything_off"]["alias"] == "Turn, everything off!"
+
+
+# ---- tools/automations.py: delete_automation() (D3) -------------------------------
+# Home Assistant's delete endpoint is keyed by the automation's own config
+# id, which for a UI-created automation differs from its entity_id's slug.
+# Measured live: a nonexistent config id 400s ("Resource not found"), not
+# 404 - the old code only ever checked for 404.
+
+def test_delete_automation_resolves_the_numeric_id_from_the_entity_attribute(fake_ha):
+    """A UI-created automation: entity_id's own slug ('automation.morning')
+    does not match its actual config id (a numeric timestamp, carried in
+    the `id` attribute) - deleting must use the attribute, not the slug."""
+    from tools.automations import delete_automation
+
+    fake_ha.states = [
+        {"entity_id": "automation.morning", "state": "on",
+         "attributes": {"id": "1690221234567", "friendly_name": "Morning"}},
+    ]
+    fake_ha.automation_configs["1690221234567"] = {"alias": "Morning"}
+
+    result = delete_automation("automation.morning")
+
+    assert result == {"deleted": "automation.morning", "status": 200}
+    assert "1690221234567" not in fake_ha.automation_configs
+
+
+def test_delete_automation_reports_a_400_as_not_deletable_not_a_404(fake_ha):
+    """The old code only recognised 404 as "not found" - Home Assistant
+    actually answers 400, so that branch was dead code."""
+    from tools.automations import delete_automation
+
+    fake_ha.states = [
+        {"entity_id": "automation.yaml_only", "state": "on",
+         "attributes": {"friendly_name": "YAML only"}},
+    ]
+    # No matching automation_configs entry - the fake answers DELETE with
+    # 400 "Resource not found", exactly like real Home Assistant.
+
+    result = delete_automation("automation.yaml_only")
+
+    assert result["error"] == "not_deletable"
+
+
+def test_delete_automation_reports_a_nonexistent_entity(fake_ha):
+    from tools.automations import delete_automation
+
+    result = delete_automation("automation.ghost")
+
+    assert result["error"] == "entity_not_found"
+
+
 def test_schedules_wraps_a_success(fake_ha):
     from tools.automations import list_schedules
 
@@ -2561,6 +2666,74 @@ def test_import_blueprint_reports_a_transport_failure_as_an_error(fake_ha):
 
     assert "error" in result
     assert "imported" not in result
+
+
+# ---- tools/automations.py: import_blueprint() actually saves (D4) -----------------
+# blueprint/import is only the preview step the blueprint editor uses - it
+# validates and returns the parsed YAML but writes nothing to disk. Verified
+# live: blueprint/list was unchanged right after blueprint/import alone, and
+# only showed the new path once blueprint/save was also sent.
+
+def test_import_blueprint_also_calls_save_and_reports_it(fake_ha):
+    from tools.automations import import_blueprint
+
+    fake_ha.ws_result("blueprint/import", {
+        "suggested_filename": "someone/my_blueprint",
+        "raw_data": "blueprint:\n  name: My Blueprint\n  domain: automation\n",
+        "blueprint": {"metadata": {"name": "My Blueprint", "domain": "automation"}},
+        "validation_errors": None,
+        "exists": False,
+    })
+    fake_ha.ws_result("blueprint/save", {"overrides_existing": False})
+
+    result = import_blueprint("https://example.com/my_blueprint.yaml")
+
+    assert result["imported"] is True
+    assert result["saved"] is True
+    assert result["path"] == "someone/my_blueprint"
+    assert result["domain"] == "automation"
+    assert result["name"] == "My Blueprint"
+    assert result["overrides_existing"] is False
+    save_call = next(m for m in fake_ha.ws_calls if m["type"] == "blueprint/save")
+    assert save_call["domain"] == "automation"
+    assert save_call["path"] == "someone/my_blueprint"
+    assert "raw_data" not in save_call
+    assert save_call["yaml"] == "blueprint:\n  name: My Blueprint\n  domain: automation\n"
+
+
+def test_import_blueprint_refuses_to_save_an_invalid_one(fake_ha):
+    from tools.automations import import_blueprint
+
+    fake_ha.ws_result("blueprint/import", {
+        "suggested_filename": "someone/broken",
+        "raw_data": "not: a valid blueprint",
+        "blueprint": {},
+        "validation_errors": ["missing 'name'"],
+        "exists": False,
+    })
+
+    result = import_blueprint("https://example.com/broken.yaml")
+
+    assert result["error"] == "invalid_blueprint"
+    assert not any(m["type"] == "blueprint/save" for m in fake_ha.ws_calls)
+
+
+def test_import_blueprint_reports_a_save_failure(fake_ha):
+    from tools.automations import import_blueprint
+
+    fake_ha.ws_result("blueprint/import", {
+        "suggested_filename": "someone/my_blueprint",
+        "raw_data": "blueprint:\n  name: My Blueprint\n  domain: script\n",
+        "blueprint": {"metadata": {"name": "My Blueprint", "domain": "script"}},
+        "validation_errors": None,
+        "exists": False,
+    })
+    fake_ha.fail_ws("blueprint/save", code="unknown_error", message="disk full")
+
+    result = import_blueprint("https://example.com/my_blueprint.yaml")
+
+    assert result["error"] == "unknown_error"
+    assert "saved" not in result
 
 
 def test_get_system_health_reports_a_transport_failure_as_an_error(fake_ha):

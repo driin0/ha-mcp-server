@@ -361,6 +361,35 @@ def confirm_entity_exists(entity_id: str) -> dict | None:
     return None
 
 
+def wait_for_entity(entity_id: str, *, retries: int = 4, delay: float = 1.0) -> bool:
+    """Poll GET /api/states/entity_id until it stops 404ing, or give up.
+
+    observe_actuation() below exists to tell "wrong state" from "gone" for
+    an entity assumed to already be registered, so it returns exists=False
+    on the FIRST 404 rather than retrying - correct for that job, wrong for
+    this one. A freshly created automation's entity briefly does not exist
+    at all while Home Assistant's entity platform catches up with a config
+    write that already returned 200 - measured live, ten automations
+    created back-to-back and immediately disabled: 9 of 10 stayed armed,
+    because the disable landed on an entity_id that did not exist yet and
+    was accepted as a 200 [] no-op. This is the "wait it out" loop that
+    race needs, before the disabling call is sent at all - see
+    create_automation()'s enabled=False path, its only caller today.
+
+    Returns True once a non-404 read is seen (the entity may still not be
+    in its final state - this only confirms it exists), False if every
+    attempt within `retries` extra reads still 404s.
+    """
+    with httpx.Client() as client:
+        for attempt in range(retries + 1):
+            if attempt:
+                time.sleep(delay)
+            r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
+            if r.status_code != 404:
+                return True
+    return False
+
+
 def observe_actuation(entity_id: str, satisfied, *, retries: int = 1, delay: float = 1.0) -> dict:
     """Read entity_id's state back after a service call and report what was
     actually observed — the discriminator between "Home Assistant accepted

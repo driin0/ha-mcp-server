@@ -231,12 +231,31 @@ def broadcast_tts(message: str, language: str = "", engine: str = "tts.google_tr
     language: language code; defaults to the language configured in Home Assistant
     engine: TTS engine for non-Alexa players (default: 'tts.google_translate')
 
-    Returns: {message, players: [{entity_id, ok, method|error}]}. `ok`
-    here means the per-player service call got a 2xx response (or, on a
-    raised exception, False with `error` set) — not that the announcement
-    was actually heard, which has no state in Home Assistant to confirm.
+    Returns: {message, engine, engine_exists, ok_count, total, note?,
+    players: [{entity_id, ok, method, error?}]}.
+
+    `ok` means the per-player service call got a 2xx response (or, on a
+    raised exception, False with `error` set) AND, for non-Alexa players,
+    that `engine` was confirmed to exist before any call was made for it.
+    `tts.speak` accepts a nonexistent engine entity_id exactly like any
+    other target that does not exist — a 200 [] no-op, the same shape as
+    an idempotent call (see confirm_entity_exists()) — so a 2xx response
+    alone cannot tell "queued on every player" from "queued on nothing,
+    the engine never existed". Measured live: with no tts.* entity
+    registered on the instance, calling tts/speak still answered 200 [],
+    which the old code reported as ok: true for all 8 players while 0 were
+    actually announced. This checks `engine` once up front and, when it is
+    missing, marks every non-Alexa player's result ok: False with that
+    reason instead of attempting a call that cannot work — Alexa players
+    are unaffected, since they go through notify.alexa_media_* instead of
+    the TTS engine and Home Assistant already answers a nonexistent notify
+    service with a genuine 4xx. This still does not confirm the
+    announcement was actually heard, which has no state in Home Assistant
+    to read back.
     """
     language = language or default_language()
+    engine_missing = confirm_entity_exists(engine) is not None
+
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -252,6 +271,13 @@ def broadcast_tts(message: str, language: str = "", engine: str = "tts.google_tr
             entity_id = player["entity_id"]
             name = entity_id.split(".", 1)[1]
             is_alexa = any(kw in name.lower() for kw in ALEXA_KEYWORDS)
+            if not is_alexa and engine_missing:
+                results.append({
+                    "entity_id": entity_id, "ok": False, "method": "tts_speak",
+                    "error": f"{engine} does not exist on this Home Assistant "
+                             "instance - not attempted.",
+                })
+                continue
             try:
                 if is_alexa:
                     notify_service = f"alexa_media_{name}"
@@ -278,7 +304,18 @@ def broadcast_tts(message: str, language: str = "", engine: str = "tts.google_tr
             except Exception as e:
                 results.append({"entity_id": entity_id, "ok": False, "error": str(e)})
 
-    return {"message": message, "players": results}
+    ok_count = sum(1 for res in results if res["ok"])
+    out = {
+        "message": message,
+        "engine": engine,
+        "engine_exists": not engine_missing,
+        "ok_count": ok_count,
+        "total": len(results),
+        "players": results,
+    }
+    if engine_missing:
+        out["note"] = f"{engine} does not exist - only Alexa players (if any) could be attempted."
+    return out
 
 
 @mcp.tool()

@@ -50,49 +50,61 @@ def set_climate(
     swing_mode:  'off', 'vertical', 'horizontal', 'both', etc. (depends on device)
 
     Returns: {entity_id, applied, verified, state, attributes} on a call
-    Home Assistant accepted, or {error: "entity_not_found"/"no_changes_requested",
-    ...} otherwise.
+    Home Assistant accepted for every requested field, or an error()
+    envelope - "no_changes_requested", "entity_not_found", or
+    "service_call_failed" when Home Assistant refused one of the fields.
 
     Each requested field is its own service call — climate has no single
     "set everything" service — so a call can partially apply (e.g.
-    hvac_mode accepted, temperature then refused) before a non-2xx
-    response raises. `verified` covers what was requested as a whole: true
-    only when every field in `applied` matches what the entity's own state
-    and attributes report on read-back; `attributes` there always shows
-    what was actually observed, which is what to check when only part of a
-    multi-field call took effect.
+    hvac_mode accepted, temperature then refused). Fields are sent in the
+    order listed above, and stop at the first one Home Assistant refuses:
+    the "service_call_failed" return still reports `applied` (the fields
+    that were sent and accepted before the failure) and `failed_field`/
+    `not_attempted`, so a caller told "failed" is not left blind to a
+    partial change already in effect — the previous behaviour let that
+    exception propagate and discarded which fields had already landed.
+    `verified` covers what was requested as a whole: true only when every
+    field in `applied` matches what the entity's own state and attributes
+    report on read-back; `attributes` there always shows what was actually
+    observed, which is what to check when only part of a multi-field call
+    took effect.
     """
-    with httpx.Client() as client:
-        applied = {}
-        if hvac_mode:
-            r = client.post(f"{HA_URL}/api/services/climate/set_hvac_mode",
-                            headers=HEADERS,
-                            json={"entity_id": entity_id, "hvac_mode": hvac_mode}, timeout=10)
-            r.raise_for_status()
-            applied["hvac_mode"] = hvac_mode
-        if temperature is not None:
-            r = client.post(f"{HA_URL}/api/services/climate/set_temperature",
-                            headers=HEADERS,
-                            json={"entity_id": entity_id, "temperature": temperature}, timeout=10)
-            r.raise_for_status()
-            applied["temperature"] = temperature
-        if fan_mode:
-            r = client.post(f"{HA_URL}/api/services/climate/set_fan_mode",
-                            headers=HEADERS,
-                            json={"entity_id": entity_id, "fan_mode": fan_mode}, timeout=10)
-            r.raise_for_status()
-            applied["fan_mode"] = fan_mode
-        if swing_mode:
-            r = client.post(f"{HA_URL}/api/services/climate/set_swing_mode",
-                            headers=HEADERS,
-                            json={"entity_id": entity_id, "swing_mode": swing_mode}, timeout=10)
-            r.raise_for_status()
-            applied["swing_mode"] = swing_mode
+    field_calls = []
+    if hvac_mode:
+        field_calls.append(("hvac_mode", "climate/set_hvac_mode",
+                            {"entity_id": entity_id, "hvac_mode": hvac_mode}))
+    if temperature is not None:
+        field_calls.append(("temperature", "climate/set_temperature",
+                            {"entity_id": entity_id, "temperature": temperature}))
+    if fan_mode:
+        field_calls.append(("fan_mode", "climate/set_fan_mode",
+                            {"entity_id": entity_id, "fan_mode": fan_mode}))
+    if swing_mode:
+        field_calls.append(("swing_mode", "climate/set_swing_mode",
+                            {"entity_id": entity_id, "swing_mode": swing_mode}))
 
-    if not applied:
+    if not field_calls:
         return error("no_changes_requested",
                      "None of hvac_mode, temperature, fan_mode or swing_mode were given.",
                      entity_id=entity_id)
+
+    applied = {}
+    with httpx.Client() as client:
+        for field, service, data in field_calls:
+            r = client.post(f"{HA_URL}/api/services/{service}", headers=HEADERS,
+                            json=data, timeout=10)
+            try:
+                r.raise_for_status()
+            except httpx.HTTPStatusError:
+                not_attempted = [f for f, _, _ in field_calls
+                                if f not in applied and f != field]
+                return error(
+                    "service_call_failed",
+                    f"Home Assistant refused {field} ({r.status_code}): {r.text[:200]}",
+                    entity_id=entity_id, applied=applied, failed_field=field,
+                    not_attempted=not_attempted,
+                )
+            applied[field] = data[field]
 
     def matches(s: dict) -> bool:
         attrs = s.get("attributes", {})

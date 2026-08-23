@@ -1,6 +1,8 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _slug, _ws, envelope, error, ws_error
+from tools._base import (
+    mcp, HA_URL, HEADERS, _slug, _ws, envelope, error, observe_actuation, wait_for_entity, ws_error,
+)
 
 
 @mcp.tool()
@@ -66,11 +68,23 @@ def create_automation(
     condition: list = None,
     description: str = "",
     enabled: bool = True,
+    overwrite: bool = False,
 ) -> dict:
     """
     Create or update an automation. The automation ID is derived from the name.
 
     trigger, condition and action must be valid HA trigger/condition/action objects.
+
+    overwrite: the automation id is derived from `name` through a lossy
+      slug (see _slug()) - "Morning lights" and "Morning, lights!" both
+      become "morning_lights", so two different names can collide on one
+      id. By default a name that collides with an existing automation
+      under a *different* alias is refused ("id_collision") rather than
+      silently replacing its definition - the id cannot be made unique
+      without changing the scheme, so refusing is the honest default. Pass
+      overwrite=True to replace it deliberately. Calling again with the
+      exact same `name` is treated as an intentional update, not a
+      collision, and always succeeds without this flag.
 
     Example — turn on a light at sunset:
       name: "Turn on light at sunset"
@@ -81,8 +95,56 @@ def create_automation(
       name: "Notify door open"
       trigger: [{"platform": "state", "entity_id": "binary_sensor.front_door", "to": "on"}]
       action: [{"service": "notify.mobile_app_myphone", "data": {"message": "Door open!"}}]
+
+    Returns: {automation_id, entity_id, enabled, verified, state, result} on
+    a config Home Assistant accepted, or an error() envelope - "id_collision"
+    (see `overwrite` above) or "automation_not_registered"/
+    "automation_not_disabled"/"automation_state_unverified" when the
+    entity's state after creation could not confirm what was requested.
+
+    `enabled` and `state` report what was actually observed after creation,
+    not the request. Home Assistant arms every new automation ("on") the
+    instant it registers, and disabling it is a second, separate service
+    call - sending that call before the entity has registered lands on an
+    entity_id that does not exist yet and is accepted as a 200 [] no-op,
+    the same way any call at a target that is not there yet is (see
+    confirm_entity_exists()), leaving the automation silently armed.
+    Measured live: ten automations created with enabled=False, config POST
+    and turn_off sent back-to-back with no wait - 9 of 10 stayed "on". This
+    tool waits for the entity to register before sending turn_off, then
+    reads its state back to confirm the request actually landed; `verified`
+    is true only when it did. A safety-relevant automation created disabled
+    must be checked by its actual state, not assumed from the request - so
+    a state that cannot be confirmed is an error() return, never a bare
+    success.
     """
     automation_id = _slug(name)
+    entity_id = f"automation.{automation_id}"
+
+    if not overwrite:
+        # A transient failure reading the existing config should not block
+        # a legitimate create, so this check only acts on a confirmed 200 -
+        # anything else (404 "no such id" included) falls through as "no
+        # collision" rather than raising.
+        with httpx.Client() as client:
+            existing = client.get(
+                f"{HA_URL}/api/config/automation/config/{automation_id}",
+                headers=HEADERS, timeout=10,
+            )
+        if existing.status_code == 200:
+            existing_alias = existing.json().get("alias", "")
+            if existing_alias != name:
+                return error(
+                    "id_collision",
+                    f"{entity_id!r} already holds a different automation "
+                    f"({existing_alias!r}) - {name!r} slugs to the same id "
+                    "and would silently replace its definition. Pass "
+                    "overwrite=True to replace it deliberately, or choose a "
+                    "name that slugs differently.",
+                    automation_id=automation_id, entity_id=entity_id,
+                    existing_alias=existing_alias, requested_name=name,
+                )
+
     payload = {
         "alias": name,
         "description": description,
@@ -99,39 +161,110 @@ def create_automation(
             timeout=15,
         )
         r.raise_for_status()
-        if not enabled:
+        create_result = r.json()
+
+    if not enabled:
+        # Wait for the entity to register before disabling it - see
+        # docstring and wait_for_entity()'s own docstring for the race this
+        # closes.
+        if not wait_for_entity(entity_id):
+            return error(
+                "automation_not_registered",
+                f"{entity_id} was created but never registered a state, so "
+                "it could not be disabled - it may still be armed. Check "
+                "manually before relying on it.",
+                automation_id=automation_id, entity_id=entity_id,
+                result=create_result,
+            )
+        with httpx.Client() as client:
             client.post(
                 f"{HA_URL}/api/services/automation/turn_off",
                 headers=HEADERS,
-                json={"entity_id": f"automation.{automation_id}"},
+                json={"entity_id": entity_id},
                 timeout=10,
             )
-        return {"automation_id": automation_id, "entity_id": f"automation.{automation_id}", "result": r.json()}
+
+    expected = "off" if not enabled else "on"
+    obs = observe_actuation(entity_id, lambda s: s["state"] == expected)
+    if not obs["exists"]:
+        return error(
+            "automation_not_registered",
+            f"{entity_id} was created but never registered a state.",
+            automation_id=automation_id, entity_id=entity_id,
+            result=create_result,
+        )
+    if not obs["verified"]:
+        return error(
+            "automation_not_disabled" if not enabled else "automation_state_unverified",
+            f"{entity_id} was created, but its state could not be confirmed "
+            f"as {expected!r} - observed {obs['state']['state']!r}. Treat "
+            "its enabled/disabled state as unknown until verified manually.",
+            automation_id=automation_id, entity_id=entity_id,
+            enabled=obs["state"]["state"] == "on", state=obs["state"]["state"],
+            result=create_result,
+        )
+    return {
+        "automation_id": automation_id,
+        "entity_id": entity_id,
+        "enabled": obs["state"]["state"] == "on",
+        "verified": True,
+        "state": obs["state"]["state"],
+        "result": create_result,
+    }
 
 
 @mcp.tool()
 def delete_automation(entity_id: str) -> dict:
     """
     Delete an automation by entity_id (e.g. 'automation.turn_on_light_at_sunset').
-    Only works for automations managed via the HA UI editor.
-    YAML-defined automations cannot be deleted via API.
+
+    Home Assistant's delete endpoint is keyed by the automation's own config
+    id, not by entity_id. An automation created by create_automation() in
+    this tool has the two equal - the same slug is used as both - but one
+    created through the Home Assistant UI editor gets a numeric timestamp
+    config id that is independent of its entity_id's object_id, since the
+    UI derives the entity_id from the alias separately. Measured live: an
+    automation saved from the UI with alias "Morning Lights UI Style" got
+    entity_id 'automation.morning_lights_ui_style' and config id
+    '1690221234567' - deleting by the entity_id's own slug answers 400
+    ("Resource not found") even though the automation exists; deleting by
+    the numeric id read from its `id` attribute succeeds. This tool reads
+    that attribute from the entity's own state before deleting, so it works
+    for automations created via the HA UI too, not only ones this tool
+    created itself.
+
+    Only works for automations stored in the UI-editable automation
+    registry. A YAML-defined automation has no config id, and Home
+    Assistant refuses to delete it via this API - measured live, with a
+    400 ("Resource not found"), not a 404: this endpoint answers 400 both
+    for "no such config id" and for "this automation cannot be deleted
+    here", so the two are reported the same way below.
     """
-    automation_id = entity_id.removeprefix("automation.")
     with httpx.Client() as client:
+        state_r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
+        if state_r.status_code == 404:
+            return error("entity_not_found",
+                         f"{entity_id} does not exist on this Home Assistant instance.",
+                         entity_id=entity_id)
+        state_r.raise_for_status()
+        automation_id = (state_r.json().get("attributes", {}).get("id")
+                        or entity_id.removeprefix("automation."))
+
         r = client.delete(
             f"{HA_URL}/api/config/automation/config/{automation_id}",
             headers=HEADERS,
             timeout=10,
         )
-        if r.status_code == 404:
-            return {
-                "error": "not_found",
-                "entity_id": entity_id,
-                "detail": (
-                    "This automation is defined in YAML and cannot be deleted via API. "
-                    "Only UI-managed automations can be deleted with this tool."
-                ),
-            }
+        if r.status_code == 400:
+            return error(
+                "not_deletable",
+                "Home Assistant refused the delete (400) - this automation "
+                "is likely defined in YAML, which has no config id and "
+                "cannot be deleted via this API. Only automations editable "
+                "in the HA UI can be deleted with this tool.",
+                entity_id=entity_id, automation_id=automation_id,
+                ha_response=r.text[:300],
+            )
         r.raise_for_status()
         return {"deleted": entity_id, "status": r.status_code}
 
@@ -365,26 +498,73 @@ def list_device_actions(device_id: str) -> dict:
 @mcp.tool()
 def import_blueprint(url: str) -> dict:
     """
-    Import a blueprint from a URL (GitHub, HA Community, etc.).
+    Import a blueprint from a URL (GitHub, HA Community, etc.) and save it
+    to disk, ready to use.
 
     url: direct URL to the blueprint YAML file.
     Examples:
       'https://raw.githubusercontent.com/user/repo/main/blueprints/automation/my_blueprint.yaml'
       'https://community.home-assistant.io/t/some-blueprint/123456'
 
+    Home Assistant's `blueprint/import` command is only the preview step
+    the blueprint editor uses before showing you what it found - it parses
+    and validates the YAML but writes nothing to disk. Saving is a second,
+    separate command, `blueprint/save`. Verified live: blueprint/list was
+    unchanged immediately after blueprint/import alone, and only showed the
+    new path once blueprint/save was also called with the id and raw YAML
+    the import step returned. This tool performs both steps, so a caller
+    does not have to know that split exists or do it themselves.
+
     After importing, use list_blueprints() to see it and
     create_automation_from_blueprint() to use it.
+
+    Returns: {imported, saved, url, path, domain, name, overrides_existing}
+    once both steps succeed, or an error() envelope - the ws_error() from
+    whichever WebSocket command failed, or "invalid_blueprint" when Home
+    Assistant's own parser reports validation errors on the imported YAML
+    (nothing is saved in that case), or "incomplete_import" when the import
+    step succeeded but did not return enough information (domain or a
+    suggested path) to save it.
     """
-    result = _ws({"type": "blueprint/import", "url": url})
-    if err := ws_error(result):
+    imported = _ws({"type": "blueprint/import", "url": url})
+    if err := ws_error(imported):
         return err
-    data = result["result"] or {}
+    data = imported["result"] or {}
+
+    validation_errors = data.get("validation_errors")
+    if validation_errors:
+        return error("invalid_blueprint",
+                     "Home Assistant could not validate this blueprint - nothing was saved.",
+                     url=url, validation_errors=validation_errors)
+
+    metadata = data.get("blueprint", {}).get("metadata", {})
+    domain = metadata.get("domain", "")
+    path = data.get("suggested_filename") or data.get("path", "")
+    if not domain or not path:
+        return error("incomplete_import",
+                     "Home Assistant's import did not return enough information "
+                     "to save this blueprint (missing domain or suggested path).",
+                     url=url, result=data)
+
+    saved = _ws({
+        "type": "blueprint/save",
+        "domain": domain,
+        "path": path,
+        "yaml": data.get("raw_data", ""),
+        "source_url": url,
+    })
+    if err := ws_error(saved):
+        return err
+    save_result = saved["result"] or {}
+
     return {
         "imported": True,
+        "saved": True,
         "url": url,
-        "path": data.get("suggested_filename") or data.get("path", ""),
-        "name": data.get("blueprint", {}).get("metadata", {}).get("name", ""),
-        "domain": data.get("blueprint", {}).get("metadata", {}).get("domain", ""),
+        "path": path,
+        "domain": domain,
+        "name": metadata.get("name", ""),
+        "overrides_existing": save_result.get("overrides_existing", False),
     }
 
 

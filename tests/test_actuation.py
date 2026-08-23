@@ -1355,3 +1355,210 @@ def test_search_and_play_media_reports_a_nonexistent_target(fake_ha):
     result = search_and_play_media("media_player.ghost", "Daft Punk")
 
     assert result["error"] == "entity_not_found"
+
+
+# ---- tools/automations.py: create_automation(enabled=False) ------------------------
+# Package D. Measured live: automation.turn_off sent immediately after the
+# config POST, with no wait for the entity to register, left 9 of 10 freshly
+# created automations "on" despite enabled=False.
+
+def test_create_automation_disabled_waits_for_registration_then_verifies_off(fake_ha):
+    """The entity does not exist for the first two reads (the registration
+    race) - create_automation() must wait it out, then confirm 'off' rather
+    than trusting the request.
+
+    Uses sequence_states rather than fake_ha.states: the config POST itself
+    (fakeha's CRUD route) registers the entity as "on", the same way a real
+    create does - sequence_states is checked ahead of that in fakeha's
+    routing, so it is what lets this test control what the *post-turn_off*
+    read-back reports without that POST-time default clobbering it."""
+    from tools.automations import create_automation
+
+    fake_ha.delay_registration("automation.morning_lights", reads=2)
+    fake_ha.sequence_states("automation.morning_lights", [
+        {"entity_id": "automation.morning_lights", "state": "off", "attributes": {}},
+    ])
+
+    result = create_automation("Morning lights", trigger=[], action=[], enabled=False)
+
+    assert result["enabled"] is False
+    assert result["verified"] is True
+    assert result["state"] == "off"
+    # The turn_off service call must have been sent, not skipped.
+    assert any(c.url.path == "/api/services/automation/turn_off" for c in fake_ha.rest_calls)
+
+
+def test_create_automation_disabled_reports_an_error_when_it_stays_armed(fake_ha):
+    """The old bug: enabled=False requested, but the automation is still
+    'on' after creation. This must not be a bare success. No fake_ha.states
+    setup needed: fakeha's config-POST route registers a fresh automation
+    as "on" by default (matching Home Assistant), and turn_off - like every
+    /api/services/* call in fakeha - never mutates it, exactly reproducing
+    the race this guards against."""
+    from tools.automations import create_automation
+
+    result = create_automation("Morning lights", trigger=[], action=[], enabled=False)
+
+    assert result["error"] == "automation_not_disabled"
+    assert result["state"] == "on"
+    assert result["enabled"] is True
+
+
+def test_create_automation_disabled_reports_an_error_when_never_registered(fake_ha):
+    from tools.automations import create_automation
+
+    fake_ha.delay_registration("automation.never_shows_up", reads=99)
+
+    result = create_automation("Never shows up", trigger=[], action=[], enabled=False)
+
+    assert result["error"] == "automation_not_registered"
+    # turn_off must never be sent to an entity that was never confirmed to exist.
+    assert not any(c.url.path == "/api/services/automation/turn_off" for c in fake_ha.rest_calls)
+
+
+def test_create_automation_enabled_reports_the_observed_state(fake_ha):
+    from tools.automations import create_automation
+
+    result = create_automation("Morning lights", trigger=[], action=[])
+
+    assert result["enabled"] is True
+    assert result["verified"] is True
+    assert result["state"] == "on"
+
+
+# ---- tools/helpers.py: set_helper - unrecognised command rejection (E1) ------------
+
+def test_set_helper_timer_rejects_an_unrecognised_command(fake_ha):
+    """A typo'd/foreign command (e.g. 'stop') used to silently fall through
+    to 'start' - the opposite of what a caller who wrote 'stop' wanted."""
+    from tools.helpers import set_helper
+
+    fake_ha.states = [
+        {"entity_id": "timer.probe", "state": "active", "attributes": {}},
+    ]
+
+    result = set_helper("timer.probe", "stop")
+
+    assert result["error"] == "invalid_value"
+    assert result["allowed"] == ["cancel", "finish", "pause", "start"]
+    assert fake_ha.rest_calls == []  # never even called Home Assistant
+
+
+def test_set_helper_counter_rejects_a_typo(fake_ha):
+    """'decremnt' used to silently fall through to 'increment'."""
+    from tools.helpers import set_helper
+
+    fake_ha.states = [
+        {"entity_id": "counter.probe", "state": "3", "attributes": {"step": 1}},
+    ]
+
+    result = set_helper("counter.probe", "decremnt")
+
+    assert result["error"] == "invalid_value"
+    assert result["allowed"] == ["decrement", "increment", "reset"]
+    assert fake_ha.rest_calls == []
+
+
+def test_set_helper_input_boolean_rejects_an_unrecognised_value(fake_ha):
+    from tools.helpers import set_helper
+
+    fake_ha.states = [
+        {"entity_id": "input_boolean.guest_mode", "state": "off", "attributes": {}},
+    ]
+
+    result = set_helper("input_boolean.guest_mode", "true")
+
+    assert result["error"] == "invalid_value"
+    assert result["allowed"] == ["off", "on"]
+
+
+# ---- tools/climate.py: set_climate - partial failure (E3) -------------------------
+
+def test_set_climate_reports_what_applied_before_a_later_field_was_refused(fake_ha):
+    """hvac_mode is accepted; fan_mode is then refused by Home Assistant.
+    The old code let that exception propagate and discarded the fact that
+    hvac_mode had already landed."""
+    from tools.climate import set_climate
+
+    fake_ha.fail_rest("/api/services/climate/set_fan_mode", status=400,
+                      message="fan_mode not valid")
+
+    result = set_climate("climate.hvac", hvac_mode="cool", fan_mode="turbo")
+
+    assert result["error"] == "service_call_failed"
+    assert result["applied"] == {"hvac_mode": "cool"}
+    assert result["failed_field"] == "fan_mode"
+    assert result["not_attempted"] == []
+
+
+def test_set_climate_reports_fields_not_yet_attempted(fake_ha):
+    """hvac_mode is refused first, so temperature (requested after it) must
+    never even be sent, and the return must say so."""
+    from tools.climate import set_climate
+
+    fake_ha.fail_rest("/api/services/climate/set_hvac_mode", status=400,
+                      message="invalid hvac_mode")
+
+    result = set_climate("climate.hvac", hvac_mode="banana", temperature=21,
+                         fan_mode="high")
+
+    assert result["error"] == "service_call_failed"
+    assert result["applied"] == {}
+    assert result["failed_field"] == "hvac_mode"
+    assert result["not_attempted"] == ["temperature", "fan_mode"]
+    # temperature/fan_mode calls must never have been sent.
+    assert not any(c.url.path == "/api/services/climate/set_temperature"
+                  for c in fake_ha.rest_calls)
+
+
+# ---- tools/media_players.py: broadcast_tts - engine existence (E5) ----------------
+
+def test_broadcast_tts_reports_a_missing_engine_instead_of_ok_true(fake_ha):
+    """Measured live: with no tts.* entity registered, tts/speak still
+    answers 200 [] for every player - the old code reported ok: true for
+    all of them with nothing actually announced."""
+    from tools.media_players import broadcast_tts
+
+    fake_ha.states = [
+        {"entity_id": "media_player.kitchen", "state": "idle", "attributes": {}},
+        {"entity_id": "media_player.living_room", "state": "idle", "attributes": {}},
+    ]
+
+    result = broadcast_tts("Dinner is ready", engine="tts.does_not_exist")
+
+    assert result["engine_exists"] is False
+    assert result["ok_count"] == 0
+    assert all(p["ok"] is False for p in result["players"])
+    assert "note" in result
+    # tts/speak must never have been called once the engine was known missing.
+    assert not any(c.url.path == "/api/services/tts/speak" for c in fake_ha.rest_calls)
+
+
+def test_broadcast_tts_still_attempts_alexa_players_when_the_engine_is_missing(fake_ha):
+    """Alexa players go through notify.alexa_media_*, not the TTS engine -
+    a missing tts.* entity must not block them."""
+    from tools.media_players import broadcast_tts
+
+    fake_ha.states = [
+        {"entity_id": "media_player.echo_kitchen", "state": "idle", "attributes": {}},
+    ]
+
+    result = broadcast_tts("Dinner is ready", engine="tts.does_not_exist")
+
+    assert result["players"][0]["method"] == "alexa_announce"
+    assert result["players"][0]["ok"] is True
+
+
+def test_broadcast_tts_reports_ok_when_the_engine_exists(fake_ha):
+    from tools.media_players import broadcast_tts
+
+    fake_ha.states = [
+        {"entity_id": "tts.google_translate", "state": "idle", "attributes": {}},
+        {"entity_id": "media_player.kitchen", "state": "idle", "attributes": {}},
+    ]
+
+    result = broadcast_tts("Dinner is ready")
+
+    assert result["engine_exists"] is True
+    assert result["ok_count"] == 1
+    assert "note" not in result
