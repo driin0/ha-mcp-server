@@ -141,11 +141,13 @@ class FakeHA:
         # Assistant's own config-storage API. A POST here also creates or
         # updates a matching row in self.states, the way a real create
         # immediately registers an entity (verified live) - automations
-        # default to "on" (armed) and scripts to "off" (idle), Home
-        # Assistant's own defaults for a freshly created one. Seeded with
-        # DEFAULT_AUTOMATION_CONFIGS above, matching the id already on
-        # automation.nas_shutdown in DEFAULT_STATES; script_configs has no
-        # such default seed.
+        # default to "on" (armed) and scripts to "off" (idle) ONLY for an
+        # id not already in the store; re-POSTing an existing id (an
+        # update) preserves whatever state it already had instead (also
+        # verified live - see the POST handler below for the reasoning).
+        # Seeded with DEFAULT_AUTOMATION_CONFIGS above, matching the id
+        # already on automation.nas_shutdown in DEFAULT_STATES;
+        # script_configs has no such default seed.
         self.automation_configs = copy.deepcopy(DEFAULT_AUTOMATION_CONFIGS)
         self.script_configs = {}
         # Everything the tools sent, for assertions.
@@ -189,8 +191,23 @@ class FakeHA:
                 entity_id = f"{domain}.{item_id}"
                 if request.method == "POST":
                     body = json.loads(request.content or b"{}")
+                    is_new = item_id not in store
+                    existing = next(
+                        (s for s in self.states if s["entity_id"] == entity_id), None)
                     store[item_id] = body
-                    row = {"entity_id": entity_id, "state": default_state,
+                    # A genuinely new automation registers armed
+                    # (default_state) - measured live for creation. But
+                    # re-POSTing an EXISTING one (an update) does not reset
+                    # its armed/disarmed state: measured live, an
+                    # automation turned off, then updated with an
+                    # unrelated field change (alias only, enabled
+                    # untouched), read back "off" afterward, not reset to
+                    # "on". update_automation() relies on this: an edit
+                    # must not silently re-arm what was deliberately
+                    # disabled.
+                    state = (existing["state"] if existing and not is_new
+                            else default_state)
+                    row = {"entity_id": entity_id, "state": state,
                            "attributes": {"friendly_name": body.get("alias", item_id),
                                          "id": item_id}}
                     for i, s in enumerate(self.states):

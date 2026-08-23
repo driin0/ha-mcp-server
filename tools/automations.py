@@ -1,6 +1,6 @@
 import httpx
 
-from tools._aliases import stored_format, to_modern
+from tools._aliases import stored_format, to_modern, to_stored
 from tools._base import (
     mcp, HA_URL, HEADERS, _slug, _ws, confirm_entity_exists, envelope, error,
     observe_actuation, wait_for_entity, ws_error,
@@ -55,6 +55,71 @@ def _fetch_config(automation_id: str, slug: str, client: httpx.Client) -> tuple[
             r2.raise_for_status()
             return slug, r2.json()
     return None, None
+
+
+def _set_and_verify_enabled(entity_id: str, enabled: bool) -> dict:
+    """Send automation.turn_on/turn_off and confirm the entity's state
+    actually reflects `enabled` afterward, the way create_automation()'s own
+    docstring measured necessary live: ten automations created with
+    enabled=False, config POST and turn_off sent back-to-back with no wait,
+    left 9 of 10 still armed - the disable landed on an entity_id that had
+    not registered yet and was accepted as a 200 [] no-op, the same way any
+    call at a target that is not there yet is (see confirm_entity_exists()).
+    wait_for_entity() closes that race before the toggle is sent at all.
+
+    Shared by create_automation() and update_automation() - both need
+    exactly this guarantee, not two independent implementations that could
+    silently drift apart. An automation that reports itself disabled while
+    still armed is this project's founding bug; every caller that can
+    change `enabled` gets the same treatment.
+
+    Returns one of:
+      error("automation_not_registered", ...) - entity_id never registered
+        a state at all, so `enabled` could not be changed or confirmed.
+      error("automation_not_disabled"|"automation_state_unverified", ...,
+        enabled=bool, state=str) - the entity exists, but its state after
+        the service call does not match what was requested. The code names
+        the safety-relevant direction explicitly: "not_disabled" for a
+        disable that did not take, "state_unverified" for an enable that
+        did not.
+      {"enabled": bool, "verified": True, "state": str} - confirmed.
+
+    Callers add their own identifying fields (automation_id, entity_id,
+    whatever else belongs in their own result shape) - this helper only
+    reports what it itself determined, so two callers with different
+    surrounding context do not have to agree on one error shape.
+    """
+    if not wait_for_entity(entity_id):
+        return error(
+            "automation_not_registered",
+            f"{entity_id} has no registered state, so its enabled state "
+            "could not be changed or confirmed - it may still be in its "
+            "previous state. Check manually before relying on it.",
+        )
+    with httpx.Client() as client:
+        client.post(
+            f"{HA_URL}/api/services/automation/"
+            f"{'turn_on' if enabled else 'turn_off'}",
+            headers=HEADERS,
+            json={"entity_id": entity_id},
+            timeout=10,
+        )
+
+    expected = "on" if enabled else "off"
+    obs = observe_actuation(entity_id, lambda s: s["state"] == expected)
+    if not obs["exists"]:
+        return error("automation_not_registered",
+                     f"{entity_id} has no registered state.")
+    if not obs["verified"]:
+        return error(
+            "automation_not_disabled" if not enabled else "automation_state_unverified",
+            f"{entity_id}'s state could not be confirmed as {expected!r} - "
+            f"observed {obs['state']['state']!r}. Treat its enabled/disabled "
+            "state as unknown until verified manually.",
+            enabled=obs["state"]["state"] == "on", state=obs["state"]["state"],
+        )
+    return {"enabled": obs["state"]["state"] == "on", "verified": True,
+            "state": obs["state"]["state"]}
 
 
 @mcp.tool()
@@ -245,52 +310,19 @@ def create_automation(
         r.raise_for_status()
         create_result = r.json()
 
-    if not enabled:
-        # Wait for the entity to register before disabling it - see
-        # docstring and wait_for_entity()'s own docstring for the race this
-        # closes.
-        if not wait_for_entity(entity_id):
-            return error(
-                "automation_not_registered",
-                f"{entity_id} was created but never registered a state, so "
-                "it could not be disabled - it may still be armed. Check "
-                "manually before relying on it.",
-                automation_id=automation_id, entity_id=entity_id,
-                result=create_result,
-            )
-        with httpx.Client() as client:
-            client.post(
-                f"{HA_URL}/api/services/automation/turn_off",
-                headers=HEADERS,
-                json={"entity_id": entity_id},
-                timeout=10,
-            )
-
-    expected = "off" if not enabled else "on"
-    obs = observe_actuation(entity_id, lambda s: s["state"] == expected)
-    if not obs["exists"]:
-        return error(
-            "automation_not_registered",
-            f"{entity_id} was created but never registered a state.",
-            automation_id=automation_id, entity_id=entity_id,
-            result=create_result,
-        )
-    if not obs["verified"]:
-        return error(
-            "automation_not_disabled" if not enabled else "automation_state_unverified",
-            f"{entity_id} was created, but its state could not be confirmed "
-            f"as {expected!r} - observed {obs['state']['state']!r}. Treat "
-            "its enabled/disabled state as unknown until verified manually.",
-            automation_id=automation_id, entity_id=entity_id,
-            enabled=obs["state"]["state"] == "on", state=obs["state"]["state"],
-            result=create_result,
-        )
+    # _set_and_verify_enabled() waits for the entity to register before
+    # sending turn_on/turn_off - see its own docstring for the race this
+    # closes, measured live against exactly this call site.
+    outcome = _set_and_verify_enabled(entity_id, enabled)
+    if "error" in outcome:
+        outcome["automation_id"] = automation_id
+        outcome["entity_id"] = entity_id
+        outcome["result"] = create_result
+        return outcome
     return {
         "automation_id": automation_id,
         "entity_id": entity_id,
-        "enabled": obs["state"]["state"] == "on",
-        "verified": True,
-        "state": obs["state"]["state"],
+        **outcome,
         "result": create_result,
     }
 
@@ -461,6 +493,184 @@ def get_automation(entity_id: str) -> dict:
         "stored_format": stored_format(restore),
         "config": config,
     }
+
+
+def _not_found_for_edit(entity_id: str, automation_id: str, slug: str,
+                        verb: str) -> dict:
+    """The error() update_automation() returns - and the sibling edit
+    tools built on the same fetch will share - when _fetch_config() cannot
+    resolve a stored config: no such entity, or a YAML-defined automation,
+    which has no config id and so cannot be reached through this API at
+    all. get_automation() reports the same situation with its own
+    hand-written error() (it predates this helper); this one exists so an
+    edit tool's refusal names what it was trying to DO, not just that it
+    could not find something to read.
+
+    verb: what the caller was trying to do ("updated"), for a message
+    specific to that tool rather than one written for reading.
+    """
+    return error(
+        "not_found",
+        f"No stored automation config found for {entity_id} (tried "
+        f"id {automation_id!r} and slug {slug!r}). It may not exist, or "
+        "may be defined in YAML, which has no config id - only "
+        f"automations editable in the HA UI can be {verb} this way.",
+        entity_id=entity_id,
+    )
+
+
+@mcp.tool()
+def update_automation(
+    entity_id: str,
+    name: str = "",
+    triggers: list = None,
+    conditions: list = None,
+    actions: list = None,
+    mode: str = "",
+    description: str | None = None,
+    enabled: bool | None = None,
+) -> dict:
+    """
+    Update an existing automation in place, preserving its id.
+
+    Read-modify-write, never reconstruction: fetches the automation's real
+    stored config, overwrites only the fields actually passed, and posts
+    the same object back - unlike create_automation(), whose payload IS
+    the whole automation from scratch. A device trigger, a nested
+    if/then, a branch marked enabled: false all survive untouched,
+    because they are never parsed - only the top-level fields this tool
+    knows about (alias, triggers, conditions, actions, mode, description)
+    are ever replaced; everything else in the fetched config is carried
+    through exactly as read.
+
+    entity_id: the automation to update, e.g. 'automation.morning_lights'.
+      Its config id is never changed by this tool - labels, dashboards and
+      cross-references stay attached to it. This is the reason this tool
+      exists at all: create_automation() derives an id from `name`, so
+      "editing" an automation by creating a second one under a new name
+      leaves both live, with the same trigger - the incident this whole
+      module exists because of.
+
+    name, mode: default to "" - an empty string means "not passed", so
+      neither can be cleared to empty through this tool. Deliberate: a
+      sentinel object reads worse than it helps for two fields that would
+      never legitimately be emptied out.
+    triggers, conditions, actions: each replaces that whole list when
+      passed (None means "leave alone" - pass [] to deliberately clear
+      one, e.g. conditions=[] to remove every condition). Either
+      vocabulary is accepted for the objects inside the list
+      (platform:/service: or trigger:/action:) - what matters for the
+      stored file is described below, not what you pass in here.
+    description: None means "not passed" - unlike name/mode, "" is a
+      legitimate description to write (clearing an existing one), so this
+      field needs a real sentinel instead of the empty-string convention.
+    enabled: None leaves the automation's current armed state alone -
+      calling this tool to rename an automation does not also silently
+      re-arm or disarm it (measured live: reconfiguring an automation
+      through this same write endpoint does NOT reset its enabled state
+      the way a fresh create does - see tests/fakeha.py's POST handler for
+      the live-measured behaviour this models). True/False requests a
+      specific state and is verified exactly the way create_automation()
+      verifies enabled=False: wait for the entity, send the toggle, read
+      the state back, and report an error() rather than a bare success
+      when it cannot be confirmed (see _set_and_verify_enabled()). An
+      automation that reports itself disabled while still armed is this
+      project's founding bug; this tool changing `enabled` gets the same
+      treatment, not a weaker one.
+
+    Nothing is written when no field was passed at all (including
+    `enabled`) - a no-op call makes no request, rather than silently
+    resubmitting an unchanged config through Home Assistant's own
+    normaliser (see the vocabulary paragraph below).
+
+    Writes go back in the stored vocabulary at the levels this tool
+    controls: `stored_format` below names the root/step spelling the
+    fetched config actually used, and anything this call does not
+    explicitly replace keeps that spelling. Measured live, though: Home
+    Assistant's own config-write endpoint renames the root keys
+    (trigger/condition/action -> triggers/conditions/actions) and an
+    action step's service: to action: on every save, regardless of what
+    is posted - only a trigger step's platform: key survives exactly as
+    submitted. `stored_format` reports what was read and what this tool
+    tried to preserve; it is not a promise about what Home Assistant's own
+    validator leaves on disk afterward, which this tool has no way to
+    prevent through this API - see the module's own test/live notes for
+    how this was confirmed.
+
+    Only automations editable in the HA UI can be updated this way - a
+    YAML-defined automation has no config id and returns an error()
+    envelope ("not_found") mentioning YAML, the same distinction
+    get_automation() and delete_automation() already draw.
+
+    Returns: {automation_id, entity_id, updated: [...], stored_format,
+    enabled?, verified?, state?} on success - `updated` lists which of
+    name/triggers/conditions/actions/mode/description were actually
+    written; `enabled`/`verified`/`state` are present only when `enabled`
+    was passed. Or an error() envelope: "not_found", or
+    "automation_not_registered"/"automation_not_disabled"/
+    "automation_state_unverified" when `enabled` was requested and could
+    not be confirmed.
+    """
+    slug = entity_id.removeprefix("automation.")
+    with httpx.Client() as client:
+        automation_id = _resolve_automation_id(entity_id, client) or slug
+        resolved_id, raw = _fetch_config(automation_id, slug, client)
+
+    if raw is None:
+        return _not_found_for_edit(entity_id, automation_id, slug, "updated")
+
+    config, restore = to_modern(raw)
+    fmt = stored_format(restore)
+
+    updated = []
+    if name:
+        config["alias"] = name
+        updated.append("name")
+    if triggers is not None:
+        config["triggers"] = triggers
+        updated.append("triggers")
+    if conditions is not None:
+        config["conditions"] = conditions
+        updated.append("conditions")
+    if actions is not None:
+        config["actions"] = actions
+        updated.append("actions")
+    if mode:
+        config["mode"] = mode
+        updated.append("mode")
+    if description is not None:
+        config["description"] = description
+        updated.append("description")
+
+    if updated:
+        payload = to_stored(config, restore)
+        with httpx.Client() as client:
+            r = client.post(
+                f"{HA_URL}/api/config/automation/config/{resolved_id}",
+                headers=HEADERS,
+                json=payload,
+                timeout=15,
+            )
+            r.raise_for_status()
+
+    result = {
+        "automation_id": resolved_id,
+        "entity_id": entity_id,
+        "updated": updated,
+        "stored_format": fmt,
+    }
+
+    if enabled is not None:
+        outcome = _set_and_verify_enabled(entity_id, enabled)
+        if "error" in outcome:
+            outcome["automation_id"] = resolved_id
+            outcome["entity_id"] = entity_id
+            outcome["updated"] = updated
+            outcome["stored_format"] = fmt
+            return outcome
+        result.update(outcome)
+
+    return result
 
 
 @mcp.tool()
