@@ -174,7 +174,8 @@ async def _ws_commands(msgs: list) -> list:
         return results
 
 
-def envelope(items, *, key="items", total=None, offset=0, limit=None, note="") -> dict:
+def envelope(items, *, key="items", total=None, offset=0, limit=None, note="",
+             offset_paginated=False) -> dict:
     """Wrap a collection in the standard result shape.
 
     The shape exists because the MCP SDK turns a bare list return into one
@@ -191,6 +192,13 @@ def envelope(items, *, key="items", total=None, offset=0, limit=None, note="") -
             passed with `total`, since `items` is already the paginated page.
     limit:  0 or None means no limit.
     note:   overrides the generated note.
+    offset_paginated: the calling tool exposes an `offset` parameter, so a
+            truncation note may tell the caller to advance it. Most tools
+            that call envelope() with a `limit` have no such parameter —
+            offset is always 0 for them — and advising a caller to move a
+            knob that does not exist produced a note that was simply wrong
+            for those tools. Only pass True from the two tools (list_devices,
+            list_automations) that actually have one.
     """
     rows = list(items)
     if total is None:
@@ -211,8 +219,10 @@ def envelope(items, *, key="items", total=None, offset=0, limit=None, note="") -
         elif not page:
             note = f"offset {offset} is past the end of {count} {key}"
         elif offset + len(page) < count:
-            note = (f"{len(page)} of {count} shown - raise limit, "
-                    f"advance offset, or refine the filters")
+            advice = ("raise limit, advance offset, or refine the filters"
+                      if offset_paginated else
+                      "raise limit or refine the filters")
+            note = f"{len(page)} of {count} shown - {advice}"
     if note:
         out["note"] = note
     out[key] = page
@@ -267,3 +277,47 @@ def ws_error(result) -> dict | None:
     if "result" not in result and "error" in result:
         return error("websocket_error", str(result["error"]))
     return None
+
+
+def entity_area_map(entities: list | None = None) -> tuple[dict, dict | None]:
+    """Map every entity_id to its area, the way Home Assistant resolves it.
+
+    An entity's area is its own area_id when set, and otherwise its device's.
+    Reading only the entity registry misses the second case, which in a real
+    installation is most entities: integrations create devices, and people
+    assign the area to the device, not to each entity individually.
+
+    entities: entity_registry/list rows the caller already fetched (e.g. to
+              also read labels or platform), so this does not repeat that
+              round trip - only config/device_registry/list is then sent.
+              When omitted, both registries are fetched here together in a
+              single _ws_multi round trip.
+
+    Returns (map, error_envelope_or_None) so a caller can decide whether a
+    failed read is fatal - it is when the caller was asked to filter by
+    area, because an empty result would be indistinguishable from "nothing
+    is in that area". When the map is only used to enrich rows (grouping,
+    reporting), a caller may instead degrade and keep going - but should
+    say so in its own note, since a silently empty area on every row is
+    the same class of fault this function exists to fix.
+    """
+    if entities is None:
+        ws_results = _ws_multi([
+            {"type": "config/entity_registry/list"},
+            {"type": "config/device_registry/list"},
+        ])
+        if err := ws_error(ws_results[0]):
+            return {}, err
+        entities = ws_results[0]["result"]
+        device_result = ws_results[1]
+    else:
+        device_result = _ws({"type": "config/device_registry/list"})
+    if err := ws_error(device_result):
+        return {}, err
+
+    device_areas = {d["id"]: d.get("area_id") for d in device_result["result"]}
+    area_map = {
+        e["entity_id"]: e.get("area_id") or device_areas.get(e.get("device_id"))
+        for e in entities
+    }
+    return area_map, None

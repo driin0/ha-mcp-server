@@ -1,6 +1,6 @@
 import pytest
 
-from tools._base import envelope, error, ws_error
+from tools._base import entity_area_map, envelope, error, ws_error
 
 
 def test_wraps_a_collection_under_a_named_key():
@@ -27,6 +27,27 @@ def test_truncation_is_announced():
     assert result["returned"] == 3
     assert [row["n"] for row in result["automations"]] == [0, 1, 2]
     assert "3 of 140" in result["note"]
+
+
+def test_truncation_note_does_not_advise_advancing_an_offset_by_default():
+    """Most callers of envelope() with a `limit` have no `offset` parameter
+    at all - offset is always 0 for them, since they never pass one through.
+    Advising "advance offset" there tells the caller to turn a knob the
+    tool does not expose."""
+    rows = [{"n": n} for n in range(140)]
+
+    result = envelope(rows, key="automations", limit=3)
+
+    assert "advance offset" not in result["note"]
+    assert "raise limit" in result["note"]
+
+
+def test_truncation_note_advises_advancing_an_offset_when_the_tool_has_one():
+    rows = [{"n": n} for n in range(140)]
+
+    result = envelope(rows, key="automations", limit=3, offset_paginated=True)
+
+    assert "advance offset" in result["note"]
 
 
 def test_offset_pages_without_losing_the_total():
@@ -144,3 +165,78 @@ def test_success_without_result_key_is_an_error():
 
     assert result["error"] == "bad_response"
     assert "result" in result["detail"]
+
+
+# ---- entity_area_map() ------------------------------------------------------
+# An entity's area is its own area_id when set, and otherwise its device's -
+# reading only the entity registry misses the second case, which on a real
+# installation is most entities.
+
+def test_entity_area_map_prefers_the_entitys_own_area(fake_ha):
+    fake_ha.registry = [
+        {"entity_id": "light.kitchen", "area_id": "kitchen", "device_id": "dev1"},
+    ]
+    fake_ha.devices = [{"id": "dev1", "area_id": "some_other_area"}]
+
+    area_map, err = entity_area_map()
+
+    assert err is None
+    assert area_map["light.kitchen"] == "kitchen"
+
+
+def test_entity_area_map_falls_back_to_the_devices_area(fake_ha):
+    fake_ha.registry = [
+        {"entity_id": "light.garage", "area_id": None, "device_id": "dev1"},
+    ]
+    fake_ha.devices = [{"id": "dev1", "area_id": "garage"}]
+
+    area_map, err = entity_area_map()
+
+    assert err is None
+    assert area_map["light.garage"] == "garage"
+
+
+def test_entity_area_map_reports_no_area_for_an_entity_with_neither(fake_ha):
+    fake_ha.registry = [
+        {"entity_id": "light.attic", "area_id": None, "device_id": None},
+    ]
+    fake_ha.devices = []
+
+    area_map, err = entity_area_map()
+
+    assert err is None
+    assert area_map["light.attic"] is None
+
+
+def test_entity_area_map_reports_an_entity_registry_failure(fake_ha):
+    fake_ha.fail_ws("config/entity_registry/list", code="unauthorized",
+                    message="Admin required")
+
+    area_map, err = entity_area_map()
+
+    assert area_map == {}
+    assert err["error"] == "unauthorized"
+
+
+def test_entity_area_map_reports_a_device_registry_failure(fake_ha):
+    fake_ha.fail_ws("config/device_registry/list", code="unauthorized",
+                    message="Admin required")
+
+    area_map, err = entity_area_map()
+
+    assert area_map == {}
+    assert err["error"] == "unauthorized"
+
+
+def test_entity_area_map_accepts_pre_fetched_entities_and_skips_that_call(fake_ha):
+    """A caller that already fetched the entity registry for its own
+    purposes (labels, platform, ...) can pass the rows through to avoid a
+    second WS round trip for the same data."""
+    fake_ha.devices = [{"id": "dev1", "area_id": "office"}]
+
+    entities = [{"entity_id": "sensor.plug", "area_id": None, "device_id": "dev1"}]
+    area_map, err = entity_area_map(entities=entities)
+
+    assert err is None
+    assert area_map["sensor.plug"] == "office"
+    assert [c["type"] for c in fake_ha.ws_calls] == ["config/device_registry/list"]

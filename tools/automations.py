@@ -54,7 +54,8 @@ def list_automations(search: str = "", label: str = "", limit: int = 50,
         })
 
     automations.sort(key=lambda x: x["name"])
-    return envelope(automations, key="automations", limit=limit, offset=offset)
+    return envelope(automations, key="automations", limit=limit, offset=offset,
+                    offset_paginated=True)
 
 
 @mcp.tool()

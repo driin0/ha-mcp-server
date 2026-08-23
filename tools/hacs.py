@@ -2,16 +2,28 @@ from tools._base import mcp, _ws, envelope, ws_error
 
 
 def _hacs_check(result: dict):
-    """Return an error dict if the WS call failed (e.g. HACS not installed)."""
-    if not result.get("success", True):
-        err = result.get("error", {})
-        code = err.get("code", "unknown")
-        if code in ("unknown_command", "not_found"):
+    """Return an error dict if the WS call failed (e.g. HACS not installed).
+
+    `if not result.get("success", True)` used to be the whole check - which
+    treats a dict with no "success" key at all as a success, since
+    `.get("success", True)` then falls back to the default. _ws returns
+    exactly that shape, {"error": "Auth failed: ..."}, when the connection
+    or the authentication fails, so a transport failure passed straight
+    through: install_hacs_repo reported {"installed": True} for a write
+    that never reached Home Assistant. Routing through ws_error() first -
+    the same helper every other WS-backed tool in this codebase uses -
+    catches that shape too, while still keeping the translation below for
+    the one case ws_error does not know is special to HACS: an
+    unknown_command/not_found response means the custom component simply
+    is not loaded, not a real error.
+    """
+    if err := ws_error(result):
+        if err["error"] in ("unknown_command", "not_found"):
             return {
                 "error": "hacs_not_available",
                 "detail": "HACS is not installed or not running on this Home Assistant instance.",
             }
-        return {"error": code, "detail": err.get("message", str(err))}
+        return err
     return None
 
 

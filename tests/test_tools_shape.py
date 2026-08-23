@@ -33,6 +33,7 @@ def test_list_automations_announces_truncation(fake_ha):
     assert result["total"] == 140
     assert result["returned"] == 3
     assert "3 of 140" in result["note"]
+    assert "advance offset" in result["note"]
 
 
 def test_list_automations_says_when_nothing_matches(fake_ha):
@@ -636,7 +637,9 @@ def test_list_entities_by_integration_wraps_a_success(fake_ha):
 
     assert result["total"] == 1
     assert result["entities"][0]["entity_id"] == "light.hue_1"
-    assert fake_ha.ws_calls[-1]["type"] == "config/entity_registry/list"
+    called = [c["type"] for c in fake_ha.ws_calls]
+    assert "config/entity_registry/list" in called
+    assert "config/device_registry/list" in called
 
 
 def test_list_entities_by_integration_reports_its_own_truncation(fake_ha):
@@ -666,6 +669,57 @@ def test_list_entities_by_integration_reports_a_ws_failure_as_an_error(fake_ha):
 
     assert result["error"] == "unauthorized"
     assert "entities" not in result
+
+
+def test_list_entities_by_integration_reports_area_inherited_from_device(fake_ha):
+    """An entity's area is its own area_id when set, and otherwise its
+    device's - the area_id field reported here must follow that, not just
+    the entity's own registry row."""
+    from tools.diagnostics import list_entities_by_integration
+
+    fake_ha.ws_result("config/entity_registry/list", [
+        {"entity_id": "light.hue_1", "platform": "hue", "name": "Hue 1",
+         "area_id": None, "device_id": "dev1", "labels": [], "disabled_by": None},
+    ])
+    fake_ha.devices = [{"id": "dev1", "area_id": "living_room"}]
+
+    result = list_entities_by_integration("hue")
+
+    assert result["entities"][0]["area_id"] == "living_room"
+
+
+def test_list_entities_by_integration_reports_no_area_when_none_is_set(fake_ha):
+    from tools.diagnostics import list_entities_by_integration
+
+    fake_ha.ws_result("config/entity_registry/list", [
+        {"entity_id": "light.hue_1", "platform": "hue", "name": "Hue 1",
+         "area_id": None, "device_id": None, "labels": [], "disabled_by": None},
+    ])
+
+    result = list_entities_by_integration("hue")
+
+    assert result["entities"][0]["area_id"] is None
+
+
+def test_list_entities_by_integration_degrades_on_a_device_registry_failure(fake_ha):
+    """area_id here is enrichment, not a filter - unlike search_entities, a
+    failed device-registry read must degrade to the entity-registry-only
+    view and say so in `note`, not abort the whole call."""
+    from tools.diagnostics import list_entities_by_integration
+
+    fake_ha.ws_result("config/entity_registry/list", [
+        {"entity_id": "light.hue_1", "platform": "hue", "name": "Hue 1",
+         "area_id": "kitchen", "device_id": None, "labels": [], "disabled_by": None},
+    ])
+    fake_ha.fail_ws("config/device_registry/list", code="unauthorized",
+                    message="Admin required")
+
+    result = list_entities_by_integration("hue")
+
+    assert result["entities"][0]["entity_id"] == "light.hue_1"
+    assert result["entities"][0]["area_id"] == "kitchen"
+    assert "note" in result
+    assert "device registry" in result["note"].lower()
 
 
 def test_get_entity_exposure_wraps_a_success(fake_ha):
@@ -737,13 +791,71 @@ def test_search_entities_uses_its_own_command(fake_ha):
 
     search_entities(query="kitchen")
 
-    assert fake_ha.ws_calls[-1]["type"] == "config/entity_registry/list"
+    called = [c["type"] for c in fake_ha.ws_calls]
+    assert "config/entity_registry/list" in called
+    assert "config/device_registry/list" in called
 
 
 def test_search_entities_reports_a_ws_failure_as_an_error(fake_ha):
     from tools.diagnostics import search_entities
 
     fake_ha.fail_ws("config/entity_registry/list", code="unauthorized",
+                    message="Admin required")
+
+    result = search_entities(query="kitchen")
+
+    assert result["error"] == "unauthorized"
+    assert "entities" not in result
+
+
+def test_search_entities_filters_by_area_inherited_from_device(fake_ha):
+    """An entity's area is its own area_id when set, and otherwise its
+    device's - the area_id filter and the area_id field it reports must
+    both follow that, not just the entity's own registry row. Measured on
+    a live instance: a light whose area comes from its device was invisible
+    to this filter before this fix."""
+    from tools.diagnostics import search_entities
+
+    fake_ha.states = [
+        {"entity_id": "light.garage", "state": "on",
+         "attributes": {"friendly_name": "Garage light"}},
+    ]
+    fake_ha.registry = [
+        {"entity_id": "light.garage", "area_id": None, "device_id": "dev1", "labels": []},
+    ]
+    fake_ha.devices = [{"id": "dev1", "area_id": "garage"}]
+
+    result = search_entities(query="", area_id="garage")
+
+    assert result["total"] == 1
+    assert result["entities"][0]["entity_id"] == "light.garage"
+    assert result["entities"][0]["area_id"] == "garage"
+
+
+def test_search_entities_reports_no_area_when_none_is_set(fake_ha):
+    from tools.diagnostics import search_entities
+
+    fake_ha.states = [
+        {"entity_id": "light.attic", "state": "off",
+         "attributes": {"friendly_name": "Attic light"}},
+    ]
+    fake_ha.registry = [
+        {"entity_id": "light.attic", "area_id": None, "device_id": None, "labels": []},
+    ]
+
+    result = search_entities(query="attic")
+
+    assert result["entities"][0]["area_id"] is None
+
+
+def test_search_entities_device_registry_failure_is_also_fatal(fake_ha):
+    """search_entities has always treated a registry failure as fatal
+    regardless of which filter was passed, because `labels` is reported on
+    every row too - the device registry backing the same area_id is held
+    to the same standard rather than silently degrading."""
+    from tools.diagnostics import search_entities
+
+    fake_ha.fail_ws("config/device_registry/list", code="unauthorized",
                     message="Admin required")
 
     result = search_entities(query="kitchen")
@@ -808,6 +920,33 @@ def test_get_entity_dependencies_caps_the_searched_count_at_the_probe_limit(fake
 
     assert result["total_automations_searched"] == 200
     assert result["total_scripts_searched"] == 0
+    assert "200" in result["note"]
+    assert "250" in result["note"]
+
+
+def test_get_entity_dependencies_notes_a_cap_even_with_no_failures(fake_ha):
+    """The note used to appear only when failed_checks was non-zero. With
+    more automations than the probe limit but every probe succeeding (and
+    finding nothing), the old code returned a clean empty result with no
+    hint that the search stopped early - exactly the situation this tool
+    exists to prevent a bad rename/delete on."""
+    from tools.diagnostics import get_entity_dependencies
+
+    fake_ha.states = [
+        {"entity_id": f"automation.a{n}", "state": "on",
+         "attributes": {"friendly_name": f"A{n}", "id": f"a{n}"}}
+        for n in range(205)
+    ]
+    fake_ha.rest_responses["/api/config/automation/config/"] = (
+        200, {"trigger": [], "condition": [], "action": []})
+
+    result = get_entity_dependencies("light.kitchen")
+
+    assert result["failed_checks"] == 0
+    assert result["automations"] == []
+    assert "note" in result
+    assert "200" in result["note"]
+    assert "205" in result["note"]
 
 
 def test_get_entity_dependencies_counts_failed_checks(fake_ha):
@@ -935,6 +1074,7 @@ def test_list_devices_wraps_a_success_through_the_shared_envelope(fake_ha):
     assert result["total"] == 5
     assert result["returned"] == 2
     assert "2 of 5" in result["note"]
+    assert "advance offset" in result["note"]
 
 
 def test_list_labels_reports_a_ws_failure_as_an_error(fake_ha):
@@ -949,6 +1089,36 @@ def test_list_labels_reports_a_ws_failure_as_an_error(fake_ha):
     assert "labels" not in result
 
 
+def test_list_labels_wraps_a_success_through_the_shared_envelope(fake_ha):
+    """list_labels used to hand-roll {total, labels} itself - no returned,
+    no offset, no empty-collection note - which could regress to a bare
+    list and still pass a shape check that only looks for a "labels" key."""
+    from tools.areas import list_labels
+
+    fake_ha.ws_result("config/label_registry/list", [
+        {"label_id": "energy", "name": "Energy"},
+        {"label_id": "outdoor", "name": "Outdoor"},
+    ])
+
+    result = list_labels()
+
+    assert result["total"] == 2
+    assert result["returned"] == 2
+    assert result["offset"] == 0
+    assert [l["label_id"] for l in result["labels"]] == ["energy", "outdoor"]
+
+
+def test_list_labels_says_when_nothing_matches(fake_ha):
+    from tools.areas import list_labels
+
+    fake_ha.ws_result("config/label_registry/list", [])
+
+    result = list_labels()
+
+    assert result["total"] == 0
+    assert result["note"] == "no labels found"
+
+
 def test_list_floors_reports_a_ws_failure_as_an_error(fake_ha):
     from tools.areas import list_floors
 
@@ -961,6 +1131,35 @@ def test_list_floors_reports_a_ws_failure_as_an_error(fake_ha):
     assert "floors" not in result
 
 
+def test_list_floors_wraps_a_success_through_the_shared_envelope(fake_ha):
+    """Same conversion as list_labels: a hand-rolled {total, floors} gains
+    returned/offset/note by routing through envelope()."""
+    from tools.areas import list_floors
+
+    fake_ha.ws_result("config/floor_registry/list", [
+        {"floor_id": "first", "name": "First floor", "level": 1},
+        {"floor_id": "ground", "name": "Ground floor", "level": 0},
+    ])
+
+    result = list_floors()
+
+    assert result["total"] == 2
+    assert result["returned"] == 2
+    assert result["offset"] == 0
+    assert [f["floor_id"] for f in result["floors"]] == ["ground", "first"]
+
+
+def test_list_floors_says_when_nothing_matches(fake_ha):
+    from tools.areas import list_floors
+
+    fake_ha.ws_result("config/floor_registry/list", [])
+
+    result = list_floors()
+
+    assert result["total"] == 0
+    assert result["note"] == "no floors found"
+
+
 def test_get_entity_registry_reports_a_ws_failure_as_an_error(fake_ha):
     from tools.areas import get_entity_registry
 
@@ -970,6 +1169,54 @@ def test_get_entity_registry_reports_a_ws_failure_as_an_error(fake_ha):
     result = get_entity_registry("light.ghost")
 
     assert result["error"] == "not_found"
+    assert "entity_id" not in result
+
+
+def test_get_entity_registry_returns_entity_own_area(fake_ha):
+    from tools.areas import get_entity_registry
+
+    # Entity with its own area should report it (test_bed_light has area_id="bedroom")
+    result = get_entity_registry("light.bed_light")
+
+    assert result["entity_id"] == "light.bed_light"
+    assert result["area_id"] == "bedroom"
+    assert result["device_id"] == "device_bed"
+
+
+def test_get_entity_registry_falls_back_to_device_area(fake_ha):
+    from tools.areas import get_entity_registry
+
+    # Entity inheriting area from device (no own area_id, device has area_id)
+    result = get_entity_registry("light.kitchen_lights")
+
+    assert result["entity_id"] == "light.kitchen_lights"
+    assert result["device_id"] == "device_kitchen"
+    # Should resolve to the device's area
+    assert result["area_id"] == "stanza_del_dispositivo"
+
+
+def test_get_entity_registry_no_area_at_all(fake_ha):
+    from tools.areas import get_entity_registry
+
+    # Entity with no area (no own area_id, no device_id at all)
+    result = get_entity_registry("switch.garage_door")
+
+    assert result["entity_id"] == "switch.garage_door"
+    assert result["area_id"] is None
+    assert result["device_id"] is None
+
+
+def test_get_entity_registry_device_registry_failure_surfaces_error(fake_ha):
+    from tools.areas import get_entity_registry
+
+    # Set up an entity with a device_id but make device registry fail
+    fake_ha.fail_ws("config/device_registry/list", code="internal_error",
+                    message="Device registry error")
+
+    result = get_entity_registry("light.kitchen_lights")
+
+    # Should return the error, not silently return null for area_id
+    assert result["error"] == "internal_error"
     assert "entity_id" not in result
 
 
@@ -1127,6 +1374,60 @@ def test_list_lovelace_resources_failure_is_an_error_not_a_record(fake_ha):
 
 
 # ---- tools/hacs.py ---------------------------------------------------------
+
+def test_hacs_check_reports_a_transport_failure_instead_of_a_false_success(fake_ha):
+    """_ws returns {"error": "Auth failed: ..."} - no "success" key at all -
+    when the connection or the authentication fails. The old
+    `not result.get("success", True)` treated a missing key as a success
+    (the default), so this shape passed _hacs_check as if HACS had
+    answered normally. Routing through ws_error() first must catch it and
+    report it as itself, not misdiagnose it as hacs_not_available - a
+    transport failure says nothing about whether HACS is installed."""
+    from tools.hacs import _hacs_check
+
+    frame = {"error": "Auth failed: {'type': 'auth_invalid'}"}
+
+    result = _hacs_check(frame)
+
+    assert result["error"] == "websocket_error"
+    assert "auth_invalid" in result["detail"]
+
+
+def test_install_hacs_repo_reports_a_transport_failure_instead_of_a_false_success(fake_ha):
+    """End-to-end version of the _hacs_check fix: a write whose request
+    never reached Home Assistant must not come back looking like
+    {"installed": True}."""
+    from tools.hacs import install_hacs_repo
+
+    fake_ha.ws_responses["hacs/repository/download"] = {
+        "error": "Auth failed: {'type': 'auth_invalid'}"
+    }
+
+    result = install_hacs_repo("1234")
+
+    assert result["error"] == "websocket_error"
+    assert "installed" not in result
+
+
+def test_hacs_info_wraps_a_success(fake_ha):
+    from tools.hacs import hacs_info
+
+    fake_ha.ws_result("hacs/info", {"version": "2.0.0", "stage": "running"})
+
+    result = hacs_info()
+
+    assert result["version"] == "2.0.0"
+
+
+def test_hacs_info_reports_hacs_not_installed(fake_ha):
+    from tools.hacs import hacs_info
+
+    fake_ha.fail_ws("hacs/info", code="unknown_command", message="unknown command")
+
+    result = hacs_info()
+
+    assert result["error"] == "hacs_not_available"
+
 
 def test_list_hacs_repos_reports_hacs_not_installed(fake_ha):
     """list_hacs_repos and search_hacs route their ws_error() failure
@@ -1294,6 +1595,66 @@ def test_get_energy_wraps_a_success(fake_ha):
     assert result["consumers"][0]["entity_id"] == "sensor.plug_kitchen"
 
 
+def test_get_energy_summary_groups_by_area_including_device_inherited(fake_ha):
+    """An entity's area is its own area_id when set, and otherwise its
+    device's - the grouping here must resolve both, not just the first,
+    and an entity with neither must fall into 'other' rather than being
+    mis-grouped."""
+    from tools.sensors import get_energy_summary
+
+    fake_ha.states = [
+        {"entity_id": "sensor.plug_kitchen", "state": "100",
+         "attributes": {"friendly_name": "Kitchen plug", "device_class": "power"}},
+        {"entity_id": "sensor.plug_office", "state": "50",
+         "attributes": {"friendly_name": "Office plug", "device_class": "power"}},
+        {"entity_id": "sensor.plug_orphan", "state": "10",
+         "attributes": {"friendly_name": "Orphan plug", "device_class": "power"}},
+    ]
+    fake_ha.registry = [
+        {"entity_id": "sensor.plug_kitchen", "area_id": "kitchen", "device_id": None, "labels": []},
+        {"entity_id": "sensor.plug_office", "area_id": None, "device_id": "dev1", "labels": []},
+        {"entity_id": "sensor.plug_orphan", "area_id": None, "device_id": None, "labels": []},
+    ]
+    fake_ha.devices = [{"id": "dev1", "area_id": "office"}]
+    fake_ha.ws_result("config/area_registry/list", [
+        {"area_id": "kitchen", "name": "Kitchen"},
+        {"area_id": "office", "name": "Office"},
+    ])
+
+    result = get_energy_summary()
+
+    groups = {g["group"]: g for g in result["groups"]}
+    assert groups["Kitchen"]["total_w"] == 100
+    assert groups["Office"]["total_w"] == 50
+    assert groups["other"]["total_w"] == 10
+    assert "note" not in result
+
+
+def test_get_energy_summary_degrades_on_a_device_registry_failure_with_a_note(fake_ha):
+    """The area map here is only used to group sensors, not to filter -
+    this tool has no area_id parameter - so a failed read must degrade to
+    'other' for every sensor rather than aborting, but it must say so:
+    silently dumping everything into 'other' is indistinguishable from an
+    instance where nothing has an area."""
+    from tools.sensors import get_energy_summary
+
+    fake_ha.states = [
+        {"entity_id": "sensor.plug_kitchen", "state": "100",
+         "attributes": {"friendly_name": "Kitchen plug", "device_class": "power"}},
+    ]
+    fake_ha.registry = [
+        {"entity_id": "sensor.plug_kitchen", "area_id": "kitchen", "device_id": None, "labels": []},
+    ]
+    fake_ha.fail_ws("config/device_registry/list", code="unauthorized",
+                    message="Admin required")
+
+    result = get_energy_summary()
+
+    assert result["groups"][0]["group"] == "other"
+    assert "note" in result
+    assert "area" in result["note"].lower()
+
+
 def test_list_sensors_wraps_a_success(fake_ha):
     from tools.sensors import list_sensors
 
@@ -1325,6 +1686,9 @@ def test_list_sensors_reports_its_own_truncation(fake_ha):
 
     assert result["total"] == 150
     assert result["returned"] == 10
+    # list_sensors has no offset parameter - the note must not tell the
+    # caller to advance one that does not exist.
+    assert "advance offset" not in result["note"]
 
 
 # ---- tools/statistics.py -----------------------------------------------------
@@ -1463,6 +1827,96 @@ def test_list_lights_filters_by_state(fake_ha):
 
     assert result["total"] == 1
     assert result["lights"][0]["entity_id"] == "light.kitchen"
+
+
+def test_list_lights_filters_by_area(fake_ha):
+    """area_id lives in the entity registry, not in state attributes - Home
+    Assistant never sets it there. The old filter read attrs.get("area_id"),
+    a key that is always absent, so it could never match a single light on
+    any real instance. fake_ha's default registry already has light.kitchen
+    in "kitchen" and light.study in "study"."""
+    from tools.lights import list_lights
+
+    result = list_lights(area_id="kitchen")
+
+    assert result["total"] == 1
+    assert result["lights"][0]["entity_id"] == "light.kitchen"
+    called = [c["type"] for c in fake_ha.ws_calls]
+    assert "config/entity_registry/list" in called
+    assert "config/device_registry/list" in called
+
+
+def test_list_lights_area_filter_reports_a_ws_failure_as_an_error(fake_ha):
+    from tools.lights import list_lights
+
+    fake_ha.fail_ws("config/entity_registry/list", code="unauthorized",
+                    message="Admin required")
+
+    result = list_lights(area_id="kitchen")
+
+    assert result["error"] == "unauthorized"
+    assert "lights" not in result
+
+
+def test_list_lights_without_area_filter_skips_the_registry_call(fake_ha):
+    """The registry lookup is only needed to filter by area - a plain
+    listing must not pay for a WS round trip it does not use."""
+    from tools.lights import list_lights
+
+    list_lights()
+
+    assert fake_ha.ws_calls == []
+
+
+def test_list_lights_filters_by_area_inherited_from_device(fake_ha):
+    """An entity's area is its own area_id when set, and otherwise its
+    device's - reading only the entity registry misses every light whose
+    area comes from its device, which on a real installation is most of
+    them. Measured live: list_lights(area_id=...) returned no results for
+    such a light while list_areas() correctly listed it under that area."""
+    from tools.lights import list_lights
+
+    fake_ha.states = [
+        {"entity_id": "light.garage", "state": "on",
+         "attributes": {"friendly_name": "Garage light"}},
+    ]
+    fake_ha.registry = [
+        {"entity_id": "light.garage", "area_id": None, "device_id": "dev1", "labels": []},
+    ]
+    fake_ha.devices = [{"id": "dev1", "area_id": "garage"}]
+
+    result = list_lights(area_id="garage")
+
+    assert result["total"] == 1
+    assert result["lights"][0]["entity_id"] == "light.garage"
+
+
+def test_list_lights_area_filter_excludes_a_light_with_no_area(fake_ha):
+    from tools.lights import list_lights
+
+    fake_ha.states = [
+        {"entity_id": "light.hallway", "state": "on",
+         "attributes": {"friendly_name": "Hallway light"}},
+    ]
+    fake_ha.registry = [
+        {"entity_id": "light.hallway", "area_id": None, "device_id": None, "labels": []},
+    ]
+
+    result = list_lights(area_id="kitchen")
+
+    assert result["total"] == 0
+
+
+def test_list_lights_area_filter_device_registry_failure_is_also_fatal(fake_ha):
+    from tools.lights import list_lights
+
+    fake_ha.fail_ws("config/device_registry/list", code="unauthorized",
+                    message="Admin required")
+
+    result = list_lights(area_id="kitchen")
+
+    assert result["error"] == "unauthorized"
+    assert "lights" not in result
 
 
 def test_get_alarm_state_wraps_a_success(fake_ha):

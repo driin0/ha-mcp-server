@@ -120,7 +120,8 @@ def list_devices(area_id: str = "", search: str = "", limit: int = 50, offset: i
     trimmed.sort(key=lambda x: x["name"].lower())
     if search:
         trimmed = [d for d in trimmed if search.lower() in d["name"].lower()]
-    return envelope(trimmed, key="devices", limit=limit, offset=offset)
+    return envelope(trimmed, key="devices", limit=limit, offset=offset,
+                    offset_paginated=True)
 
 
 @mcp.tool()
@@ -154,12 +155,16 @@ def rename_entity(entity_id: str, name: str) -> dict:
 
 @mcp.tool()
 def list_labels() -> dict:
-    """List all labels defined in Home Assistant, sorted by name."""
+    """
+    List all labels defined in Home Assistant, sorted by name.
+
+    Returns: {total, returned, offset, note?, labels: [...]}
+    """
     r = _ws({"type": "config/label_registry/list"})
     if err := ws_error(r):
         return err
     labels = sorted(r["result"], key=lambda x: x.get("name", "").lower())
-    return {"total": len(labels), "labels": labels}
+    return envelope(labels, key="labels")
 
 
 @mcp.tool()
@@ -267,12 +272,16 @@ def bulk_set_entity_labels(entity_ids: list, labels: list) -> dict:
 
 @mcp.tool()
 def list_floors() -> dict:
-    """List all floors defined in Home Assistant, sorted by level."""
+    """
+    List all floors defined in Home Assistant, sorted by level.
+
+    Returns: {total, returned, offset, note?, floors: [...]}
+    """
     r = _ws({"type": "config/floor_registry/list"})
     if err := ws_error(r):
         return err
     floors = sorted(r["result"], key=lambda x: x.get("level", 0))
-    return {"total": len(floors), "floors": floors}
+    return envelope(floors, key="floors")
 
 
 @mcp.tool()
@@ -309,12 +318,25 @@ def get_entity_registry(entity_id: str) -> dict:
     if err := ws_error(r):
         return err
     result = r["result"]
+
+    # Resolve area_id: entity's own area, or fall back to device's area
+    area_id = result.get("area_id")
+    device_id = result.get("device_id")
+    if not area_id and device_id:
+        device_r = _ws({"type": "config/device_registry/list"})
+        if err := ws_error(device_r):
+            return err
+        for device in device_r.get("result", []):
+            if device.get("id") == device_id:
+                area_id = device.get("area_id")
+                break
+
     return {
         "entity_id": result.get("entity_id"),
         "name": result.get("name") or result.get("original_name"),
         "platform": result.get("platform"),
-        "device_id": result.get("device_id"),
-        "area_id": result.get("area_id"),
+        "device_id": device_id,
+        "area_id": area_id,
         "unique_id": result.get("unique_id"),
         "disabled_by": result.get("disabled_by"),
         "hidden_by": result.get("hidden_by"),

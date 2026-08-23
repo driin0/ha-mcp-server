@@ -81,7 +81,7 @@ saved conversations assume a bare list, they need updating — see below.
 
 ### Added
 
-- A pytest suite (128 tests) and a GitHub Actions CI workflow
+- A pytest suite (156 tests) and a GitHub Actions CI workflow
   (`.github/workflows/test.yml`). The repository previously had no tests.
 
 ## 1.1.0

@@ -1,7 +1,10 @@
 import httpx
 from datetime import datetime, timedelta, timezone
 
-from tools._base import mcp, HA_URL, HEADERS, default_language, _ws, _ws_multi, envelope, ws_error
+from tools._base import (
+    mcp, HA_URL, HEADERS, default_language, entity_area_map, _ws, _ws_multi,
+    envelope, ws_error,
+)
 
 
 @mcp.tool()
@@ -301,6 +304,23 @@ def list_entities_by_integration(integration: str, search: str = "", limit: int 
     result = _ws({"type": "config/entity_registry/list"})
     if err := ws_error(result):
         return err
+
+    # area_id below is enrichment, not a filter - this tool has no area_id
+    # parameter - so a failed device-registry read degrades to the
+    # entity-registry-only view (area_map stays empty, area_map.get() then
+    # falls back to the raw, own-area-only value) rather than aborting the
+    # whole call. It still has to say so: a silently empty/wrong area_id on
+    # every row is the same class of fault entity_area_map() exists to fix.
+    area_map, area_err = entity_area_map(entities=result["result"])
+    degraded_note = ""
+    if area_err:
+        area_map = {}
+        degraded_note = (
+            "device registry unavailable - area_id reflects only entities "
+            "with their own area assignment, not those inheriting one from "
+            "their device"
+        )
+
     out = []
     for e in result["result"]:
         if e.get("platform") != integration:
@@ -312,11 +332,16 @@ def list_entities_by_integration(integration: str, search: str = "", limit: int 
             "entity_id": e["entity_id"],
             "name": name,
             "platform": e.get("platform"),
-            "area_id": e.get("area_id"),
+            "area_id": area_map.get(e["entity_id"], e.get("area_id")),
             "disabled": e.get("disabled_by") is not None,
         })
     out.sort(key=lambda x: x["entity_id"])
-    return envelope(out, key="entities", limit=limit)
+    out_result = envelope(out, key="entities", limit=limit)
+    if degraded_note:
+        out_result["note"] = (
+            f"{out_result['note']} {degraded_note}" if out_result.get("note") else degraded_note
+        )
+    return out_result
 
 
 @mcp.tool()
@@ -431,7 +456,10 @@ def get_entity_dependencies(entity_id: str) -> dict:
     Returns: {entity_id, automations: [...], scripts: [...],
              total_automations_searched, total_scripts_searched,
              failed_checks, note?}
-    Note: searches up to 200 automations and 200 scripts in parallel.
+    Note: searches up to 200 automations and 200 scripts in parallel. An
+    instance with more than that gets a note saying the search was capped -
+    even when every probe that ran succeeded and found nothing, since a
+    clean empty result and an incomplete search look identical otherwise.
     failed_checks counts probes that could not be completed (an
     authorisation failure, a deleted config entry, a network error) - those
     are not evidence the entity is unreferenced, and a non-zero count comes
@@ -505,6 +533,9 @@ def get_entity_dependencies(entity_id: str) -> dict:
             if not ok:
                 failed_checks += 1
 
+    capped = (len(automations) > _MAX_DEPENDENCY_PROBES
+              or len(scripts) > _MAX_DEPENDENCY_PROBES)
+
     result = {
         "entity_id": entity_id,
         "automations": sorted(dep_automations, key=lambda x: x["name"]),
@@ -513,11 +544,27 @@ def get_entity_dependencies(entity_id: str) -> dict:
         "total_scripts_searched": min(len(scripts), _MAX_DEPENDENCY_PROBES),
         "failed_checks": failed_checks,
     }
+    # This tool is typically called right before renaming or deleting an
+    # entity, so an instance with more automations/scripts than the probe
+    # limit must say so even when every probe that did run succeeded - a
+    # clean empty result with no note here used to look like a confirmed
+    # "nothing references this entity" when it was really "not everything
+    # was checked."
+    notes = []
+    if capped:
+        notes.append(
+            f"only the first {_MAX_DEPENDENCY_PROBES} automations and "
+            f"{_MAX_DEPENDENCY_PROBES} scripts were searched, out of "
+            f"{len(automations)} automation(s) and {len(scripts)} script(s) "
+            "that exist - references beyond that limit would be missed"
+        )
     if failed_checks:
-        result["note"] = (
+        notes.append(
             f"{failed_checks} probe(s) could not be completed - the result "
             "may be incomplete"
         )
+    if notes:
+        result["note"] = " ".join(notes)
     return result
 
 
@@ -592,6 +639,16 @@ def search_entities(
         return err
     registry = {e["entity_id"]: e for e in ws_result["result"]}
 
+    # A registry read failure has always been fatal here, regardless of
+    # which filters were passed - the `labels` field on every output row
+    # depends on it too. The device registry backs the same area_id (both
+    # the filter below and the field reported on each row), so a failure
+    # reading it is treated the same way rather than silently falling back
+    # to the entity-only, device-inheritance-blind value.
+    area_map, err = entity_area_map(entities=ws_result["result"])
+    if err:
+        return err
+
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -610,7 +667,7 @@ def search_entities(
             continue
         if state and s["state"] != state:
             continue
-        if area_id and reg_entry.get("area_id") != area_id:
+        if area_id and area_map.get(eid) != area_id:
             continue
         if label and label not in reg_entry.get("labels", []):
             continue
@@ -622,7 +679,7 @@ def search_entities(
             "name": name,
             "domain": eid_domain,
             "state": s["state"],
-            "area_id": reg_entry.get("area_id"),
+            "area_id": area_map.get(eid),
             "labels": list(reg_entry.get("labels", [])),
         })
 

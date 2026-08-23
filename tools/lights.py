@@ -1,6 +1,6 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, envelope
+from tools._base import mcp, HA_URL, HEADERS, entity_area_map, envelope
 
 
 @mcp.tool()
@@ -14,6 +14,18 @@ def list_lights(area_id: str = "", search: str = "", state: str = "") -> dict:
 
     Returns: {total, returned, offset, note?, lights: [...]}
     """
+    area_map = {}
+    if area_id:
+        # area is entity-registry metadata, not a state attribute - Home
+        # Assistant never puts it on states, so the filter has to join the
+        # registry the same way search_entities() and get_energy_summary()
+        # do. A light's area comes from its own area_id when set and
+        # otherwise from its device, so both registries are needed - see
+        # entity_area_map().
+        area_map, err = entity_area_map()
+        if err:
+            return err
+
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -22,7 +34,7 @@ def list_lights(area_id: str = "", search: str = "", state: str = "") -> dict:
         if not s["entity_id"].startswith("light."):
             continue
         attrs = s.get("attributes", {})
-        if area_id and attrs.get("area_id") != area_id:
+        if area_id and area_map.get(s["entity_id"]) != area_id:
             continue
         if state and s["state"] != state:
             continue

@@ -20,10 +20,26 @@ DEFAULT_STATES = [
 ]
 
 DEFAULT_REGISTRY = [
-    {"entity_id": "light.kitchen", "area_id": "kitchen", "labels": []},
-    {"entity_id": "light.study", "area_id": "study", "labels": []},
-    {"entity_id": "automation.nas_shutdown", "area_id": None, "labels": ["power"]},
-    {"entity_id": "automation.morning", "area_id": None, "labels": []},
+    {"entity_id": "light.kitchen", "area_id": "kitchen", "device_id": None, "labels": []},
+    {"entity_id": "light.study", "area_id": "study", "device_id": None, "labels": []},
+    {"entity_id": "automation.nas_shutdown", "area_id": None, "device_id": None, "labels": ["power"]},
+    {"entity_id": "automation.morning", "area_id": None, "device_id": None, "labels": []},
+    # Entity with own area (takes precedence over device area)
+    {"entity_id": "light.bed_light", "area_id": "bedroom", "device_id": "device_bed", "labels": []},
+    # Entity inheriting area from device
+    {"entity_id": "light.kitchen_lights", "area_id": None, "device_id": "device_kitchen", "labels": []},
+    # Entity with no area at all
+    {"entity_id": "switch.garage_door", "area_id": None, "device_id": None, "labels": []},
+]
+
+# config/device_registry/list rows. Empty by default: none of the default
+# entities above are attached to a device, so the default fixture exercises
+# only the "area set directly on the entity" path. A test that wants the
+# "area inherited from the device" path adds a device here and points an
+# entity's device_id at it - see DEFAULT_REGISTRY for the entity side.
+DEFAULT_DEVICES = [
+    {"id": "device_bed", "name": "Bed", "area_id": None, "manufacturer": None, "model": None, "labels": []},
+    {"id": "device_kitchen", "name": "Kitchen", "area_id": "stanza_del_dispositivo", "manufacturer": None, "model": None, "labels": []},
 ]
 
 
@@ -33,6 +49,7 @@ class FakeHA:
     def __init__(self):
         self.states = [dict(s) for s in DEFAULT_STATES]
         self.registry = [dict(e) for e in DEFAULT_REGISTRY]
+        self.devices = [dict(d) for d in DEFAULT_DEVICES]
         self.config = {"version": "2026.8.1", "location_name": "Test",
                        "language": "en"}
         # Per-command WebSocket overrides: {"tag/list": {"success": True, ...}}
@@ -125,6 +142,18 @@ class FakeHA:
         if kind == "config/entity_registry/list":
             return {"id": 1, "type": "result", "success": True,
                     "result": self.registry}
+        if kind == "config/entity_registry/get":
+            entity_id = msg.get("entity_id")
+            for entity in self.registry:
+                if entity.get("entity_id") == entity_id:
+                    return {"id": 1, "type": "result", "success": True,
+                            "result": entity}
+            return {"id": 1, "type": "result", "success": False,
+                    "error": {"code": "not_found",
+                              "message": f"Entity not found: {entity_id}"}}
+        if kind == "config/device_registry/list":
+            return {"id": 1, "type": "result", "success": True,
+                    "result": self.devices}
         return {"id": 1, "type": "result", "success": False,
                 "error": {"code": "unknown_command",
                           "message": f"No fake response for {kind}"}}

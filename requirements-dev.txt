@@ -1,3 +1,10 @@
+# tools/ itself is only ever imported, never reinstalled, so the pytest
+# suite needs the production dependencies (httpx, mcp, python-dotenv,
+# websockets) on top of the dev-only ones below - without this, `pip
+# install -r requirements-dev.txt` alone leaves pytest failing at the
+# first `import httpx` with ModuleNotFoundError.
+-r requirements.txt
+
 # Not used by the pytest suite (tests/ runs entirely against an in-process
 # fake, no browser involved) - it's here for scripts/screenshots.py, which
 # drives a real Chromium against the dashboard mock to regenerate docs/img/.
