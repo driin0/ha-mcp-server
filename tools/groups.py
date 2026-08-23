@@ -1,6 +1,6 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws, envelope
+from tools._base import mcp, HA_URL, HEADERS, _ws, confirm_entity_exists, envelope, error, observe_actuation
 
 
 @mcp.tool()
@@ -56,22 +56,23 @@ def create_group(
                   (default False: 'on' when ANY entity is on)
     icon:        MDI icon, e.g. 'mdi:lightbulb-group' (optional)
 
-    Use list_groups() after creating to verify the result.
+    Returns: {entity_id, name, entities, verified, state} on a call Home
+    Assistant accepted. `verified` is true only when group.<object_id>
+    exists afterward with a member list matching `entities` exactly, read
+    back rather than assumed. Note that Home Assistant does not validate
+    membership: an entity_id in `entities` that does not itself exist is
+    still accepted and stored as a member as-is (measured live), so
+    `verified: true` here confirms the group was created with the member
+    list requested, not that every member is real.
     """
-    data: dict = {
-        "object_id": name.lower().replace(" ", "_"),
-        "name": name,
-        "entities": entities,
-        "all": all_entities,
-    }
-    if icon:
-        data["icon"] = icon
+    object_id = name.lower().replace(" ", "_")
+    entity_id = f"group.{object_id}"
     with httpx.Client() as client:
         r = client.post(
             f"{HA_URL}/api/services/group/set",
             headers=HEADERS,
             json={
-                "object_id": data["object_id"],
+                "object_id": object_id,
                 "name": name,
                 "entities": ",".join(entities),
                 "all": all_entities,
@@ -80,10 +81,16 @@ def create_group(
             timeout=15,
         )
         r.raise_for_status()
+
+    wanted = set(entities)
+    obs = observe_actuation(entity_id, lambda s: set(s.get("attributes", {}).get("entity_id", [])) == wanted)
+    actual_entities = obs["state"].get("attributes", {}).get("entity_id", []) if obs["exists"] else []
     return {
-        "entity_id": f"group.{data['object_id']}",
+        "entity_id": entity_id,
         "name": name,
-        "entities": entities,
+        "entities": actual_entities,
+        "verified": obs["verified"],
+        "state": obs["state"]["state"] if obs["exists"] else None,
     }
 
 
@@ -105,7 +112,23 @@ def update_group(
     icon:        new MDI icon
 
     Only non-None/non-empty fields are updated; others keep their current value.
+
+    Returns: {entity_id, verified, state, entities} on a call Home Assistant
+    accepted, or {error: "entity_not_found", ...} when entity_id has no
+    state at all — checked BEFORE calling group/set, not after: that
+    service does not distinguish create from update, so pointed at an
+    object_id with no existing group it creates a new one instead of
+    failing (measured live) - without this check, "update" a group that
+    was never there would silently create it and report success.
+
+    `verified` is true only when every field actually given
+    (entities/name/all_entities — icon is not exposed on the state object,
+    so it cannot be checked here) matches on read-back, not merely that
+    the call returned 2xx.
     """
+    if missing := confirm_entity_exists(entity_id):
+        return missing
+
     object_id = entity_id.removeprefix("group.")
     payload: dict = {"object_id": object_id}
     if entities is not None:
@@ -124,7 +147,28 @@ def update_group(
             timeout=15,
         )
         r.raise_for_status()
-    return {"entity_id": entity_id, "updated": True}
+
+    def matches(s: dict) -> bool:
+        attrs = s.get("attributes", {})
+        if entities is not None and set(attrs.get("entity_id", [])) != set(entities):
+            return False
+        if name and attrs.get("friendly_name") != name:
+            return False
+        if all_entities is not None and attrs.get("all") != all_entities:
+            return False
+        return True
+
+    obs = observe_actuation(entity_id, matches)
+    if not obs["exists"]:
+        return error("entity_not_found",
+                     f"{entity_id} does not exist on this Home Assistant instance.",
+                     entity_id=entity_id)
+    return {
+        "entity_id": entity_id,
+        "verified": obs["verified"],
+        "state": obs["state"]["state"],
+        "entities": obs["state"].get("attributes", {}).get("entity_id", []),
+    }
 
 
 @mcp.tool()
@@ -136,7 +180,23 @@ def delete_group(entity_id: str) -> dict:
 
     Note: only groups created via the 'group.set' service can be deleted this way.
     YAML-defined groups (in groups.yaml) must be removed manually from the file.
+
+    Returns: {entity_id, verified} on a call Home Assistant accepted, or
+    {error: "entity_not_found", ...} when entity_id had no state even
+    before the call — nothing to delete. `verified` is true only when
+    entity_id no longer has a state afterward — a YAML-defined group is
+    accepted by group/remove without effect, since the service only
+    removes storage-backed groups, which `verified: false` reports rather
+    than a blanket claimed success.
     """
+    with httpx.Client() as client:
+        r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
+    if r.status_code == 404:
+        return error("entity_not_found",
+                     f"{entity_id} does not exist on this Home Assistant instance.",
+                     entity_id=entity_id)
+    r.raise_for_status()
+
     object_id = entity_id.removeprefix("group.")
     with httpx.Client() as client:
         r = client.post(
@@ -146,4 +206,10 @@ def delete_group(entity_id: str) -> dict:
             timeout=15,
         )
         r.raise_for_status()
-    return {"deleted": entity_id, "success": True}
+
+    # observe_actuation()'s predicate is never satisfied by a state that
+    # still exists, so a group that survives the delete falls through to
+    # exists=True/verified=False after the retry; one that is gone by
+    # then returns exists=False immediately - which here IS the success.
+    obs = observe_actuation(entity_id, lambda s: False)
+    return {"entity_id": entity_id, "verified": not obs["exists"]}

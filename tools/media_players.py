@@ -1,6 +1,8 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, ALEXA_KEYWORDS, default_language, _ws, envelope, ws_error
+from tools._base import (
+    mcp, HA_URL, HEADERS, ALEXA_KEYWORDS, default_language, _ws, confirm_entity_exists, envelope, error, ws_error,
+)
 
 
 @mcp.tool()
@@ -47,7 +49,15 @@ def send_tts(entity_id: str, message: str, language: str = "", engine: str = "tt
     automatically. A player counts as an Echo when its entity_id contains one of
     the configured Alexa keywords ('echo' or 'alexa' unless changed) — set them
     to match speaker groups named after a room or the household.
+
+    Returns: {entity_id, message, method, accepted: true, verified: null,
+    detail} once Home Assistant accepts the call, or
+    {error: "entity_not_found", ...} when entity_id has no state at all.
+    Whether the announcement was actually heard has no state in Home
+    Assistant to read back, so `verified` stays null.
     """
+    if missing := confirm_entity_exists(entity_id):
+        return missing
     language = language or default_language()
     name = entity_id.split(".", 1)[1]
     is_alexa = any(kw in name.lower() for kw in ALEXA_KEYWORDS)
@@ -75,7 +85,15 @@ def send_tts(entity_id: str, message: str, language: str = "", engine: str = "tt
                 timeout=15,
             )
         r.raise_for_status()
-    return {"entity_id": entity_id, "message": message, "method": "alexa_announce" if is_alexa else "tts_speak"}
+    return {
+        "entity_id": entity_id,
+        "message": message,
+        "method": "alexa_announce" if is_alexa else "tts_speak",
+        "accepted": True,
+        "verified": None,
+        "detail": "Home Assistant accepted the announcement; whether it "
+                  "was actually heard has no state here to confirm.",
+    }
 
 
 @mcp.tool()
@@ -102,7 +120,22 @@ def media_player_control(
       - 'volume'      set volume (requires volume: 0.0–1.0)
       - 'source'      select source (requires source parameter)
       - 'play_media'  play specific media (requires media_content_id, optional media_content_type)
+
+    Returns: {command, entity_id, accepted: true, verified: null, detail}
+    once Home Assistant accepts the call, or {error: "entity_not_found"/
+    "invalid_command", ...} otherwise.
+
+    `verified` stays null rather than checked against the player's state:
+    the media_player domain spans dozens of unrelated integrations (a
+    Chromecast, a Sonos, a browser tab, an Alexa speaker, ...) with no
+    single consistent state machine across them — "pause" settles into
+    "paused" on some, "idle" on others, and a source/volume change can
+    take anywhere from instant to several seconds depending on the
+    backend. Use get_states_by_domain('media_player') or
+    list_media_players() afterward to see what actually happened.
     """
+    if missing := confirm_entity_exists(entity_id):
+        return missing
     cmd_map = {
         "play": "media_play", "pause": "media_pause", "stop": "media_stop",
         "next": "media_next_track", "previous": "media_previous_track",
@@ -129,9 +162,17 @@ def media_player_control(
                                 "media_content_type": media_content_type,
                             }, timeout=10)
         else:
-            return {"error": f"Unknown command or missing parameters: {command}"}
+            return error("invalid_command", f"Unknown command or missing parameters: {command}",
+                         entity_id=entity_id, command=command)
         r.raise_for_status()
-        return {"command": command, "entity_id": entity_id, "ok": True}
+    return {
+        "command": command,
+        "entity_id": entity_id,
+        "accepted": True,
+        "verified": None,
+        "detail": "Home Assistant accepted the call; see this tool's "
+                  "docstring for why the result cannot be verified here.",
+    }
 
 
 @mcp.tool()
@@ -145,7 +186,15 @@ def search_and_play_media(entity_id: str, query: str, media_type: str = "music")
 
     Works on players that support media browsing/search (Spotify, YouTube Music, etc.).
     Uses the HA media_player.play_media service with enqueue=replace.
+
+    Returns: {entity_id, query, media_type, accepted: true, verified: null,
+    detail} once Home Assistant accepts the call, or
+    {error: "entity_not_found", ...} when entity_id has no state at all.
+    See media_player_control() for why the result cannot be verified
+    against a single expected state across the many media_player backends.
     """
+    if missing := confirm_entity_exists(entity_id):
+        return missing
     with httpx.Client() as client:
         r = client.post(
             f"{HA_URL}/api/services/media_player/play_media",
@@ -159,7 +208,15 @@ def search_and_play_media(entity_id: str, query: str, media_type: str = "music")
             timeout=15,
         )
         r.raise_for_status()
-    return {"entity_id": entity_id, "query": query, "media_type": media_type, "ok": True}
+    return {
+        "entity_id": entity_id,
+        "query": query,
+        "media_type": media_type,
+        "accepted": True,
+        "verified": None,
+        "detail": "Home Assistant accepted the call; see media_player_control()'s "
+                  "docstring for why the result cannot be verified here.",
+    }
 
 
 @mcp.tool()
@@ -173,6 +230,11 @@ def broadcast_tts(message: str, language: str = "", engine: str = "tts.google_tr
     message: text to speak
     language: language code; defaults to the language configured in Home Assistant
     engine: TTS engine for non-Alexa players (default: 'tts.google_translate')
+
+    Returns: {message, players: [{entity_id, ok, method|error}]}. `ok`
+    here means the per-player service call got a 2xx response (or, on a
+    raised exception, False with `error` set) — not that the announcement
+    was actually heard, which has no state in Home Assistant to confirm.
     """
     language = language or default_language()
     with httpx.Client() as client:

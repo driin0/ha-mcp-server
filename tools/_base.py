@@ -2,7 +2,9 @@ import asyncio
 import json
 import os
 import re
+import time
 
+import httpx
 from dotenv import load_dotenv
 from mcp.server.mcpserver import MCPServer
 
@@ -321,3 +323,99 @@ def entity_area_map(entities: list | None = None) -> tuple[dict, dict | None]:
         for e in entities
     }
     return area_map, None
+
+
+def confirm_entity_exists(entity_id: str) -> dict | None:
+    """Confirm entity_id currently has a state on this Home Assistant instance.
+
+    Returns None when it exists. Returns an error() envelope when Home
+    Assistant reports 404 for it.
+
+    This exists because a Home Assistant service call does not reject a
+    target that does not exist: it is accepted and answered with 200 and an
+    empty list of changed states — the exact shape an idempotent no-op call
+    also returns (turning off an already-off light, locking an
+    already-locked lock). Measured live: `lock.unlock` on
+    `lock.ghost_does_not_exist` returns 200 [], and the entity 404s on
+    read. Without this check a tool has no way to tell "accepted, nothing
+    to act on" from "accepted, and it worked".
+
+    Call this BEFORE the service call, for a tool with no state of its own
+    to read back afterward and reveal that same absence — press_button,
+    restart_homeassistant, the notify family, alerts, todo, calendar,
+    groups, media players. An actuator with observable state does not need
+    it: observe_actuation() below already reports `exists: False` from the
+    read-back it does anyway, one HTTP call instead of two.
+
+    Raises like any other read in this file on a transport failure or a
+    non-404 error status — only "does not exist" is reported as an
+    error() return here; "could not check" surfaces as an exception.
+    """
+    with httpx.Client() as client:
+        r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
+    if r.status_code == 404:
+        return error("entity_not_found",
+                     f"{entity_id} does not exist on this Home Assistant instance.",
+                     entity_id=entity_id)
+    r.raise_for_status()
+    return None
+
+
+def observe_actuation(entity_id: str, satisfied, *, retries: int = 1, delay: float = 1.0) -> dict:
+    """Read entity_id's state back after a service call and report what was
+    actually observed — the discriminator between "Home Assistant accepted
+    the call" and "the call did what it said".
+
+    Never trust the service call's own response body for this: Home
+    Assistant returns only the states that changed, so an idempotent call
+    (locking an already-locked lock) and a call aimed at an entity_id that
+    does not exist at all both legitimately return 200 with an empty list —
+    measured live, `vacuum.start` on an already-cleaning vacuum and
+    `lock.unlock` on a nonexistent entity both come back as 200 []. This
+    function ignores that body entirely and always goes back to the source
+    of truth: the entity's own state, read fresh.
+
+    entity_id: the entity the service call targeted.
+    satisfied:  callable(state: dict) -> bool, given the raw Home Assistant
+                state object (`{"entity_id", "state", "attributes", ...}`).
+                Decide whether it counts as the actuation having taken
+                effect — e.g. `lambda s: s["state"] == "locked"`, or
+                `lambda s: s["attributes"].get("fan_speed") == "turbo"`.
+    retries:    extra reads after the first, `delay` seconds apart (default:
+                one retry, one second later). This is not a polling loop —
+                Home Assistant applies most service calls synchronously
+                (toggle_automation, tools/automations.py, is the one-shot
+                precedent this generalises). Measured live: a lock and a
+                garage-door cover already show their final state by the
+                time the POST returns; an alarm panel and a window cover
+                with simulated travel settle within about a second. This is
+                a short bounded margin for that case, not a substitute for
+                a real job-completion API.
+
+    Returns exactly one of:
+      {"exists": False, "verified": False, "state": None}
+          entity_id has no state at all. The service call was still
+          accepted — see the confirm_entity_exists() docstring — so this is
+          the only way to learn the target never existed.
+      {"exists": True, "verified": True, "state": <raw HA state dict>}
+          `satisfied` matched a read-back.
+      {"exists": True, "verified": False, "state": <raw HA state dict>}
+          the entity exists but `satisfied` never matched within `retries`
+          — accepted, but unverified (a jammed lock, an offline device, a
+          value silently ignored: measured live, `vacuum.set_fan_speed`
+          with a value outside the entity's own fan_speed_list returns 200
+          [] and leaves the attribute untouched — no error, no effect).
+    """
+    state = None
+    for attempt in range(retries + 1):
+        if attempt:
+            time.sleep(delay)
+        with httpx.Client() as client:
+            r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
+        if r.status_code == 404:
+            return {"exists": False, "verified": False, "state": None}
+        r.raise_for_status()
+        state = r.json()
+        if satisfied(state):
+            return {"exists": True, "verified": True, "state": state}
+    return {"exists": True, "verified": False, "state": state}

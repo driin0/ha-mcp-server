@@ -56,6 +56,14 @@ def fake_ha(monkeypatch):
     real_ws_multi = tools._base._ws_multi
     monkeypatch.setattr(tools._base, "_ws", state.ws)
     monkeypatch.setattr(tools._base, "_ws_multi", state.ws_multi)
+
+    # observe_actuation() sleeps between retries so a real deployment gives a
+    # slow entity a moment to settle - real seconds a test suite should not
+    # spend. time.sleep is patched at the module level tools._base imported
+    # it from, not reassigned into tools._base's own namespace, so this one
+    # patch covers every tool that calls observe_actuation() without each
+    # test needing to know or care that it does.
+    monkeypatch.setattr(tools._base.time, "sleep", lambda seconds: None)
     for module in list(sys.modules.values()):
         name = getattr(module, "__name__", "")
         if name.startswith("tools."):

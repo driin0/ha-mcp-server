@@ -1,6 +1,6 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, envelope
+from tools._base import mcp, HA_URL, HEADERS, envelope, error, observe_actuation
 
 
 @mcp.tool()
@@ -48,6 +48,19 @@ def set_climate(
     temperature: target temperature in °C
     fan_mode:    'auto', 'low', 'medium', 'high', etc. (depends on device)
     swing_mode:  'off', 'vertical', 'horizontal', 'both', etc. (depends on device)
+
+    Returns: {entity_id, applied, verified, state, attributes} on a call
+    Home Assistant accepted, or {error: "entity_not_found"/"no_changes_requested",
+    ...} otherwise.
+
+    Each requested field is its own service call — climate has no single
+    "set everything" service — so a call can partially apply (e.g.
+    hvac_mode accepted, temperature then refused) before a non-2xx
+    response raises. `verified` covers what was requested as a whole: true
+    only when every field in `applied` matches what the entity's own state
+    and attributes report on read-back; `attributes` there always shows
+    what was actually observed, which is what to check when only part of a
+    multi-field call took effect.
     """
     with httpx.Client() as client:
         applied = {}
@@ -75,4 +88,34 @@ def set_climate(
                             json={"entity_id": entity_id, "swing_mode": swing_mode}, timeout=10)
             r.raise_for_status()
             applied["swing_mode"] = swing_mode
-        return {"entity_id": entity_id, "applied": applied, "ok": True}
+
+    if not applied:
+        return error("no_changes_requested",
+                     "None of hvac_mode, temperature, fan_mode or swing_mode were given.",
+                     entity_id=entity_id)
+
+    def matches(s: dict) -> bool:
+        attrs = s.get("attributes", {})
+        if "hvac_mode" in applied and s["state"] != applied["hvac_mode"]:
+            return False
+        if "temperature" in applied and attrs.get("temperature") != applied["temperature"]:
+            return False
+        if "fan_mode" in applied and attrs.get("fan_mode") != applied["fan_mode"]:
+            return False
+        if "swing_mode" in applied and attrs.get("swing_mode") != applied["swing_mode"]:
+            return False
+        return True
+
+    obs = observe_actuation(entity_id, matches)
+    if not obs["exists"]:
+        return error("entity_not_found",
+                     f"{entity_id} does not exist on this Home Assistant instance.",
+                     entity_id=entity_id, applied=applied)
+    attrs = obs["state"].get("attributes", {})
+    return {
+        "entity_id": entity_id,
+        "applied": applied,
+        "verified": obs["verified"],
+        "state": obs["state"]["state"],
+        "attributes": {k: attrs.get(k) for k in ("temperature", "fan_mode", "swing_mode") if k in applied},
+    }

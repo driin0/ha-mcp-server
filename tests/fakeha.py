@@ -88,6 +88,13 @@ class FakeHA:
         # 404s that path rather than answering with an empty list.
         self.calendars = []
         self.calendar_events = {}
+        # Per-entity queue of state overrides for GET /api/states/<entity_id>:
+        # each read consumes the next item, and the last one repeats once the
+        # queue is down to one - models an entity whose read-back only comes
+        # to reflect a service call's effect after a retry (observe_actuation
+        # in tools/_base.py), as opposed to self.states, which answers every
+        # read for that entity_id identically within one test.
+        self.state_sequences = {}
         # Everything the tools sent, for assertions.
         self.rest_calls = []
         self.ws_calls = []
@@ -106,6 +113,10 @@ class FakeHA:
             return httpx.Response(200, json=self.states)
         if path.startswith("/api/states/"):
             wanted = path.removeprefix("/api/states/")
+            if wanted in self.state_sequences:
+                seq = self.state_sequences[wanted]
+                state = seq.pop(0) if len(seq) > 1 else seq[0]
+                return httpx.Response(200, json=state)
             for s in self.states:
                 if s["entity_id"] == wanted:
                     return httpx.Response(200, json=s)
@@ -201,6 +212,18 @@ class FakeHA:
         way Home Assistant does for a rejected service call, a bad auth
         token, or a broken integration."""
         self.rest_responses[path_fragment] = (status, {"message": message})
+
+    def sequence_states(self, entity_id: str, states: list):
+        """Make successive GET /api/states/<entity_id> calls return `states`
+        in order, repeating the last one once exhausted.
+
+        For testing observe_actuation()'s retry: a service call whose
+        read-back only comes to reflect the actuation on the second read
+        (e.g. still "locking" on the first, "locked" on the second) -
+        self.states alone cannot model that, since it answers identically
+        on every read within a test.
+        """
+        self.state_sequences[entity_id] = list(states)
 
     def raise_rest(self, path_fragment: str, exc: Exception | None = None):
         """Make any REST call whose path contains `path_fragment` raise

@@ -1,6 +1,6 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws, _ws_multi, envelope, error, ws_error
+from tools._base import mcp, HA_URL, HEADERS, _ws, _ws_multi, envelope, error, observe_actuation, ws_error
 
 
 @mcp.tool()
@@ -8,6 +8,14 @@ def restart_homeassistant() -> dict:
     """
     Restart Home Assistant. Use with caution — all automations and integrations
     will be unavailable for ~30–60 seconds during restart.
+
+    Returns: {accepted: true, verified: null, detail}. There is no entity
+    to check beforehand (this targets the whole instance, not a single
+    entity) and no bounded read-back that could confirm a restart that
+    takes tens of seconds — waiting for it here would be exactly the long
+    polling loop this codebase avoids. `verified` stays null rather than
+    claiming a completed restart this tool never actually observes; use
+    get_config() a while later to confirm Home Assistant came back up.
     """
     with httpx.Client() as client:
         r = client.post(
@@ -17,7 +25,13 @@ def restart_homeassistant() -> dict:
             timeout=15,
         )
         r.raise_for_status()
-    return {"restarting": True}
+    return {
+        "accepted": True,
+        "verified": None,
+        "detail": "Home Assistant accepted the restart request. It takes "
+                  "roughly 30-60 seconds; check back with get_config() "
+                  "afterward to confirm it came back up.",
+    }
 
 
 @mcp.tool()
@@ -166,6 +180,22 @@ def apply_update(entity_id: str, backup: bool = True) -> dict:
     backup: create a backup before updating (default: True, recommended)
 
     ⚠️ Some updates require a restart. Confirm with the user before proceeding.
+
+    Returns: {entity_id, verified, state, installed_version, latest_version}
+    on a call Home Assistant accepted, or {error: "entity_not_found", ...}
+    when entity_id has no state at all.
+
+    `verified` is true only when the update entity's own state, read back
+    after the call, is "off" (Home Assistant's update domain: "on" means an
+    update is pending, "off" means installed_version already matches
+    latest_version) — not merely that the install call returned 2xx. An
+    install that is genuinely long-running (a firmware flash, a core
+    restart) may still show `verified: false` here since this does one
+    short bounded read-back, not a wait for the job to finish; check
+    list_updates() again afterward for anything that takes longer than
+    that. Calling this on an entity with no pending update, or a wrong
+    entity_id shape, raises rather than returning a value — Home Assistant
+    answers both with a non-2xx status.
     """
     with httpx.Client() as client:
         r = client.post(
@@ -175,7 +205,19 @@ def apply_update(entity_id: str, backup: bool = True) -> dict:
             timeout=30,
         )
         r.raise_for_status()
-    return {"entity_id": entity_id, "update_triggered": True, "backup": backup}
+    obs = observe_actuation(entity_id, lambda s: s["state"] == "off")
+    if not obs["exists"]:
+        return error("entity_not_found",
+                     f"{entity_id} does not exist on this Home Assistant instance.",
+                     entity_id=entity_id)
+    attrs = obs["state"].get("attributes", {})
+    return {
+        "entity_id": entity_id,
+        "verified": obs["verified"],
+        "state": obs["state"]["state"],
+        "installed_version": attrs.get("installed_version"),
+        "latest_version": attrs.get("latest_version"),
+    }
 
 
 @mcp.tool()

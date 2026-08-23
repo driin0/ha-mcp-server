@@ -1,6 +1,6 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws, envelope, ws_error
+from tools._base import mcp, HA_URL, HEADERS, _ws, confirm_entity_exists, envelope, ws_error
 
 
 @mcp.tool()
@@ -25,14 +25,13 @@ def list_todo_lists() -> dict:
     return envelope(out, key="lists")
 
 
-@mcp.tool()
-def get_todo_items(entity_id: str) -> dict:
-    """
-    Get all items from a todo list.
+def _todo_items(entity_id: str):
+    """The current items on a todo list, or a ws_error() dict.
 
-    entity_id: e.g. 'todo.shopping_list'
-
-    Returns: {total, returned, offset, note?, items: [...]}
+    Shared plumbing for get_todo_items() and the write tools below, which
+    use this same call_service/return_response round trip as their
+    read-back — todo items are not entities of their own with a state to
+    GET; they only exist inside this response.
     """
     result = _ws({
         "type": "call_service",
@@ -45,7 +44,21 @@ def get_todo_items(entity_id: str) -> dict:
         return err
     # Response result: {"response": {"todo.shopping_list": {"items": [...]}}}
     response = result["result"].get("response", {})
-    items = response.get(entity_id, {}).get("items", [])
+    return response.get(entity_id, {}).get("items", [])
+
+
+@mcp.tool()
+def get_todo_items(entity_id: str) -> dict:
+    """
+    Get all items from a todo list.
+
+    entity_id: e.g. 'todo.shopping_list'
+
+    Returns: {total, returned, offset, note?, items: [...]}
+    """
+    items = _todo_items(entity_id)
+    if isinstance(items, dict):  # ws_error()
+        return items
     return envelope(items, key="items")
 
 
@@ -58,7 +71,15 @@ def add_todo_item(entity_id: str, item: str, description: str = "", due_date: st
     item: item summary/name
     description: optional longer description
     due_date: optional due date in YYYY-MM-DD format
+
+    Returns: {entity_id, item, verified} on a call Home Assistant accepted,
+    or {error: "entity_not_found", ...} when entity_id has no state at
+    all. `verified` is true only when an item with this summary is present
+    in get_todo_items() read back after the call - not merely that the
+    call returned 2xx.
     """
+    if missing := confirm_entity_exists(entity_id):
+        return missing
     data: dict = {"entity_id": entity_id, "item": item}
     if description:
         data["description"] = description
@@ -72,7 +93,15 @@ def add_todo_item(entity_id: str, item: str, description: str = "", due_date: st
             timeout=10,
         )
         r.raise_for_status()
-    return {"added": True, "entity_id": entity_id, "item": item}
+
+    items = _todo_items(entity_id)
+    if isinstance(items, dict):  # ws_error()
+        return items
+    return {
+        "entity_id": entity_id,
+        "item": item,
+        "verified": any(i.get("summary") == item for i in items),
+    }
 
 
 @mcp.tool()
@@ -84,7 +113,15 @@ def update_todo_item(entity_id: str, item: str, status: str = "", rename: str = 
     item: current item name (uid or summary)
     status: needs_action | completed
     rename: new name for the item
+
+    Returns: {entity_id, item, verified} on a call Home Assistant accepted,
+    or {error: "entity_not_found"/"item_not_found", ...} otherwise.
+    `verified` is true only when the item — looked up by its new name if
+    `rename` was given, else by `item` — is present with the requested
+    `status` (when given) in get_todo_items() read back after the call.
     """
+    if missing := confirm_entity_exists(entity_id):
+        return missing
     data: dict = {"entity_id": entity_id, "item": item}
     if status:
         data["status"] = status
@@ -98,12 +135,30 @@ def update_todo_item(entity_id: str, item: str, status: str = "", rename: str = 
             timeout=10,
         )
         r.raise_for_status()
-    return {"updated": True, "entity_id": entity_id, "item": item}
+
+    items = _todo_items(entity_id)
+    if isinstance(items, dict):  # ws_error()
+        return items
+    # `item` (and `rename`) may be either the item's uid or its summary -
+    # the update_item service itself accepts either, so the read-back
+    # match has to check both to avoid a false "unverified" on a uid.
+    look_for = rename or item
+    match = next((i for i in items if look_for in (i.get("uid"), i.get("summary"))), None)
+    verified = match is not None and (not status or match.get("status") == status)
+    return {"entity_id": entity_id, "item": look_for, "verified": verified}
 
 
 @mcp.tool()
 def remove_todo_item(entity_id: str, item: str) -> dict:
-    """Remove an item from a todo list. item: item name or uid."""
+    """Remove an item from a todo list. item: item name or uid.
+
+    Returns: {entity_id, item, verified} on a call Home Assistant accepted,
+    or {error: "entity_not_found", ...} when entity_id has no state at
+    all. `verified` is true only when no item with this summary remains in
+    get_todo_items() read back after the call.
+    """
+    if missing := confirm_entity_exists(entity_id):
+        return missing
     with httpx.Client() as client:
         r = client.post(
             f"{HA_URL}/api/services/todo/remove_item",
@@ -112,4 +167,12 @@ def remove_todo_item(entity_id: str, item: str) -> dict:
             timeout=10,
         )
         r.raise_for_status()
-    return {"removed": True, "entity_id": entity_id, "item": item}
+
+    items = _todo_items(entity_id)
+    if isinstance(items, dict):  # ws_error()
+        return items
+    return {
+        "entity_id": entity_id,
+        "item": item,
+        "verified": not any(item in (i.get("uid"), i.get("summary")) for i in items),
+    }

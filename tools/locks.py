@@ -1,6 +1,8 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, envelope
+from tools._base import mcp, HA_URL, HEADERS, envelope, error, observe_actuation
+
+_LOCK_EXPECTED_STATE = {"lock": "locked", "unlock": "unlocked", "open": "open"}
 
 
 @mcp.tool()
@@ -38,8 +40,22 @@ def lock_control(entity_id: str, command: str, code: str = "") -> dict:
 
     command: lock | unlock | open
     code: optional PIN/code if required by the lock
+
+    Returns: {entity_id, command, verified, state} on a call Home Assistant
+    accepted, or {error: "entity_not_found", ...} when entity_id has no
+    state at all — Home Assistant accepts and 200s a service call aimed at
+    an entity that does not exist, so this check happens after the call, by
+    reading the entity back, not before it.
+
+    `verified` is true only when the entity's own state, read back after
+    the call, matches the command (locked / unlocked / open). A lock that
+    jams, or one that never received the command, still answers the
+    service call with 200 — `verified: false` with `state` set to whatever
+    was actually observed (e.g. "jammed") is how that is told apart from a
+    real success. A non-2xx response (wrong code, a refused command) raises
+    rather than returning a value at all.
     """
-    if command not in ("lock", "unlock", "open"):
+    if command not in _LOCK_EXPECTED_STATE:
         raise ValueError("command must be: lock, unlock, or open")
     data: dict = {"entity_id": entity_id}
     if code:
@@ -47,4 +63,15 @@ def lock_control(entity_id: str, command: str, code: str = "") -> dict:
     with httpx.Client() as client:
         r = client.post(f"{HA_URL}/api/services/lock/{command}", headers=HEADERS, json=data, timeout=10)
         r.raise_for_status()
-    return {"entity_id": entity_id, "command": command, "ok": True}
+    expected = _LOCK_EXPECTED_STATE[command]
+    obs = observe_actuation(entity_id, lambda s: s["state"] == expected)
+    if not obs["exists"]:
+        return error("entity_not_found",
+                     f"{entity_id} does not exist on this Home Assistant instance.",
+                     entity_id=entity_id, command=command)
+    return {
+        "entity_id": entity_id,
+        "command": command,
+        "verified": obs["verified"],
+        "state": obs["state"]["state"],
+    }

@@ -1,6 +1,6 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, entity_area_map, envelope
+from tools._base import mcp, HA_URL, HEADERS, entity_area_map, envelope, error, observe_actuation
 
 
 @mcp.tool()
@@ -67,13 +67,39 @@ def set_light(
     """
     Control a light entity.
 
-    state: 'on' | 'off' | 'toggle'
+    state: 'on' | 'off' | 'toggle' | '' (empty defaults to 'on' — apply the given attributes)
     brightness_pct: 0–100
     color_temp_k: color temperature in Kelvin (e.g. 2700 warm, 4000 neutral, 6500 cool)
     rgb_color: [R, G, B] list, e.g. [255, 100, 0]
     effect: named effect (e.g. 'Night', 'Day', 'Candle', 'Twinkle') — see entity's effect_list
     transition: fade duration in seconds
+
+    Returns: {entity_id, state, verified, observed_state} on a call Home
+    Assistant accepted, or {error: "entity_not_found"/"invalid_state", ...}
+    otherwise. An unrecognised `state` (anything other than '', 'on',
+    'off' or 'toggle') is rejected rather than silently treated as 'on'.
+
+    `verified` is true only when the light's own state, read back after the
+    call, matches — "on" for a turn_on/attribute call, "off" for 'off', and
+    (since 'toggle' has no fixed target) any state different from what the
+    light reported just before the call, for 'toggle'.
     """
+    if state not in ("", "on", "off", "toggle"):
+        return error("invalid_state",
+                     f"Unrecognised state {state!r} — use '', 'on', 'off', or 'toggle'.",
+                     entity_id=entity_id, state=state)
+
+    prior = None
+    if state == "toggle":
+        # No fixed target state for a toggle: whether it ends up "on" or
+        # "off" depends on what the light was doing before the call, so
+        # that has to be read first rather than assumed.
+        with httpx.Client() as client:
+            r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
+        if r.status_code != 404:
+            r.raise_for_status()
+            prior = r.json()["state"]
+
     with httpx.Client() as client:
         if state == "off":
             data: dict = {"entity_id": entity_id}
@@ -97,4 +123,22 @@ def set_light(
                 data["transition"] = transition
             r = client.post(f"{HA_URL}/api/services/light/turn_on", headers=HEADERS, json=data, timeout=10)
         r.raise_for_status()
-    return {"entity_id": entity_id, "state": state or "on", "ok": True}
+
+    if state == "off":
+        satisfied = lambda s: s["state"] == "off"
+    elif state == "toggle":
+        satisfied = lambda s: isinstance(prior, str) and s["state"] != prior
+    else:
+        satisfied = lambda s: s["state"] == "on"
+
+    obs = observe_actuation(entity_id, satisfied)
+    if not obs["exists"]:
+        return error("entity_not_found",
+                     f"{entity_id} does not exist on this Home Assistant instance.",
+                     entity_id=entity_id, state=state)
+    return {
+        "entity_id": entity_id,
+        "state": state or "on",
+        "verified": obs["verified"],
+        "observed_state": obs["state"]["state"],
+    }

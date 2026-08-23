@@ -1,6 +1,8 @@
 import pytest
 
-from tools._base import entity_area_map, envelope, error, ws_error
+from tools._base import (
+    confirm_entity_exists, entity_area_map, envelope, error, observe_actuation, ws_error,
+)
 
 
 def test_wraps_a_collection_under_a_named_key():
@@ -240,3 +242,88 @@ def test_entity_area_map_accepts_pre_fetched_entities_and_skips_that_call(fake_h
     assert err is None
     assert area_map["sensor.plug"] == "office"
     assert [c["type"] for c in fake_ha.ws_calls] == ["config/device_registry/list"]
+
+
+# ---- confirm_entity_exists() ------------------------------------------------
+# Guards a call with nothing to read back afterward: Home Assistant accepts
+# and 200s a service call aimed at an entity_id that does not exist, so this
+# is the only way such a tool learns the target was never real.
+
+def test_confirm_entity_exists_is_silent_for_a_real_entity(fake_ha):
+    assert confirm_entity_exists("light.kitchen") is None
+
+
+def test_confirm_entity_exists_reports_a_missing_entity(fake_ha):
+    result = confirm_entity_exists("light.ghost")
+
+    assert result["error"] == "entity_not_found"
+    assert result["entity_id"] == "light.ghost"
+
+
+def test_confirm_entity_exists_raises_on_a_transport_failure(fake_ha):
+    """A failed check must surface as an exception, not be folded into
+    "does not exist" - the two are different claims."""
+    import httpx
+
+    fake_ha.fail_rest("/api/states/light.kitchen", status=401, message="Unauthorized")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        confirm_entity_exists("light.kitchen")
+
+
+# ---- observe_actuation() ----------------------------------------------------
+# The discriminator between "Home Assistant accepted the call" and "the call
+# did what it said" - always re-reads the entity's own state rather than
+# trusting the service call's own (possibly empty, possibly stale) response.
+
+def test_observe_actuation_reports_a_matched_read_back(fake_ha):
+    result = observe_actuation("light.kitchen", lambda s: s["state"] == "on")
+
+    assert result == {"exists": True, "verified": True,
+                      "state": {"entity_id": "light.kitchen", "state": "on",
+                                "attributes": {"friendly_name": "Kitchen", "brightness": 200}}}
+
+
+def test_observe_actuation_reports_accepted_but_unverified(fake_ha):
+    """The entity exists but never reaches the expected state within
+    `retries` - accepted, but the effect was not observed (a jammed lock,
+    an offline device)."""
+    result = observe_actuation("light.study", lambda s: s["state"] == "on")
+
+    assert result["exists"] is True
+    assert result["verified"] is False
+    assert result["state"]["state"] == "off"
+
+
+def test_observe_actuation_reports_a_missing_entity(fake_ha):
+    """The service call was still accepted - Home Assistant does not
+    reject a call aimed at a nonexistent entity_id - so this is the only
+    way to learn the target never existed."""
+    result = observe_actuation("light.ghost", lambda s: s["state"] == "on")
+
+    assert result == {"exists": False, "verified": False, "state": None}
+
+
+def test_observe_actuation_retries_before_giving_up(fake_ha):
+    """A lock or a cover with simulated travel time may not have settled by
+    the first read - the retry exists for exactly this."""
+    fake_ha.sequence_states("lock.front_door", [
+        {"entity_id": "lock.front_door", "state": "locking", "attributes": {}},
+        {"entity_id": "lock.front_door", "state": "locked", "attributes": {}},
+    ])
+
+    result = observe_actuation("lock.front_door", lambda s: s["state"] == "locked")
+
+    assert result["verified"] is True
+    assert result["state"]["state"] == "locked"
+
+
+def test_observe_actuation_never_trusts_an_empty_service_response(fake_ha):
+    """Home Assistant returns only the states that changed, so an
+    idempotent call (turning on an already-on light) legitimately returns
+    200 [] - that must never be read as failure. observe_actuation() does
+    not even look at the service call's response; it goes back to the
+    entity's own state."""
+    result = observe_actuation("light.kitchen", lambda s: s["state"] == "on")
+
+    assert result["verified"] is True
