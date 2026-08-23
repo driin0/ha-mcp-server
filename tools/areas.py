@@ -2,7 +2,7 @@ import json
 
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws, _ws_multi, envelope, error, ws_error
+from tools._base import mcp, HA_URL, HEADERS, _ws, _ws_multi, envelope, error, ws_error, ws_transport_error
 
 
 @mcp.tool()
@@ -146,12 +146,29 @@ def list_devices(area_id: str = "", search: str = "", limit: int = 50, offset: i
 
 @mcp.tool()
 def get_device(device_id: str) -> dict:
-    """Get full details of a device by device_id."""
+    """Get full details of a device by device_id.
+
+    Returns the device object from Home Assistant, or an error() envelope
+    — "device_not_found" when no device has that id, or ws_error()'s own
+    code/detail when the registry read itself failed.
+
+    r.get("result", []) used to fold both cases into "not found": a dead
+    connection or a revoked token (ws_error()'s "error" response has no
+    "result" key at all) read back as {"error": "Device not found:
+    <id>"}, the exact fault already fixed one file over in
+    dashboards.py's _dashboard_id() — a caller told "not found" when the
+    registry was never actually checked, and with no `detail` key since
+    this bypassed error() entirely. Routing the read through ws_error()
+    first lets a genuine absence stay "not found" while a transport or
+    auth failure surfaces as itself.
+    """
     r = _ws({"type": "config/device_registry/list"})
-    for d in r.get("result", []):
+    if err := ws_error(r):
+        return err
+    for d in r["result"]:
         if d.get("id") == device_id:
             return d
-    return {"error": f"Device not found: {device_id}"}
+    return error("device_not_found", f"No device with id {device_id!r}.", device_id=device_id)
 
 
 @mcp.tool()
@@ -316,8 +333,12 @@ def bulk_set_entity_labels(entity_ids: list, labels: list) -> dict:
     labels: list of label_id strings to assign to all entities
 
     Returns: {total, succeeded, failed: [...]} on a batch that was sent, or
-    an error() envelope ("too_many_entities") without sending anything when
-    entity_ids exceeds the 200-entity limit.
+    an error() envelope ("too_many_entities" without sending anything when
+    entity_ids exceeds the 200-entity limit; otherwise ws_transport_error()'s
+    own code/detail) when the WebSocket connection itself never reached
+    Home Assistant - that is one systemic failure, not "every entity
+    failed": see ws_transport_error()'s docstring (tools/_base.py) for why
+    a batch like this cannot tell the two apart on its own.
     """
     if len(entity_ids) > _BULK_LABEL_MAX:
         return error(
@@ -333,6 +354,8 @@ def bulk_set_entity_labels(entity_ids: list, labels: list) -> dict:
         for eid in entity_ids
     ]
     results = _ws_multi(msgs)
+    if results and (transport_err := ws_transport_error(results[0])):
+        return transport_err
     succeeded, failed = 0, []
     for eid, r in zip(entity_ids, results):
         if r.get("success"):

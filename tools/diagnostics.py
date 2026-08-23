@@ -311,6 +311,19 @@ def fire_event(event_type: str, event_data: dict = None) -> dict:
     Home Assistant accepted the event onto its bus, not that any listener
     ran or what it did - check the affected entities/automations
     afterward, the same way any call_service()-shaped action is verified.
+
+    `fired` is a bespoke key rather than this codebase's usual
+    `accepted`/`verified` shape - deliberately, not an oversight. That pair
+    exists for a claim that is genuinely uncertain (Home Assistant accepts
+    and 200s a service call aimed at an entity that does not exist, so
+    "accepted" and "worked" have to be told apart - see
+    confirm_entity_exists()/observe_actuation() in tools/_base.py).
+    POST /api/events/<type> has no equivalent ambiguity: there is no
+    registry of valid event types to be silently accepted-but-ignored
+    against, so a 200 response is a fully confirmed fact - the event did
+    reach the bus - not a hedge. `fired: true` says exactly that and no
+    more; folding it into `accepted`/`verified: null` would understate a
+    claim this call can actually back up.
     """
     with httpx.Client() as client:
         r = client.post(

@@ -45,6 +45,14 @@ def acknowledge_alert(entity_id: str) -> dict:
     Acknowledged alerts will resume firing if the condition is still active
     after the configured notification interval.
 
+    Home Assistant's alert domain has no dedicated "acknowledge" service -
+    only turn_on, turn_off and toggle exist (confirmed live against
+    /api/services). Its own alert entity implements turn_off as the
+    acknowledgement action (silences the alert without requiring the
+    underlying condition to clear), so this tool calls alert/turn_off; an
+    earlier version called the nonexistent alert/acknowledge and always
+    got a 400, uncaught.
+
     Returns: {entity_id, accepted: true, verified: null, detail} once Home
     Assistant accepts the call, or {error: "entity_not_found", ...} when
     entity_id has no state at all. Acknowledging silences repeated
@@ -56,7 +64,7 @@ def acknowledge_alert(entity_id: str) -> dict:
         return missing
     with httpx.Client() as client:
         r = client.post(
-            f"{HA_URL}/api/services/alert/acknowledge",
+            f"{HA_URL}/api/services/alert/turn_off",
             headers=HEADERS,
             json={"entity_id": entity_id},
             timeout=10,

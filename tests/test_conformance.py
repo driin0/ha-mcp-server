@@ -254,9 +254,26 @@ def test_every_zero_arg_tool_actually_returns_a_dict_at_runtime(fake_ha):
     )
 
 
-def _success_defaulted_with_literal_sites():
-    """Every `<expr>.get("success", <literal>)` call anywhere in tools/*.py,
-    for any literal default — True, False, or otherwise.
+def _success_defaulted_sites(dir_: pathlib.Path = TOOLS_DIR):
+    """Every `<expr>.get("success", <default>)` call anywhere in `dir_`'s
+    *.py files, for ANY default expression — a literal (`True`, `False`),
+    a name (`SOME_DEFAULT`), an attribute, a call, anything `ast.parse`
+    can produce as the second argument. There is no default that makes
+    this call safe: see test_no_ws_result_reads_success_with_a_default()'s
+    docstring for why both directions of a *literal* default are already
+    wrong, and a non-literal default is not a third, safer option — it is
+    the same fault with the value hidden one more step away, still
+    silently discarding whatever `_ws()` actually returned in place of a
+    missing "success" key.
+
+    Previously restricted to `isinstance(default, ast.Constant)`, which
+    caught `.get("success", True)`/`.get("success", False)` but not
+    `.get("success", SOME_NAME)` — a default that is a Name, an Attribute,
+    or any other non-literal node parsed clean and was never flagged.
+    Verified: mutating a real call site to read `.get("success",
+    _UNRELATED_DEFAULT)` left this check green before this fix; the
+    regression test below reproduces that shape directly rather than by
+    editing a real tool.
 
     AST-based, not a grep, for two reasons: it must not trip on the prose in
     tools/hacs.py's docstring that explains this very bug (a docstring is an
@@ -266,20 +283,13 @@ def _success_defaulted_with_literal_sites():
     double quotes would miss but which parses to the identical ast.Constant
     value "success".
 
-    True and False are both banned, not just True, even though only the
-    True direction can turn a failure into a false positive. A literal
-    False default is the areas.py bug (see the docstring below): it never
-    lies about `success` itself, but it silently discards Home Assistant's
-    actual error code and message in favour of a bare False, and it is
-    routinely paired with an unrelated field elsewhere in the same dict
-    that is NOT conditioned on that success check — the exact shape of
-    {"disabled": true, "success": false}, an effect asserted unconditionally
-    while success denies it happened. ws_error() is the one path that both
-    reports the real failure and lets the rest of the function only build
-    that "effect" dict once success is actually confirmed.
+    dir_: the directory to scan — defaults to TOOLS_DIR (production code),
+          overridden by tests below to point at a synthetic temp directory
+          instead, so the regression case does not require mutating a real
+          tool file to prove itself.
     """
     sites = []
-    for path in sorted(TOOLS_DIR.glob("*.py")):
+    for path in sorted(pathlib.Path(dir_).glob("*.py")):
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -289,15 +299,14 @@ def _success_defaulted_with_literal_sites():
                 continue
             if len(node.args) < 2:
                 continue
-            key, default = node.args[0], node.args[1]
+            key = node.args[0]
             if not (isinstance(key, ast.Constant) and key.value == "success"):
                 continue
-            if isinstance(default, ast.Constant):
-                sites.append(f"{path.name}:{node.lineno}")
+            sites.append(f"{path.name}:{node.lineno}")
     return sites
 
 
-def test_no_ws_result_reads_success_with_a_literal_default():
+def test_no_ws_result_reads_success_with_a_default():
     """`.get("success", True)` treats a dict with no "success" key at all as
     a success — but that is exactly the shape `_ws()` returns when the
     connection or the authentication fails: {"error": "Auth failed: ..."},
@@ -312,9 +321,13 @@ def test_no_ws_result_reads_success_with_a_literal_default():
     "effect" field elsewhere in the same dict that is not itself
     conditioned on that check (`{"disabled": true, "success": r.get(
     "success", False)}` asserts `disabled: true` even when `success` comes
-    back false). See _success_defaulted_with_literal_sites() for the full
-    reasoning on why both directions are banned, not just the historically
-    first one found.
+    back false). A default that is not even a literal — `.get("success",
+    some_variable)` — is neither of those specific shapes, but it is not a
+    third, safer option either: it is still discarding whatever `_ws()`
+    actually returned instead of reporting it via `ws_error()`, just with
+    the value one step further from view. See _success_defaulted_sites()
+    for the full reasoning on why every default is banned, not just the
+    two literal ones found first.
 
     The fix is `if err := ws_error(result): return err` (tools/_base.py),
     which treats a missing "success" key as a failure to be reported, not
@@ -322,12 +335,32 @@ def test_no_ws_result_reads_success_with_a_literal_default():
     instead of discarding it. This test is the net that keeps the fix from
     being undone by the next tool written by copying a neighbour.
     """
-    offenders = _success_defaulted_with_literal_sites()
+    offenders = _success_defaulted_sites()
     assert not offenders, (
-        "these sites read a WS result's \"success\" key with a literal "
-        "default, which either turns a _ws() transport failure into a "
-        "false success (a True default) or silently discards Home "
-        "Assistant's actual error code/message (any default) — replace "
-        "with `if err := ws_error(result): return err`:\n"
+        "these sites read a WS result's \"success\" key with a default, "
+        "which either turns a _ws() transport failure into a false "
+        "success (a True default) or silently discards Home Assistant's "
+        "actual error code/message (any other default) — replace with "
+        "`if err := ws_error(result): return err`:\n"
         + "\n".join(offenders)
     )
+
+
+def test_success_defaulted_sites_catches_a_non_literal_default(tmp_path):
+    """The AST net used to require `isinstance(default, ast.Constant)`, so
+    `result.get("success", SOME_NAME)` — a Name node, not a Constant —
+    parsed clean and was never flagged. Reproduced here against a
+    synthetic file in a temp directory, not by mutating a real tool, so
+    this test does not depend on — and cannot bit-rot against — whatever
+    tools/*.py happens to contain."""
+    (tmp_path / "fake_tool.py").write_text(
+        "_UNRELATED_DEFAULT = object()\n"
+        "\n"
+        "def do_thing(result):\n"
+        "    if not result.get(\"success\", _UNRELATED_DEFAULT):\n"
+        "        return {\"error\": \"nope\"}\n"
+    )
+
+    offenders = _success_defaulted_sites(tmp_path)
+
+    assert offenders == ["fake_tool.py:4"]

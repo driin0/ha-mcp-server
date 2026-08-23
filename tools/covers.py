@@ -1,6 +1,9 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, envelope, error, observe_actuation
+from tools._base import (
+    mcp, HA_URL, HEADERS, envelope, error, observe_actuation,
+    verified_allowing_transit,
+)
 
 
 @mcp.tool()
@@ -51,12 +54,29 @@ def cover_control(
     set_position/set_tilt_position, its current_position/
     current_tilt_position attribute), read back after the call, matches
     what was requested. A cover with simulated or real travel time is not
-    settled the instant the service call returns — measured live, a window
-    cover reaches its target position within about a second — so the
-    read-back retries once. `stop` and `toggle` have no single target state
-    to match: `verified` there means the cover is no longer mid-travel
-    ("opening"/"closing") by the time of the read-back, not that it ended
-    up in any particular position.
+    settled the instant the service call returns — measured live on this
+    project's own test instance, a garage door with no simulated travel
+    settles in under a second, but a window cover took ten seconds for a
+    full open or close (an earlier version of this docstring claimed "about
+    a second", measured on a since-changed instance — re-measure on your
+    own covers rather than trusting either number). The read-back retries
+    twice more (three reads total, roughly three seconds) — short of what a
+    slow cover needs, deliberately: blocking a tool call for ten seconds
+    has its own cost, so instead of stretching the budget to match the
+    slowest cover this codebase has seen, `verified` is `None` — not
+    `False` — when the retry budget runs out and the cover is still
+    "opening"/"closing" for the direction just requested: a real mismatch
+    still reports `False` (the cover is not moving, or moved the wrong
+    way), but a cover that is honestly still travelling is not reported as
+    a failure it never was. `stop` keeps its original meaning — `verified`
+    there means the cover is no longer mid-travel by the read-back, since
+    stalling mid-travel is `stop`'s own failure mode, not something to
+    excuse. `toggle` has no single target state either: `verified` there is
+    true as soon as the state differs from what it was immediately before
+    the call, which may itself be a transitional state like "opening"
+    rather than a settled one — toggle does not get the None treatment,
+    since by definition it has no fixed target to compare a transitional
+    state against.
     """
     command_map = {
         "open": "open_cover",
@@ -103,15 +123,21 @@ def cover_control(
     else:  # set_tilt_position
         satisfied = lambda s: s.get("attributes", {}).get("current_tilt_position") == tilt_position
 
-    obs = observe_actuation(entity_id, satisfied, retries=2, delay=1.0)
+    obs = observe_actuation(entity_id, satisfied, retries=3, delay=1.0)
     if not obs["exists"]:
         return error("entity_not_found",
                      f"{entity_id} does not exist on this Home Assistant instance.",
                      entity_id=entity_id, command=command)
+    transitional = {
+        "open": {"opening"},
+        "close": {"closing"},
+        "set_position": {"opening", "closing"},
+        "set_tilt_position": {"opening", "closing"},
+    }.get(command, frozenset())  # stop/toggle: no in-transit softening, see docstring
     out = {
         "entity_id": entity_id,
         "command": command,
-        "verified": obs["verified"],
+        "verified": verified_allowing_transit(obs, transitional),
         "state": obs["state"]["state"],
     }
     if command == "set_position":

@@ -1,6 +1,8 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws, _ws_multi, envelope, error, observe_actuation, ws_error
+from tools._base import (
+    mcp, HA_URL, HEADERS, _ws, _ws_multi, envelope, error, observe_actuation, rest_error, ws_error,
+)
 
 
 @mcp.tool()
@@ -173,15 +175,44 @@ def reload_integration(entry_id: str) -> dict:
     Reload a config entry (integration) without restarting Home Assistant.
     entry_id: use list_config_entries() to find the entry_id.
 
-    Returns: {entry_id, reloaded: true} once Home Assistant confirms the
-    reload, or an error() envelope with Home Assistant's actual error
-    code/message on failure — `reloaded: true` is only ever returned once
-    that has actually been confirmed, never asserted alongside a failure.
+    Returns: {entry_id, reloaded: true, require_restart} once Home
+    Assistant confirms the reload, or an error() envelope —
+    {error: "not_found", ...} when entry_id does not exist,
+    {error: "not_allowed", ...} when Home Assistant refuses to reload it,
+    or rest_error()'s own code/detail for anything else. `reloaded: true`
+    is only ever returned once that has actually been confirmed, never
+    asserted alongside a failure. `require_restart` is Home Assistant's
+    own signal that this integration cannot be fully reloaded without a
+    full restart, even though the reload call itself succeeded.
+
+    This is a REST call, not a WebSocket command — Home Assistant has no
+    "config_entries/reload" WebSocket command at all: reloading a config
+    entry is only exposed at POST /api/config/config_entries/entry/
+    {entry_id}/reload. An earlier version of this tool sent a WebSocket
+    command of that name, which does not exist on any Home Assistant
+    version — confirmed both against Home Assistant's own source and
+    live, where it got back an immediate {"error": "unknown_command"}
+    on every call, never a successful reload.
     """
-    result = _ws({"type": "config_entries/reload", "entry_id": entry_id})
-    if err := ws_error(result):
+    with httpx.Client() as client:
+        r = client.post(
+            f"{HA_URL}/api/config/config_entries/entry/{entry_id}/reload",
+            headers=HEADERS,
+            timeout=30,
+        )
+    if r.status_code == 404:
+        return error("not_found", f"No config entry with id {entry_id!r}.", entry_id=entry_id)
+    if r.status_code == 403:
+        return error("not_allowed",
+                     "Home Assistant will not reload this entry (OperationNotAllowed).",
+                     entry_id=entry_id)
+    if err := rest_error(r):
         return err
-    return {"entry_id": entry_id, "reloaded": bool(result["result"])}
+    return {
+        "entry_id": entry_id,
+        "reloaded": True,
+        "require_restart": r.json().get("require_restart", False),
+    }
 
 
 @mcp.tool()

@@ -55,6 +55,22 @@ def test_lock_control_reports_accepted_but_unverified_for_a_jammed_lock(fake_ha)
     assert result["state"] == "jammed"
 
 
+def test_lock_control_reports_null_for_a_lock_still_locking(fake_ha):
+    """A lock still in the transient "locking" state has neither confirmed
+    nor denied the command - not the same as "jammed", which is a real,
+    settled mismatch."""
+    from tools.locks import lock_control
+
+    fake_ha.states = [
+        {"entity_id": "lock.slow_deadbolt", "state": "locking", "attributes": {}},
+    ]
+
+    result = lock_control("lock.slow_deadbolt", "lock")
+
+    assert result["verified"] is None
+    assert result["state"] == "locking"
+
+
 def test_lock_control_rejects_an_unknown_command(fake_ha):
     from tools.locks import lock_control
 
@@ -100,6 +116,37 @@ def test_alarm_control_reports_accepted_but_unverified(fake_ha):
 
     assert result["verified"] is False
     assert result["state"] == "armed_away"
+
+
+def test_alarm_control_reports_null_while_still_arming(fake_ha):
+    """Measured live: a panel with a short exit delay took about five
+    seconds to reach armed_home, well past the read-back budget - "arming"
+    at that point means genuinely in progress, not a denial."""
+    from tools.alarm import alarm_control
+
+    fake_ha.states = [
+        {"entity_id": "alarm_control_panel.security", "state": "arming", "attributes": {}},
+    ]
+
+    result = alarm_control("alarm_control_panel.security", "arm_home", code="1234")
+
+    assert result["verified"] is None
+    assert result["state"] == "arming"
+
+
+def test_alarm_control_disarm_has_no_null_case(fake_ha):
+    """Measured live, disarm was instantaneous every time - it keeps a
+    plain True/False verified with no transitional state to soften."""
+    from tools.alarm import alarm_control
+
+    fake_ha.states = [
+        {"entity_id": "alarm_control_panel.security", "state": "pending", "attributes": {}},
+    ]
+
+    result = alarm_control("alarm_control_panel.security", "disarm", code="1234")
+
+    assert result["verified"] is False
+    assert result["state"] == "pending"
 
 
 def test_alarm_control_rejects_an_unknown_command(fake_ha):
@@ -161,6 +208,52 @@ def test_cover_control_set_position_unverified_when_position_does_not_match(fake
 
     assert result["verified"] is False
     assert result["position"] == 10
+
+
+def test_cover_control_close_reports_null_while_still_closing(fake_ha):
+    """Measured live, a window cover can take ten seconds for a full
+    close - well past the read-back budget. "closing" at that point is
+    genuinely in progress, not a denial that the cover ever moved."""
+    from tools.covers import cover_control
+
+    fake_ha.states = [
+        {"entity_id": "cover.hall_window", "state": "closing", "attributes": {}},
+    ]
+
+    result = cover_control("cover.hall_window", "close")
+
+    assert result["verified"] is None
+    assert result["state"] == "closing"
+
+
+def test_cover_control_open_reports_false_when_it_moves_the_wrong_way(fake_ha):
+    """"opening" softens to null for an open command, but "closing" does
+    not - that is not "still working on it", it is heading the wrong way."""
+    from tools.covers import cover_control
+
+    fake_ha.states = [
+        {"entity_id": "cover.hall_window", "state": "closing", "attributes": {}},
+    ]
+
+    result = cover_control("cover.hall_window", "open")
+
+    assert result["verified"] is False
+    assert result["state"] == "closing"
+
+
+def test_cover_control_set_position_reports_null_while_still_in_transit(fake_ha):
+    from tools.covers import cover_control
+
+    fake_ha.states = [
+        {"entity_id": "cover.hall_window", "state": "opening",
+         "attributes": {"current_position": 30}},
+    ]
+
+    result = cover_control("cover.hall_window", "set_position", position=80)
+
+    assert result["verified"] is None
+    assert result["state"] == "opening"
+    assert result["position"] == 30
 
 
 def test_cover_control_toggle_verifies_against_the_prior_state(fake_ha):
@@ -253,6 +346,50 @@ def test_vacuum_control_fan_speed_verified_when_the_value_is_accepted(fake_ha):
 
     assert result["verified"] is True
     assert result["fan_speed"] == "max"
+
+
+def test_vacuum_control_return_verified_only_once_docked(fake_ha):
+    """'return' used to count "returning" itself as verified: true - the
+    state the vacuum is in for the entire drive back, not once it
+    arrives. Only "docked" verifies now."""
+    from tools.vacuum import vacuum_control
+
+    fake_ha.states = [
+        {"entity_id": "vacuum.roomba", "state": "docked", "attributes": {}},
+    ]
+
+    result = vacuum_control("return", entity_id="vacuum.roomba")
+
+    assert result["verified"] is True
+    assert result["state"] == "docked"
+
+
+def test_vacuum_control_return_reports_null_while_still_returning(fake_ha):
+    """Measured live, a vacuum can sit in "returning" well past the
+    read-back budget - genuinely in progress, not a denial."""
+    from tools.vacuum import vacuum_control
+
+    fake_ha.states = [
+        {"entity_id": "vacuum.roomba", "state": "returning", "attributes": {}},
+    ]
+
+    result = vacuum_control("return", entity_id="vacuum.roomba")
+
+    assert result["verified"] is None
+    assert result["state"] == "returning"
+
+
+def test_vacuum_control_return_reports_false_for_a_real_mismatch(fake_ha):
+    from tools.vacuum import vacuum_control
+
+    fake_ha.states = [
+        {"entity_id": "vacuum.roomba", "state": "error", "attributes": {}},
+    ]
+
+    result = vacuum_control("return", entity_id="vacuum.roomba")
+
+    assert result["verified"] is False
+    assert result["state"] == "error"
 
 
 def test_vacuum_control_locate_has_no_state_to_verify(fake_ha):
@@ -359,6 +496,29 @@ def test_apply_update_reports_accepted_but_unverified(fake_ha):
 # ---- tools/lights.py: set_light -----------------------------------------------
 
 def test_set_light_reports_a_verified_success(fake_ha):
+    """204/2.55 rounds to 80 - the light's own attributes, read back after
+    the call, actually reflect the requested brightness_pct."""
+    from tools.lights import set_light
+
+    fake_ha.states = [
+        {"entity_id": "light.kitchen", "state": "on", "attributes": {"brightness": 204}},
+    ]
+
+    result = set_light("light.kitchen", brightness_pct=80)
+
+    assert result["verified"] is True
+    assert result["observed_state"] == "on"
+    assert result["brightness_pct"] == 80
+
+
+def test_set_light_does_not_verify_an_attribute_that_never_changed(fake_ha):
+    """set_light() used to check only state == "on" for any turn_on/attribute
+    call, so a light that ignored every requested attribute (an unsupported
+    effect, an rgbw-only light asked for a color temperature) still reported
+    verified: true - see tools/lights.py's module-level fix. FakeHA never
+    simulates side effects of a POST (see this file's module docstring), so
+    "attributes": {} here stands in for exactly that: the call was accepted,
+    but nothing about brightness actually moved."""
     from tools.lights import set_light
 
     fake_ha.states = [
@@ -367,8 +527,102 @@ def test_set_light_reports_a_verified_success(fake_ha):
 
     result = set_light("light.kitchen", brightness_pct=80)
 
-    assert result["verified"] is True
+    assert result["verified"] is False
     assert result["observed_state"] == "on"
+    assert result["brightness_pct"] is None  # honest: nothing was read back at that key
+
+
+def test_set_light_verifies_color_temp_k(fake_ha):
+    from tools.lights import set_light
+
+    fake_ha.states = [
+        {"entity_id": "light.kitchen", "state": "on",
+         "attributes": {"color_temp_kelvin": 2700}},
+    ]
+
+    result = set_light("light.kitchen", color_temp_k=2700)
+
+    assert result["verified"] is True
+    assert result["color_temp_k"] == 2700
+
+
+def test_set_light_does_not_verify_color_temp_k_on_a_light_that_ignored_it(fake_ha):
+    """Measured live: an rgbw-only light (no 'color_temp' color mode) 200s a
+    color_temp_k request and leaves color_temp_kelvin unset - the exact
+    shape this reproduces."""
+    from tools.lights import set_light
+
+    fake_ha.states = [
+        {"entity_id": "light.kitchen", "state": "on",
+         "attributes": {"rgbw_color": [0, 15, 30, 15]}},
+    ]
+
+    result = set_light("light.kitchen", color_temp_k=2700)
+
+    assert result["verified"] is False
+    assert result["color_temp_k"] is None
+
+
+def test_set_light_verifies_rgb_color_by_hue_and_saturation(fake_ha):
+    """Home Assistant does not preserve an rgb_color's value/brightness for
+    a light whose native color mode is 'hs': it stores hue/saturation and
+    derives rgb_color back at full value. Measured live: requesting
+    rgb_color=[10, 20, 30] on a color_temp/hs light reads back rgb_color
+    [85, 170, 255] - same hue (210) and saturation (66.667), different
+    value. hs_color is what set_light() actually compares against."""
+    from tools.lights import set_light
+
+    fake_ha.states = [
+        {"entity_id": "light.kitchen", "state": "on",
+         "attributes": {"hs_color": [210.0, 66.667], "rgb_color": [85, 170, 255]}},
+    ]
+
+    result = set_light("light.kitchen", rgb_color=[10, 20, 30])
+
+    assert result["verified"] is True
+    assert result["rgb_color"] == [85, 170, 255]
+
+
+def test_set_light_does_not_verify_rgb_color_with_the_wrong_hue(fake_ha):
+    from tools.lights import set_light
+
+    fake_ha.states = [
+        {"entity_id": "light.kitchen", "state": "on",
+         "attributes": {"hs_color": [0.0, 100.0], "rgb_color": [255, 0, 0]}},
+    ]
+
+    result = set_light("light.kitchen", rgb_color=[10, 20, 30])  # blue-ish hue
+
+    assert result["verified"] is False
+    assert result["rgb_color"] == [255, 0, 0]
+
+
+def test_set_light_verifies_effect(fake_ha):
+    from tools.lights import set_light
+
+    fake_ha.states = [
+        {"entity_id": "light.kitchen", "state": "on", "attributes": {"effect": "rainbow"}},
+    ]
+
+    result = set_light("light.kitchen", effect="rainbow")
+
+    assert result["verified"] is True
+    assert result["effect"] == "rainbow"
+
+
+def test_set_light_does_not_verify_an_unsupported_effect(fake_ha):
+    """Measured live: a light with no effect_list at all (no EFFECT feature)
+    200s an effect request and leaves "effect" unset."""
+    from tools.lights import set_light
+
+    fake_ha.states = [
+        {"entity_id": "light.kitchen", "state": "on", "attributes": {}},
+    ]
+
+    result = set_light("light.kitchen", effect="Disco")
+
+    assert result["verified"] is False
+    assert result["effect"] is None
 
 
 def test_set_light_off_reports_a_verified_success(fake_ha):
@@ -972,6 +1226,28 @@ def test_send_photo_accepts_a_real_target(fake_ha):
     assert result["chat_id"] == 123456
 
 
+def test_send_photo_reports_a_non_telegram_target_as_an_error_not_a_crash(fake_ha):
+    """notify.notifier is a completely ordinary, non-Telegram notify
+    target - picking the wrong notify service here is a plausible caller
+    mistake, not an exceptional condition. The old code let
+    _resolve_telegram_chat_id() raise a bare, uncaught ValueError for
+    this; it must come back as an error() instead, naming what this tool
+    supports."""
+    from tools.notifications import send_photo
+
+    fake_ha.states = [
+        {"entity_id": "notify.notifier", "state": "unknown", "attributes": {}},
+        {"entity_id": "notify.telegram_home", "state": "unknown",
+         "attributes": {"friendly_name": "Telegram Home (123456)"}},
+    ]
+
+    result = send_photo(target="notify.notifier", photo_url="https://example.com/x.jpg")
+
+    assert result["error"] == "not_a_telegram_target"
+    assert result["entity_id"] == "notify.notifier"
+    assert result["telegram_targets"] == ["notify.telegram_home"]
+
+
 def test_send_camera_snapshot_reports_a_nonexistent_notify_target(fake_ha):
     from tools.notifications import send_camera_snapshot
 
@@ -993,6 +1269,39 @@ def test_send_camera_snapshot_reports_a_nonexistent_camera(fake_ha):
 
     assert result["error"] == "entity_not_found"
     assert result["entity_id"] == "camera.ghost"
+
+
+def test_send_camera_snapshot_reports_a_nonexistent_camera_even_with_a_bad_notify_target(fake_ha):
+    """The camera is checked before the notify target's chat_id is
+    resolved, so a bad camera_entity_id is reported as itself rather than
+    masked by the *other* argument's chat_id error - the old ordering let
+    a nonexistent camera get hidden behind whichever failure the notify
+    target hit first."""
+    from tools.notifications import send_camera_snapshot
+
+    fake_ha.states = [
+        {"entity_id": "notify.notifier", "state": "unknown", "attributes": {}},
+    ]
+
+    result = send_camera_snapshot("camera.ghost", target="notify.notifier")
+
+    assert result["error"] == "entity_not_found"
+    assert result["entity_id"] == "camera.ghost"
+
+
+def test_send_camera_snapshot_reports_a_non_telegram_target_as_an_error_not_a_crash(fake_ha):
+    from tools.notifications import send_camera_snapshot
+
+    fake_ha.states = [
+        {"entity_id": "notify.notifier", "state": "unknown", "attributes": {}},
+        {"entity_id": "camera.gate", "state": "idle",
+         "attributes": {"access_token": "tok123"}},
+    ]
+
+    result = send_camera_snapshot("camera.gate", target="notify.notifier")
+
+    assert result["error"] == "not_a_telegram_target"
+    assert result["entity_id"] == "notify.notifier"
 
 
 def test_create_persistent_notification_verifies_a_given_id(fake_ha):
@@ -1081,6 +1390,24 @@ def test_acknowledge_alert_accepts_a_real_target(fake_ha):
     assert result["verified"] is None
 
 
+def test_acknowledge_alert_calls_turn_off_not_the_nonexistent_acknowledge_service(fake_ha):
+    """Home Assistant's alert domain has no alert.acknowledge service - only
+    turn_on, turn_off and toggle exist (confirmed live against
+    /api/services). The old code posted to alert/acknowledge, which 400s
+    on every real Home Assistant instance; alert.turn_off is what actually
+    acknowledges an alert."""
+    from tools.alerts import acknowledge_alert
+
+    fake_ha.states = [
+        {"entity_id": "alert.gas_leak", "state": "on", "attributes": {}},
+    ]
+
+    acknowledge_alert("alert.gas_leak")
+
+    assert any(c.url.path == "/api/services/alert/turn_off" for c in fake_ha.rest_calls)
+    assert not any(c.url.path == "/api/services/alert/acknowledge" for c in fake_ha.rest_calls)
+
+
 def test_acknowledge_alert_reports_a_nonexistent_target(fake_ha):
     from tools.alerts import acknowledge_alert
 
@@ -1146,6 +1473,27 @@ def test_update_todo_item_matches_by_uid_or_summary(fake_ha):
     assert result["verified"] is True
 
 
+def test_update_todo_item_reports_a_rejected_call_as_an_error_not_a_crash(fake_ha):
+    """An item that does not exist, or a status value outside
+    needs_action/completed, both make Home Assistant reject
+    todo/update_item with a non-2xx REST response - measured live, a 500
+    for the first and a 400 for the second, neither JSON. The old code
+    had no try/except around r.raise_for_status(), so this propagated as
+    an uncaught HTTPStatusError instead of the error() envelope every
+    other failure path in this file returns."""
+    from tools.todo import update_todo_item
+
+    fake_ha.states = [{"entity_id": "todo.shopping_list", "state": "1", "attributes": {}}]
+    fake_ha.fail_rest("/api/services/todo/update_item", status=500,
+                      message="Server got itself in trouble")
+
+    result = update_todo_item("todo.shopping_list", "NoSuchItemXYZ", status="completed")
+
+    assert result["error"] == "home_assistant_error"
+    assert result["status"] == 500
+    assert "verified" not in result
+
+
 def test_remove_todo_item_verifies_absence(fake_ha):
     from tools.todo import remove_todo_item
 
@@ -1192,6 +1540,27 @@ def test_add_calendar_event_reports_accepted_but_unverified(fake_ha):
         "calendar.home", "Dentist", "2026-08-25T09:00:00+02:00", "2026-08-25T10:00:00+02:00")
 
     assert result["verified"] is False
+
+
+def test_add_calendar_event_reports_a_rejected_call_as_an_error_not_a_crash(fake_ha):
+    """A calendar entity that does not support calendar.create_event (no
+    CREATE_EVENT feature) makes Home Assistant reject the create call
+    itself - measured live, a 500, not JSON. The old code had no
+    try/except around r.raise_for_status(), so this propagated as an
+    uncaught HTTPStatusError instead of the error() envelope every other
+    failure path in this file returns."""
+    from tools.calendar import add_calendar_event
+
+    fake_ha.states = [{"entity_id": "calendar.home", "state": "off", "attributes": {}}]
+    fake_ha.fail_rest("/api/services/calendar/create_event", status=500,
+                      message="Server got itself in trouble")
+
+    result = add_calendar_event(
+        "calendar.home", "Dentist", "2026-08-25T09:00:00+02:00", "2026-08-25T10:00:00+02:00")
+
+    assert result["error"] == "home_assistant_error"
+    assert result["status"] == 500
+    assert "verified" not in result
 
 
 # ---- tools/groups.py ---------------------------------------------------------------
@@ -1458,6 +1827,25 @@ def test_create_automation_enabled_reports_the_observed_state(fake_ha):
     assert result["enabled"] is True
     assert result["verified"] is True
     assert result["state"] == "on"
+
+
+# ---- tools/helpers.py: create_template_sensor -------------------------------------
+
+def test_create_template_sensor_reports_a_rejected_flow_start_as_an_error_not_a_crash(fake_ha):
+    """A transport/auth failure (a revoked token, e.g.) makes the very
+    first REST call in this tool's three-step config-flow sequence fail -
+    measured live, a 401. The old code had no try/except around
+    r1.raise_for_status(), so this propagated as an uncaught
+    HTTPStatusError instead of the error() envelope every other failure
+    path in this codebase returns."""
+    from tools.helpers import create_template_sensor
+
+    fake_ha.fail_rest("/api/config/config_entries/flow", status=401, message="Unauthorized")
+
+    result = create_template_sensor("Test Sensor", "{{ 1 + 1 }}")
+
+    assert result["error"] == "home_assistant_error"
+    assert result["status"] == 401
 
 
 # ---- tools/helpers.py: set_helper - unrecognised command rejection (E1) ------------

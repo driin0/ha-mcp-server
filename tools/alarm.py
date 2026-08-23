@@ -1,6 +1,26 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, envelope, error, observe_actuation
+from tools._base import (
+    mcp, HA_URL, HEADERS, envelope, error, observe_actuation,
+    verified_allowing_transit,
+)
+
+# The transient state each arm_* command passes through before landing on
+# its target ("arming", not "armed_home" yet — measured live, a panel with
+# a short exit delay took about five seconds to settle). "disarm" has no
+# entry here: measured live on this project's own test instance, disarm
+# was instantaneous every time — no "disarming" state was ever observed —
+# so it keeps the plain True/False result rather than getting a None it
+# has never actually needed. A real installation with a longer entry delay
+# on disarm would not match that; there is nothing in the API response to
+# tell the two apart in advance.
+_ALARM_TRANSITIONAL_STATES = {
+    "arm_home": {"arming"},
+    "arm_away": {"arming"},
+    "arm_night": {"arming"},
+    "arm_vacation": {"arming"},
+    "arm_custom_bypass": {"arming"},
+}
 
 # HA service names (alarm_disarm, alarm_arm_home, ...) already match
 # f"alarm_{command}"; the state each settles into is not the same string
@@ -33,12 +53,24 @@ def alarm_control(entity_id: str, command: str, code: str = "") -> dict:
 
     `verified` is true only when the panel's own state, read back after the
     call, matches the command (e.g. arm_home -> "armed_home"). Arming
-    passes through a transient "arming"/"pending" state first — measured
-    live, a panel with a short exit delay settles within about a second, so
-    the read-back retries once before concluding the effect was not
-    observed. A wrong or missing code raises rather than returning a value
-    (Home Assistant answers it with a non-2xx status), which surfaces the
-    same way any other refused call in this codebase does.
+    passes through a transient "arming" state first — measured live, a
+    panel with a short exit delay took about five seconds to settle (an
+    earlier version of this docstring claimed "within about a second",
+    measured on a since-changed instance — re-measure on your own panel
+    rather than trusting either number). The read-back retries twice more
+    (three reads total, roughly three seconds) — short of what that exit
+    delay needs, deliberately: blocking a tool call for five-plus seconds
+    has its own cost. When the budget runs out and the panel is still
+    "arming", `verified` is `None` — not `False` — since that is honestly
+    still in progress, not a denial that arming will complete; `state`
+    alongside it says "arming" so the reason is visible. A real mismatch
+    (disarmed again, a different mode, "pending" from a triggered sensor)
+    still reports `False`. "disarm" has no transient state of its own —
+    measured live, it was instantaneous every time — so it keeps a plain
+    True/False `verified` with no `None` case. A wrong or missing code
+    raises rather than returning a value (Home Assistant answers it with a
+    non-2xx status), which surfaces the same way any other refused call in
+    this codebase does.
     """
     if command not in _ALARM_EXPECTED_STATE:
         return error("invalid_command",
@@ -56,7 +88,7 @@ def alarm_control(entity_id: str, command: str, code: str = "") -> dict:
         )
         r.raise_for_status()
     expected = _ALARM_EXPECTED_STATE[command]
-    obs = observe_actuation(entity_id, lambda s: s["state"] == expected, retries=2, delay=1.0)
+    obs = observe_actuation(entity_id, lambda s: s["state"] == expected, retries=3, delay=1.0)
     if not obs["exists"]:
         return error("entity_not_found",
                      f"{entity_id} does not exist on this Home Assistant instance.",
@@ -64,7 +96,7 @@ def alarm_control(entity_id: str, command: str, code: str = "") -> dict:
     return {
         "entity_id": entity_id,
         "command": command,
-        "verified": obs["verified"],
+        "verified": verified_allowing_transit(obs, _ALARM_TRANSITIONAL_STATES.get(command, frozenset())),
         "state": obs["state"]["state"],
     }
 

@@ -265,11 +265,12 @@ def add_lovelace_resource(url: str, resource_type: str = "module") -> dict:
 
 
 @mcp.tool()
-def remove_lovelace_resource(resource_id: int) -> dict:
+def remove_lovelace_resource(resource_id: str) -> dict:
     """
     Remove a Lovelace frontend resource by its ID.
 
-    resource_id: integer ID (use list_lovelace_resources() to find IDs)
+    resource_id: opaque hex string ID, e.g. '9ed6e7503f1549e6bf3b73f079b7542d'
+                 (use list_lovelace_resources() to find IDs)
 
     ⚠️ This is irreversible. Any dashboard card relying on this resource
     (a custom card's JS, a theme's CSS) stops rendering until it is
@@ -279,7 +280,7 @@ def remove_lovelace_resource(resource_id: int) -> dict:
     error() envelope with Home Assistant's actual error code/message on
     failure.
     """
-    result = _ws({"type": "lovelace/resources/delete", "id": resource_id})
+    result = _ws({"type": "lovelace/resources/delete", "resource_id": resource_id})
     if err := ws_error(result):
         return err
     return {"deleted": resource_id, "success": True}

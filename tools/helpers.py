@@ -1,7 +1,8 @@
 import httpx
 
 from tools._base import (
-    mcp, HA_URL, HEADERS, HELPER_DOMAINS, _slug, _ws, envelope, error, observe_actuation, ws_error,
+    mcp, HA_URL, HEADERS, HELPER_DOMAINS, _slug, _ws, envelope, error, observe_actuation,
+    rest_error, ws_error,
 )
 
 # timer/{command} settles into a fixed state, the same way lock/{command}
@@ -390,8 +391,12 @@ def create_template_sensor(
         state_template: "{{ states('sensor.living_room_temperature') }}"
 
     Returns: {entry_id, name, result, icon_set?, icon_error?} once Home
-    Assistant accepts the config flow submission, or {error: "400 on form
-    submit", schema, payload_sent} when it rejects the payload.
+    Assistant accepts the config flow submission, or an error() envelope -
+    {error: "400 on form submit", schema, payload_sent} when it rejects
+    the sensor payload itself, or {error: "home_assistant_error", status,
+    detail} when any of this tool's three REST config-flow calls fails
+    for another reason (a transport/auth failure - a revoked token 401s
+    on the very first call - or an unexpected non-2xx at any step).
     `icon_set`/`icon_error` only appear when `icon` was given: setting it
     is a second, separate WebSocket call after the sensor itself is
     created, so it can fail (and is reported failing, with the real error)
@@ -406,7 +411,8 @@ def create_template_sensor(
             json={"handler": "template"},
             timeout=15,
         )
-        r1.raise_for_status()
+        if err := rest_error(r1):
+            return err
         flow = r1.json()
         flow_id = flow["flow_id"]
 
@@ -417,7 +423,8 @@ def create_template_sensor(
             json={"next_step_id": "sensor"},
             timeout=15,
         )
-        r2.raise_for_status()
+        if err := rest_error(r2):
+            return err
         form_schema = r2.json()
 
         # Step 3: submit sensor config — only include fields present in the schema
@@ -440,7 +447,8 @@ def create_template_sensor(
         )
         if r3.status_code == 400:
             return {"error": "400 on form submit", "schema": form_schema, "payload_sent": payload}
-        r3.raise_for_status()
+        if err := rest_error(r3):
+            return err
         result = r3.json()
         entry_id = result.get("result", {}).get("entry_id", "")
 

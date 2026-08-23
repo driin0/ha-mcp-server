@@ -11,6 +11,13 @@ def list_users() -> dict:
     Returns: {total, returned, offset, note?, users: [{id, name, is_admin,
              is_active, local_only, system_generated}]}
     Requires admin privileges.
+
+    Always registered, unlike its three write counterparts
+    (create_user/update_user/delete_user), which are gated off by default
+    — see list_disabled_tools() for why and how to enable them. Listing
+    accounts is a read with no privilege-escalation shape of its own; it
+    stays available so a caller can still discover a user's id (needed by
+    update_user/delete_user) once that gate is turned on.
     """
     # WS config/auth/list — the correct command used by the HA frontend
     result = _ws({"type": "config/auth/list"})

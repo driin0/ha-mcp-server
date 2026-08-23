@@ -29,6 +29,26 @@ write tool in this codebase now returns exactly one of the following.
    — "verified: None" here is a claim of ignorance, not of success; the
    detail says what could and could not be confirmed.
 
+   A second, narrower case gets the same None treatment:
+   verified_allowing_transit() (below) downgrades observe_actuation()'s
+   `verified: False` to `verified: None` when the entity's own read-back
+   state is a transitional one for the actuation just requested — a cover
+   still "closing", an alarm panel still "arming", a vacuum still
+   "returning" to its dock. observe_actuation()'s retry budget is short by
+   design (a bounded margin, not a job-completion poll — see its
+   docstring), so a genuinely successful but slow actuation is common, not
+   an edge case: measured live, a window cover can take ten seconds to
+   settle and an alarm panel's exit delay took five, both well past the
+   read-back budget. Reporting that as `verified: False` is a false
+   negative with the same shape as the false positive this whole
+   convention exists to prevent — a caller reads a flat "no" for
+   something that is, truthfully, still in progress. `verified: None`
+   here means exactly what it means in the no-read-back case: not
+   confirmed, not denied — ask again, or accept that this call cannot
+   settle the question within its budget. `state` alongside it always
+   names the transitional value observed, so the reason is not hidden
+   behind the None.
+
 3. A **registry write** result, for a config/registry command (create,
    update, delete an area, tag, person, helper, dashboard, pipeline...):
    gated by ws_error() (or an HTTP status check, for the handful of REST
@@ -243,7 +263,22 @@ async def _ws_commands(msgs: list) -> list:
         for i, msg in enumerate(msgs, start=1):
             await ws.send(json.dumps({"id": i, **msg}))
 
-        # Collect result messages by id, skipping event/unsolicited frames
+        # Collect result messages by id, skipping event/unsolicited frames.
+        #
+        # A command Home Assistant never answers at all (e.g. a wrong
+        # parameter name it silently ignores rather than rejects — see
+        # remove_lovelace_resource()'s former "id" vs "resource_id" bug)
+        # leaves its id in `pending` forever, so this can time out and
+        # raise rather than return. That is deliberate, not an oversight:
+        # ws_error()'s own docstring already documents "timeouts raise
+        # exceptions ... so callers see an exception rather than an error
+        # envelope". Converting that into an error() here would need a
+        # real deadline rather than this per-recv timeout (which resets on
+        # every unrelated frame — a state_changed event mid-batch pushes
+        # the effective wait well past 15s), and would change the contract
+        # for every one of this codebase's ~100 WebSocket-backed tools at
+        # once. That is a deliberate, separately-tested change, not a side
+        # effect of fixing one tool's wrong parameter name.
         results: list = [None] * len(msgs)
         pending = set(range(1, len(msgs) + 1))
         while pending:
@@ -357,6 +392,68 @@ def ws_error(result) -> dict | None:
     if "result" not in result and "error" in result:
         return error("websocket_error", str(result["error"]))
     return None
+
+
+def ws_transport_error(result) -> dict | None:
+    """Return an error envelope when `result` is the connection/auth-level
+    failure shape _ws_commands() returns for EVERY message in a batch when
+    the WebSocket itself never authenticated - {"error": "..."} with no
+    "success" key at all (see ws_error()'s docstring). Returns None for an
+    ordinary per-command result, whether it succeeded or was individually
+    rejected by Home Assistant (which always carries a "success" key of
+    its own).
+
+    Exists for _ws_multi() callers that build their own per-item bulk
+    result (succeeded/failed counts, one row per entity) rather than
+    routing each result through ws_error(): without this check, a
+    transport failure that answers every message in the batch identically
+    reads back as an ordinary "every item failed" - indistinguishable
+    from N separate per-item rejections. A caller sees that and concludes
+    something about those N entities, when in fact the connection never
+    carried the batch to Home Assistant at all. Measured live against
+    bulk_set_entity_labels() (tools/areas.py) under an invalid token:
+    {"total": 1, "succeeded": 0, "failed": ["light.bed_light"]} - a
+    normal-shaped bulk result with no "error" key anywhere in it.
+
+    Check the first result only: _ws_commands() decides auth/connection
+    failure before sending any command at all, so if one message in the
+    batch has this shape, every message in that same _ws_multi() call
+    does.
+    """
+    if isinstance(result, dict) and "success" not in result and "error" in result:
+        return error("websocket_error", str(result["error"]))
+    return None
+
+
+def rest_error(r: httpx.Response) -> dict | None:
+    """Convert a non-2xx REST response into an error() envelope instead of
+    letting a bare r.raise_for_status() propagate as an uncaught
+    HTTPStatusError.
+
+    Home Assistant answers a rejected REST service/config call with a
+    plain-text body, not JSON with a "message" field the way a frontend
+    error toast might suggest - measured live against a throwaway
+    instance: "500 Internal Server Error\n\nServer got itself in
+    trouble" for an item that does not exist (todo/update_item) or a
+    calendar without CREATE_EVENT support (calendar/create_event), "400:
+    Bad Request" for a malformed status enum or malformed dates. This
+    reports r.text directly rather than assuming a JSON shape that is
+    not actually there.
+
+    Call this immediately after the request instead of r.raise_for_status()
+    - not in addition to it, and not after it, which would never see this
+    branch at all. Returns None for a 2xx response, so a caller writes:
+
+        r = client.post(...)
+        if err := rest_error(r):
+            return err
+
+    the same shape ws_error() already gives WebSocket-backed writes in
+    this codebase.
+    """
+    if r.is_success:
+        return None
+    return error("home_assistant_error", r.text.strip(), status=r.status_code)
 
 
 def entity_area_map(entities: list | None = None) -> tuple[dict, dict | None]:
@@ -494,10 +591,18 @@ def observe_actuation(entity_id: str, satisfied, *, retries: int = 1, delay: flo
                 (toggle_automation, tools/automations.py, is the one-shot
                 precedent this generalises). Measured live: a lock and a
                 garage-door cover already show their final state by the
-                time the POST returns; an alarm panel and a window cover
-                with simulated travel settle within about a second. This is
-                a short bounded margin for that case, not a substitute for
-                a real job-completion API.
+                time the POST returns; a window cover with simulated
+                travel took up to ten seconds and an alarm panel's exit
+                delay took about five — both well past any retry budget
+                short enough to spend inside a tool call (an earlier
+                version of this docstring claimed "within about a second";
+                that number came from a different instance and did not
+                reproduce here — see verified_allowing_transit() below for
+                how callers with a transitional state to watch for handle
+                the gap between this short budget and a slow settle,
+                rather than reporting a flat False for it). This is a
+                short bounded margin for the common case, not a substitute
+                for a real job-completion API.
 
     Returns exactly one of:
       {"exists": False, "verified": False, "state": None}
@@ -505,7 +610,15 @@ def observe_actuation(entity_id: str, satisfied, *, retries: int = 1, delay: flo
           accepted — see the confirm_entity_exists() docstring — so this is
           the only way to learn the target never existed.
       {"exists": True, "verified": True, "state": <raw HA state dict>}
-          `satisfied` matched a read-back.
+          `satisfied` matched a read-back. Returned on the FIRST read where
+          `satisfied` matches, with no further reads after it — so a state
+          that flaps (matches once, then changes again before this
+          function would have read it a second time) still reports
+          verified: true, the same as one that settled and stayed. This is
+          inherent to a bounded read-back done once per attempt rather than
+          a continuous watch, and is not fixed here; callers that need to
+          know a value held steady, not just that it was seen once, need
+          their own follow-up read.
       {"exists": True, "verified": False, "state": <raw HA state dict>}
           the entity exists but `satisfied` never matched within `retries`
           — accepted, but unverified (a jammed lock, an offline device, a
@@ -526,6 +639,44 @@ def observe_actuation(entity_id: str, satisfied, *, retries: int = 1, delay: flo
         if satisfied(state):
             return {"exists": True, "verified": True, "state": state}
     return {"exists": True, "verified": False, "state": state}
+
+
+def verified_allowing_transit(obs: dict, transitional_states: frozenset) -> bool | None:
+    """Downgrade an observe_actuation() miss to None when the entity's
+    read-back state is transitional, rather than reporting a flat False for
+    something that is still legitimately in progress.
+
+    obs:  an observe_actuation() result with obs["exists"] already True —
+          call this after that check, not instead of it; a nonexistent
+          entity is its own case (see observe_actuation()'s own return
+          shapes) and does not go through here.
+    transitional_states: the state strings that mean "still happening, not
+          yet settled" for the actuation just requested — e.g. {"closing"}
+          for a cover close, {"arming"} for an alarm panel's arm_home.
+          Scoped to the single command actually sent, not every
+          transitional state the domain has: a cover asked to `open` that
+          reads back "closing" is not "still working on it", it is moving
+          the wrong way, and stays False.
+
+    Returns True unchanged when observe_actuation() already confirmed it.
+    Returns None — "not confirmed, not denied" — when it did not, but the
+    last read-back state is in `transitional_states`: the same meaning
+    `verified: None` carries elsewhere in this codebase for an actuation
+    with nothing to read back (see this module's docstring), extended
+    here to an actuation that has plenty to read back but has not
+    finished changing it yet. Measured live: a window cover can take ten
+    seconds to fully open or close and an alarm panel's exit delay took
+    five, both past any retry budget short enough to spend inside a tool
+    call — this is what keeps that from reading as a denial.
+    Returns False for every other unmet case unchanged - a jammed lock,
+    a light that stayed off, anything that is not still in transit.
+    """
+    if obs["verified"]:
+        return True
+    state = obs["state"]
+    if state is not None and state.get("state") in transitional_states:
+        return None
+    return False
 
 
 # ---------------------------------------------------------------------------

@@ -476,6 +476,63 @@ def test_config_entries_uses_its_own_command(fake_ha):
     assert fake_ha.ws_calls[-1]["type"] == "config_entries/get"
 
 
+def test_reload_integration_uses_the_rest_endpoint_not_a_nonexistent_ws_command(fake_ha):
+    """Home Assistant has no "config_entries/reload" WebSocket command at
+    all - confirmed against its own source and live, where an earlier
+    version of this tool got back {"error": "unknown_command"} on every
+    call. Reloading a config entry is a REST call:
+    POST /api/config/config_entries/entry/{entry_id}/reload."""
+    from tools.system import reload_integration
+
+    fake_ha.rest_responses["/api/config/config_entries/entry/abc123/reload"] = (
+        200, {"require_restart": False})
+
+    result = reload_integration("abc123")
+
+    assert result == {"entry_id": "abc123", "reloaded": True, "require_restart": False}
+    assert fake_ha.ws_calls == []  # never sent as a WS command
+    assert any(
+        c.url.path == "/api/config/config_entries/entry/abc123/reload"
+        for c in fake_ha.rest_calls
+    )
+
+
+def test_reload_integration_reports_a_missing_entry(fake_ha):
+    from tools.system import reload_integration
+
+    fake_ha.rest_responses["/api/config/config_entries/entry/ghost/reload"] = (
+        404, {"message": "Invalid entry specified"})
+
+    result = reload_integration("ghost")
+
+    assert result["error"] == "not_found"
+
+
+def test_reload_integration_reports_a_refused_reload(fake_ha):
+    """Home Assistant answers 403 when the entry cannot be reloaded
+    (OperationNotAllowed) - distinct from a missing entry."""
+    from tools.system import reload_integration
+
+    fake_ha.rest_responses["/api/config/config_entries/entry/abc123/reload"] = (
+        403, {"message": "Entry cannot be reloaded"})
+
+    result = reload_integration("abc123")
+
+    assert result["error"] == "not_allowed"
+
+
+def test_reload_integration_reports_a_require_restart_signal(fake_ha):
+    from tools.system import reload_integration
+
+    fake_ha.rest_responses["/api/config/config_entries/entry/abc123/reload"] = (
+        200, {"require_restart": True})
+
+    result = reload_integration("abc123")
+
+    assert result["reloaded"] is True
+    assert result["require_restart"] is True
+
+
 def test_repairs_wraps_a_success(fake_ha):
     from tools.system import list_repairs
 
@@ -1242,6 +1299,64 @@ def test_list_devices_wraps_a_success_through_the_shared_envelope(fake_ha):
     assert "advance offset" in result["note"]
 
 
+def test_get_device_returns_the_matching_device(fake_ha):
+    from tools.areas import get_device
+
+    fake_ha.ws_result("config/device_registry/list", [
+        {"id": "d1", "name": "Router"},
+        {"id": "d2", "name": "Switch"},
+    ])
+
+    result = get_device("d2")
+
+    assert result["id"] == "d2"
+    assert result["name"] == "Switch"
+
+
+def test_get_device_says_not_found_for_a_genuinely_absent_id(fake_ha):
+    from tools.areas import get_device
+
+    fake_ha.ws_result("config/device_registry/list", [
+        {"id": "d1", "name": "Router"},
+    ])
+
+    result = get_device("does-not-exist")
+
+    assert result["error"] == "device_not_found"
+    assert "detail" in result
+
+
+def test_get_device_reports_a_registry_read_failure_not_not_found(fake_ha):
+    """get_device used to iterate `r.get("result", [])`, so a failed device
+    registry read (a dead connection, a revoked token) fell through the
+    empty default straight to "Device not found: <id>" - the same fault
+    already fixed in dashboards.py's _dashboard_id() - and bypassed
+    error() entirely, so the response carried no `detail` at all."""
+    from tools.areas import get_device
+
+    fake_ha.fail_ws("config/device_registry/list", code="unauthorized",
+                    message="Admin required")
+
+    result = get_device("d1")
+
+    assert result["error"] == "unauthorized"
+    assert result["error"] != "device_not_found"
+
+
+def test_get_device_reports_a_transport_failure_not_not_found(fake_ha):
+    """A revoked token fails before Home Assistant even answers with a
+    "success" key - _ws() itself returns {"error": "Auth failed: ..."}.
+    That must not read as "device not found" either."""
+    from tools.areas import get_device
+
+    fake_ha.fail_ws_transport("config/device_registry/list")
+
+    result = get_device("d1")
+
+    assert result["error"] != "device_not_found"
+    assert "Auth failed" in result["detail"]
+
+
 def test_list_labels_reports_a_ws_failure_as_an_error(fake_ha):
     from tools.areas import list_labels
 
@@ -1439,6 +1554,81 @@ def test_list_zones_says_when_nothing_matches(fake_ha):
     assert result["note"] == "no zones found"
 
 
+# ---- tools/areas.py: bulk_set_entity_labels -------------------------------
+
+def test_bulk_set_entity_labels_reports_a_normal_success(fake_ha):
+    from tools.areas import bulk_set_entity_labels
+
+    fake_ha.ws_result("config/entity_registry/update",
+                      {"entity_entry": {"labels": ["energia"]}})
+
+    result = bulk_set_entity_labels(["light.kitchen", "light.study"], ["energia"])
+
+    assert result == {"total": 2, "succeeded": 2, "failed": []}
+    assert "error" not in result
+
+
+def test_bulk_set_entity_labels_reports_per_entity_failures_normally(fake_ha, monkeypatch):
+    """An ordinary per-entity registry rejection (a bogus entity_id among
+    otherwise valid ones) is not a transport failure - it must stay a
+    normal bulk result, one failed id, not collapse into a single
+    error()."""
+    from tools.areas import bulk_set_entity_labels
+
+    def fake_ws_multi(msgs):
+        results = []
+        for msg in msgs:
+            if msg["entity_id"] == "light.totally_bogus_entity_zzz":
+                results.append({"id": 1, "type": "result", "success": False,
+                                "error": {"code": "not_found", "message": "Entity not found"}})
+            else:
+                results.append({"id": 1, "type": "result", "success": True,
+                                "result": {"entity_entry": {"labels": msg["labels"]}}})
+        return results
+
+    import tools.areas as areas_module
+    monkeypatch.setattr(areas_module, "_ws_multi", fake_ws_multi)
+
+    result = bulk_set_entity_labels(
+        ["light.bed_light", "light.totally_bogus_entity_zzz"], ["energia"])
+
+    assert result == {"total": 2, "succeeded": 1, "failed": ["light.totally_bogus_entity_zzz"]}
+    assert "error" not in result
+
+
+def test_bulk_set_entity_labels_reports_a_transport_failure_as_one_error(fake_ha):
+    """Under an invalid token (or any connection/auth failure), _ws_commands
+    answers every message in the batch with the same {"error": "..."}
+    shape, carrying no "success" key at all. The old code read that with
+    `r.get("success")`, which is falsy for every one of them, so it folded
+    a systemic transport failure into an ordinary-looking bulk result -
+    {"succeeded": 0, "failed": [...]} with no "error" key anywhere -
+    indistinguishable from every entity individually being rejected.
+    Measured live against a throwaway Home Assistant instance under an
+    invalid HA_TOKEN. This must now surface as one error(), not a bulk
+    result at all."""
+    from tools.areas import bulk_set_entity_labels
+
+    fake_ha.fail_ws_transport("config/entity_registry/update", "Auth failed: {'type': 'auth_invalid'}")
+
+    result = bulk_set_entity_labels(["light.bed_light", "light.study"], ["energia"])
+
+    assert result["error"] == "websocket_error"
+    assert "Auth failed" in result["detail"]
+    assert "succeeded" not in result
+    assert "failed" not in result
+
+
+def test_bulk_set_entity_labels_rejects_a_batch_over_the_limit(fake_ha):
+    from tools.areas import bulk_set_entity_labels, _BULK_LABEL_MAX
+
+    result = bulk_set_entity_labels(
+        [f"light.l{n}" for n in range(_BULK_LABEL_MAX + 1)], ["energia"])
+
+    assert result["error"] == "too_many_entities"
+    assert fake_ha.ws_calls == []  # nothing sent
+
+
 # ---- tools/calendar.py ---------------------------------------------------
 
 def test_list_calendars_wraps_a_success(fake_ha):
@@ -1536,6 +1726,42 @@ def test_list_lovelace_resources_failure_is_an_error_not_a_record(fake_ha):
     assert result["error"] == "not_found"
     assert result["detail"] == "Unknown command"
     assert "resources" not in result
+
+
+def test_remove_lovelace_resource_sends_the_key_home_assistant_expects(fake_ha):
+    """Home Assistant's lovelace/resources/delete command is keyed by
+    `resource_id`, not `id` - the tool used to send `id`, which Home
+    Assistant silently ignores (no error frame, no reply at all), so every
+    call hung for the full WS read timeout and then raised TimeoutError.
+    Pinning the exact key sent is what a `fail_ws`/`ws_result` test on the
+    old code could not have caught: the fake answers by command *type*
+    alone, so a wrong key inside an otherwise well-formed message would
+    still get a normal success reply from the fake while hanging forever
+    against the real thing - only asserting the sent message's own
+    contents catches it."""
+    from tools.dashboards import remove_lovelace_resource
+
+    fake_ha.ws_result("lovelace/resources/delete", None)
+
+    result = remove_lovelace_resource("9ed6e7503f1549e6bf3b73f079b7542d")
+
+    assert result == {"deleted": "9ed6e7503f1549e6bf3b73f079b7542d", "success": True}
+    sent = fake_ha.ws_calls[-1]
+    assert sent["type"] == "lovelace/resources/delete"
+    assert sent["resource_id"] == "9ed6e7503f1549e6bf3b73f079b7542d"
+    assert "id" not in sent  # the old, wrong key - HA never replies to this one
+
+
+def test_remove_lovelace_resource_reports_a_ws_failure_as_an_error(fake_ha):
+    from tools.dashboards import remove_lovelace_resource
+
+    fake_ha.fail_ws("lovelace/resources/delete", code="not_found",
+                    message="Resource not found")
+
+    result = remove_lovelace_resource("does-not-exist")
+
+    assert result["error"] == "not_found"
+    assert "deleted" not in result
 
 
 def test_update_dashboard_resolves_url_path_and_succeeds(fake_ha):

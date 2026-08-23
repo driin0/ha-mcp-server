@@ -1,8 +1,17 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, envelope, error, observe_actuation
+from tools._base import (
+    mcp, HA_URL, HEADERS, envelope, error, observe_actuation,
+    verified_allowing_transit,
+)
 
 _LOCK_EXPECTED_STATE = {"lock": "locked", "unlock": "unlocked", "open": "open"}
+# The state Home Assistant's lock domain defines for "not there yet" for
+# each command (LockState.LOCKING/UNLOCKING/OPENING). Not reproduced live
+# on this project's demo lock, which jumps straight to its target state
+# with no observable delay — this is defensive, for the real locks (many
+# Z-Wave/Zigbee locks included) that do take a moment to actuate.
+_LOCK_TRANSITIONAL_STATE = {"lock": "locking", "unlock": "unlocking", "open": "opening"}
 
 
 @mcp.tool()
@@ -52,8 +61,14 @@ def lock_control(entity_id: str, command: str, code: str = "") -> dict:
     jams, or one that never received the command, still answers the
     service call with 200 — `verified: false` with `state` set to whatever
     was actually observed (e.g. "jammed") is how that is told apart from a
-    real success. A non-2xx response (wrong code, a refused command) raises
-    rather than returning a value at all.
+    real success. Not reproduced live on this project's test lock, which
+    settles with no observable delay, but many real locks pass through a
+    transient "locking"/"unlocking"/"opening" state first; when the
+    read-back still shows that state for the command just sent,
+    `verified` is `None` — accepted and still actuating, neither confirmed
+    nor denied — rather than the `False` a lock that is not moving at all
+    (or has jammed) still gets. A non-2xx response (wrong code, a refused
+    command) raises rather than returning a value at all.
     """
     if command not in _LOCK_EXPECTED_STATE:
         raise ValueError("command must be: lock, unlock, or open")
@@ -72,6 +87,6 @@ def lock_control(entity_id: str, command: str, code: str = "") -> dict:
     return {
         "entity_id": entity_id,
         "command": command,
-        "verified": obs["verified"],
+        "verified": verified_allowing_transit(obs, {_LOCK_TRANSITIONAL_STATE[command]}),
         "state": obs["state"]["state"],
     }

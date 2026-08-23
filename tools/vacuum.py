@@ -1,6 +1,8 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, error, observe_actuation
+from tools._base import (
+    mcp, HA_URL, HEADERS, error, observe_actuation, verified_allowing_transit,
+)
 
 
 def _resolve_vacuum(entity_id: str) -> str:
@@ -88,6 +90,16 @@ def vacuum_control(
     plays a sound), so it instead checks the target exists before calling
     and reports `verified: null` — "accepted, effect unverifiable" — rather
     than a claim this tool cannot back up.
+
+    'return' used to count the transient "returning" state as success —
+    the state a vacuum is in for the entire drive back, not once it gets
+    there. Measured live, a vacuum can sit in "returning" for well past the
+    read-back budget (retries are short by design — see
+    observe_actuation()'s docstring — a real return can take much longer
+    than any budget this tool should block a call for). Only "docked"
+    counts as verified now; "returning" still within the retry budget
+    reports `verified: null` — accepted and genuinely in progress, neither
+    confirmed nor denied — and any other state reports `verified: false`.
     """
     if not entity_id:
         raise ValueError("entity_id is required — vacuum_control no longer guesses a target")
@@ -143,21 +155,22 @@ def vacuum_control(
     elif command == "pause":
         satisfied = lambda s: s["state"] == "paused"
     elif command == "return":
-        satisfied = lambda s: s["state"] in ("returning", "docked")
+        satisfied = lambda s: s["state"] == "docked"
     elif command == "fan_speed":
         satisfied = lambda s: s.get("attributes", {}).get("fan_speed") == fan_speed
     else:  # clean_rooms
         satisfied = lambda s: s["state"] == "cleaning"
 
-    obs = observe_actuation(entity_id, satisfied, retries=2, delay=1.0)
+    obs = observe_actuation(entity_id, satisfied, retries=3, delay=1.0)
     if not obs["exists"]:
         return error("entity_not_found",
                      f"{entity_id} does not exist on this Home Assistant instance.",
                      entity_id=entity_id, command=command)
+    transitional = {"returning"} if command == "return" else frozenset()
     out = {
         "entity_id": entity_id,
         "command": command,
-        "verified": obs["verified"],
+        "verified": verified_allowing_transit(obs, transitional),
         "state": obs["state"]["state"],
     }
     if command == "fan_speed":

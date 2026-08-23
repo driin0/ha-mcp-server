@@ -5,7 +5,7 @@ import httpx
 from tools._base import mcp, HA_URL, HEADERS, _ws, confirm_entity_exists, envelope, error, ws_error
 
 
-def _resolve_telegram_chat_id(entity_id: str) -> int:
+def _resolve_telegram_chat_id(entity_id: str) -> int | None:
     """
     Resolve the Telegram chat_id for a notify entity.
 
@@ -15,7 +15,13 @@ def _resolve_telegram_chat_id(entity_id: str) -> int:
     2. Fallback: regex on friendly_name for "(chat_id)" suffix
        (legacy YAML-configured entities and group chats)
 
-    Raises ValueError if chat_id cannot be determined.
+    Returns None if chat_id cannot be determined - notably for any
+    ordinary, non-Telegram notify target (a mobile app, Alexa, a file
+    notifier): picking the wrong notify service for send_photo() /
+    send_camera_snapshot() is a plausible, ordinary caller mistake, not
+    an exceptional condition, so this reports it with None rather than
+    raising - see _telegram_target_error() below for the error() built
+    from it.
 
     TODO HA 2026.9.0: migrate callers to use 'chat_id' or 'entity_id' parameter
     directly in telegram_bot service calls once the new API is stable.
@@ -38,10 +44,7 @@ def _resolve_telegram_chat_id(entity_id: str) -> int:
             if m:
                 return int(m.group(1))
 
-    raise ValueError(
-        f"Cannot resolve Telegram chat_id for {entity_id}. "
-        "Add the chat_id in parentheses to the entity's friendly name, e.g. 'Name (123456)'."
-    )
+    return None
 
 
 def _telegram_type(chat_id: int | None) -> str:
@@ -51,6 +54,35 @@ def _telegram_type(chat_id: int | None) -> str:
     if chat_id > 0:
         return "telegram_private"
     return "telegram_group"  # negative: group or channel
+
+
+def _telegram_target_error(entity_id: str) -> dict:
+    """error() for a notify target send_photo()/send_camera_snapshot() cannot
+    use because _resolve_telegram_chat_id() returned None for it - not a
+    Telegram entity at all, or a legacy one missing the "(chat_id)"
+    friendly-name suffix these two tools depend on.
+
+    Names what these two tools actually support, and lists the other
+    notify targets that DO look like Telegram ones - list_notify_services()
+    already classifies every notify.* entity this cheaply (one /api/states
+    read, reused here rather than repeated), so a caller does not have to
+    make a second call just to find out what would work.
+    """
+    targets = [
+        s["entity_id"] for s in list_notify_services().get("services", [])
+        if s["type"] in ("telegram_private", "telegram_group")
+    ]
+    return error(
+        "not_a_telegram_target",
+        f"{entity_id} does not look like a Telegram notify target. "
+        "send_photo() and send_camera_snapshot() only support Telegram - "
+        "they call telegram_bot.send_photo directly - and this entity's "
+        "registry unique_id and friendly name did not resolve a chat_id. "
+        "A legacy YAML-configured Telegram target needs the chat_id in "
+        "parentheses in its friendly name, e.g. 'Name (123456)'.",
+        entity_id=entity_id,
+        telegram_targets=targets,
+    )
 
 
 @mcp.tool()
@@ -185,15 +217,20 @@ def send_photo(target: str, photo_url: str, caption: str = "") -> dict:
     caption: optional caption text
 
     Returns: {target, chat_id, photo, accepted: true, verified: null,
-    detail} once Home Assistant accepts the call, or
+    detail} once Home Assistant accepts the call, or an error() envelope -
     {error: "entity_not_found", ...} when the target entity has no state
-    at all. See send_notification() for why delivery itself is not
+    at all, or {error: "not_a_telegram_target", telegram_targets: [...],
+    ...} when it exists but is not a Telegram notify entity (this tool
+    only works with Telegram; the error lists the notify targets that
+    are). See send_notification() for why delivery itself is not
     verifiable here.
     """
     entity_id = target if target.startswith("notify.") else f"notify.{target}"
     if missing := confirm_entity_exists(entity_id):
         return missing
     chat_id = _resolve_telegram_chat_id(entity_id)
+    if chat_id is None:
+        return _telegram_target_error(entity_id)
     payload: dict = {"url": photo_url, "target": [chat_id]}
     if caption:
         payload["caption"] = caption
@@ -230,19 +267,23 @@ def send_camera_snapshot(camera_entity_id: str, target: str, caption: str = "") 
     caption: optional caption text
 
     Returns: {camera, target, chat_id, photo_url, accepted: true,
-    verified: null, detail} once Home Assistant accepts the call, or
-    {error: "entity_not_found", ...} when either the camera or the notify
-    target has no state at all. See send_notification() for why delivery
-    itself is not verifiable here.
+    verified: null, detail} once Home Assistant accepts the call, or an
+    error() envelope - {error: "entity_not_found", ...} when either the
+    camera or the notify target has no state at all, or
+    {error: "not_a_telegram_target", telegram_targets: [...], ...} when
+    the notify target exists but is not a Telegram notify entity. See
+    send_notification() for why delivery itself is not verifiable here.
     """
-    # 1. Confirm both targets exist and resolve the notify target's chat_id
+    # 1. Confirm the notify target exists
     notify_id = target if target.startswith("notify.") else f"notify.{target}"
     if missing := confirm_entity_exists(notify_id):
         return missing
-    chat_id = _resolve_telegram_chat_id(notify_id)
 
     with httpx.Client() as client:
-        # 2. Get camera access_token from entity state
+        # 2. Get camera access_token from entity state - checked before
+        # resolving the notify target's chat_id, so a bad camera_entity_id
+        # is reported as itself rather than masked by a chat_id error for
+        # the *other* argument.
         r = client.get(f"{HA_URL}/api/states/{camera_entity_id}", headers=HEADERS, timeout=10)
         if r.status_code == 404:
             return error("entity_not_found",
@@ -253,6 +294,11 @@ def send_camera_snapshot(camera_entity_id: str, target: str, caption: str = "") 
         if not access_token:
             return {"error": "no_access_token", "entity_id": camera_entity_id,
                     "detail": "Camera entity has no access_token attribute."}
+
+        # 2b. Resolve the notify target's chat_id
+        chat_id = _resolve_telegram_chat_id(notify_id)
+        if chat_id is None:
+            return _telegram_target_error(notify_id)
 
         # 3. Get HA external URL
         cfg = client.get(f"{HA_URL}/api/config", headers=HEADERS, timeout=10)

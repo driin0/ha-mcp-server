@@ -1,6 +1,6 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws, confirm_entity_exists, envelope, ws_error
+from tools._base import mcp, HA_URL, HEADERS, _ws, confirm_entity_exists, envelope, rest_error, ws_error
 
 
 @mcp.tool()
@@ -115,10 +115,16 @@ def update_todo_item(entity_id: str, item: str, status: str = "", rename: str = 
     rename: new name for the item
 
     Returns: {entity_id, item, verified} on a call Home Assistant accepted,
-    or {error: "entity_not_found"/"item_not_found", ...} otherwise.
-    `verified` is true only when the item — looked up by its new name if
-    `rename` was given, else by `item` — is present with the requested
-    `status` (when given) in get_todo_items() read back after the call.
+    or an error() envelope — {error: "entity_not_found", ...} when
+    entity_id has no state at all, or {error: "home_assistant_error",
+    status, detail} when Home Assistant rejects the call itself (an item
+    that does not exist under `item`, or a `status` value outside
+    needs_action/completed both 4xx/5xx there rather than being validated
+    here first — HA's own rejection message does not distinguish the two,
+    so neither does this). `verified` is true only when the item — looked
+    up by its new name if `rename` was given, else by `item` — is present
+    with the requested `status` (when given) in get_todo_items() read
+    back after the call.
     """
     if missing := confirm_entity_exists(entity_id):
         return missing
@@ -134,7 +140,8 @@ def update_todo_item(entity_id: str, item: str, status: str = "", rename: str = 
             json=data,
             timeout=10,
         )
-        r.raise_for_status()
+        if err := rest_error(r):
+            return err
 
     items = _todo_items(entity_id)
     if isinstance(items, dict):  # ws_error()

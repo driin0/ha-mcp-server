@@ -1,6 +1,65 @@
+import colorsys
+
 import httpx
 
 from tools._base import mcp, HA_URL, HEADERS, entity_area_map, envelope, error, observe_actuation
+
+
+def _rgb_to_hs(rgb: list) -> tuple:
+    """Hue (0-360) and saturation (0-100) of an [R, G, B] triple.
+
+    Home Assistant does not store an rgb_color as such for a light whose
+    native color mode is 'hs' (color_temp/hs lights, the common case): it
+    keeps only hue and saturation, and derives rgb_color back from them at
+    full value (V=1.0) for display — value/brightness is a separate
+    attribute. Measured live: requesting rgb_color=[10, 20, 30] on
+    light.ceiling_lights (modes ['color_temp', 'hs']) reads back rgb_color
+    [85, 170, 255] — the same hue/saturation at full brightness, not the
+    value we sent. A light whose native mode already stores full-range
+    color (rgbw/rgbww) does round-trip rgb_color exactly, but comparing
+    hue/saturation instead works for both: it is what the entity's own
+    hs_color attribute reports either way, so this is the one comparison
+    that does not depend on which color mode the target actually uses.
+    """
+    r, g, b = rgb
+    h, s, _v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+    return h * 360, s * 100
+
+
+def _light_matches(s: dict, requested: dict) -> bool:
+    """True when every field in `requested` is reflected in state `s`.
+
+    requested may hold any of brightness_pct, color_temp_k, rgb_color,
+    effect — whichever set_light() was actually asked to change. Each is
+    checked against the specific attribute Home Assistant reports it
+    under; a light that does not support one (no color_temp mode, no
+    effect_list) simply will not show the requested value there, so this
+    returns False for it the same as a real mismatch — see set_light()'s
+    docstring for why that is the honest outcome rather than a distinct
+    "unsupported" state: the observed value returned alongside `verified`
+    already shows a caller what happened (unchanged, or converted into a
+    different color mode).
+    """
+    if s["state"] != "on":
+        return False
+    attrs = s.get("attributes", {})
+    if "brightness_pct" in requested:
+        brightness = attrs.get("brightness")
+        observed_pct = round(brightness / 2.55) if brightness is not None else None
+        if observed_pct != requested["brightness_pct"]:
+            return False
+    if "color_temp_k" in requested:
+        if attrs.get("color_temp_kelvin") != requested["color_temp_k"]:
+            return False
+    if "rgb_color" in requested:
+        want_h, want_s = _rgb_to_hs(requested["rgb_color"])
+        got = attrs.get("hs_color")
+        if got is None or abs(got[0] - want_h) > 0.5 or abs(got[1] - want_s) > 0.5:
+            return False
+    if "effect" in requested:
+        if attrs.get("effect") != requested["effect"]:
+            return False
+    return True
 
 
 @mcp.tool()
@@ -74,15 +133,32 @@ def set_light(
     effect: named effect (e.g. 'Night', 'Day', 'Candle', 'Twinkle') — see entity's effect_list
     transition: fade duration in seconds
 
-    Returns: {entity_id, state, verified, observed_state} on a call Home
-    Assistant accepted, or {error: "entity_not_found"/"invalid_state", ...}
-    otherwise. An unrecognised `state` (anything other than '', 'on',
+    Returns: {entity_id, state, verified, observed_state, ...} on a call
+    Home Assistant accepted, or {error: "entity_not_found"/"invalid_state",
+    ...} otherwise. An unrecognised `state` (anything other than '', 'on',
     'off' or 'toggle') is rejected rather than silently treated as 'on'.
 
     `verified` is true only when the light's own state, read back after the
     call, matches — "on" for a turn_on/attribute call, "off" for 'off', and
     (since 'toggle' has no fixed target) any state different from what the
-    light reported just before the call, for 'toggle'.
+    light reported just before the call, for 'toggle'. For a turn_on call
+    that also requests brightness_pct/color_temp_k/rgb_color/effect,
+    `verified` covers those too: true only when every attribute actually
+    requested is reflected in the read-back, not just the on/off state — a
+    light that ignores an unsupported effect, or converts a color request
+    into a mode it does not support, used to still report `verified: true`
+    because only state=="on" was checked. Each requested attribute is
+    echoed back under its own key (e.g. `brightness_pct`, `color_temp_k`,
+    `rgb_color`, `effect`) with what was actually observed — not what was
+    asked for — so a caller can see exactly what did or did not take
+    effect. brightness_pct is compared via Home Assistant's own
+    brightness (0-255) attribute, converted back to a percentage the same
+    way list_lights() reports it. rgb_color is compared by hue/saturation
+    (see _rgb_to_hs()'s docstring): Home Assistant does not preserve an
+    rgb_color's value/brightness component for a light whose native color
+    mode is 'hs', only hue and saturation, so an exact rgb_color
+    round-trip would report `verified: false` on lights where the call
+    genuinely worked.
     """
     if state not in ("", "on", "off", "toggle"):
         return error("invalid_state",
@@ -124,21 +200,43 @@ def set_light(
             r = client.post(f"{HA_URL}/api/services/light/turn_on", headers=HEADERS, json=data, timeout=10)
         r.raise_for_status()
 
+    requested: dict = {}
+    if state not in ("off", "toggle"):
+        if brightness_pct is not None:
+            requested["brightness_pct"] = brightness_pct
+        if color_temp_k is not None:
+            requested["color_temp_k"] = color_temp_k
+        if rgb_color is not None:
+            requested["rgb_color"] = rgb_color
+        if effect:
+            requested["effect"] = effect
+
     if state == "off":
         satisfied = lambda s: s["state"] == "off"
     elif state == "toggle":
         satisfied = lambda s: isinstance(prior, str) and s["state"] != prior
     else:
-        satisfied = lambda s: s["state"] == "on"
+        satisfied = lambda s: _light_matches(s, requested)
 
     obs = observe_actuation(entity_id, satisfied)
     if not obs["exists"]:
         return error("entity_not_found",
                      f"{entity_id} does not exist on this Home Assistant instance.",
                      entity_id=entity_id, state=state)
-    return {
+    out = {
         "entity_id": entity_id,
         "state": state or "on",
         "verified": obs["verified"],
         "observed_state": obs["state"]["state"],
     }
+    attrs = obs["state"].get("attributes", {})
+    if "brightness_pct" in requested:
+        brightness = attrs.get("brightness")
+        out["brightness_pct"] = round(brightness / 2.55) if brightness is not None else None
+    if "color_temp_k" in requested:
+        out["color_temp_k"] = attrs.get("color_temp_kelvin")
+    if "rgb_color" in requested:
+        out["rgb_color"] = attrs.get("rgb_color")
+    if "effect" in requested:
+        out["effect"] = attrs.get("effect")
+    return out
