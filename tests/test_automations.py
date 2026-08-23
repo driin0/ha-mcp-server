@@ -1,13 +1,13 @@
 """tools/automations.py: the id resolution shared by get_automation(),
 create_automation() and delete_automation() (_resolve_automation_id(),
-_fetch_config()), get_automation()'s own shape, and update_automation() - the
-first read-modify-write edit tool built on top of it.
+_fetch_config()), get_automation()'s own shape, and the two read-modify-write
+edit tools built on top of it - update_automation() and patch_automation().
 
 create_automation()'s and delete_automation()'s own behavioural tests stay
 where they already were (tests/test_tools_shape.py, tests/test_actuation.py)
 - this file covers only what changed here: get_automation() itself, the id
 resolution now shared by all three instead of written out three times, and
-update_automation() in full.
+update_automation()/patch_automation() in full.
 
 enabled=True/False on update_automation() is verified through
 _set_and_verify_enabled(), the same helper create_automation() now shares -
@@ -309,3 +309,91 @@ def test_update_automation_enable_toggle_reports_not_registered_when_entity_vani
                   for c in fake_ha.rest_calls)
 
 
+# ---- patch_automation() --------------------------------------------------
+
+def test_patch_automation_changes_one_value_and_reports_old(fake_ha):
+    from tools.automations import patch_automation
+
+    result = patch_automation(
+        "automation.nas_shutdown", "conditions.0.value_template",
+        "{{ is_state('button.nas_shutdown_v2', 'unavailable') }}",
+    )
+
+    assert result["old"] == "{{ is_state('button.nas_shutdown', 'unavailable') }}"
+    assert result["new"] == "{{ is_state('button.nas_shutdown_v2', 'unavailable') }}"
+    assert result["stored_format"] == "legacy"
+    stored = fake_ha.automation_configs["1684270733500"]
+    assert (stored["condition"][0]["value_template"]
+           == "{{ is_state('button.nas_shutdown_v2', 'unavailable') }}")
+
+
+def test_patch_automation_legacy_spelled_path_is_accepted(fake_ha):
+    """conditions.0... and condition.0... must resolve identically -
+    exactly one notation, either root spelling."""
+    from tools.automations import patch_automation
+
+    result = patch_automation("automation.nas_shutdown",
+                              "condition.0.value_template", "changed")
+
+    assert result["old"] == "{{ is_state('button.nas_shutdown', 'unavailable') }}"
+    assert result["new"] == "changed"
+    assert fake_ha.automation_configs["1684270733500"]["condition"][0]["value_template"] == "changed"
+
+
+def test_patch_automation_a_template_deep_inside_actions_is_reached_and_rewritten(fake_ha):
+    """The incident this whole plan exists for: one entity_id changed
+    inside one action step, everything around it untouched."""
+    from tools.automations import get_automation, patch_automation
+
+    before = get_automation("automation.nas_shutdown")["config"]
+
+    result = patch_automation("automation.nas_shutdown",
+                              "actions.2.target.entity_id", "switch.nas_power_v2")
+
+    assert result["old"] == "switch.nas_power"
+    assert result["new"] == "switch.nas_power_v2"
+
+    after = get_automation("automation.nas_shutdown")["config"]
+    assert after["actions"][2]["target"]["entity_id"] == "switch.nas_power_v2"
+    # Nothing else moved.
+    assert after["triggers"] == before["triggers"]
+    assert after["conditions"] == before["conditions"]
+    assert after["actions"][0] == before["actions"][0]
+    assert after["actions"][1] == before["actions"][1]
+    assert after["mode"] == before["mode"]
+
+
+def test_patch_automation_mistyped_path_returns_bad_path_and_writes_nothing(fake_ha):
+    from tools.automations import patch_automation
+
+    before = dict(fake_ha.automation_configs["1684270733500"])
+
+    result = patch_automation("automation.nas_shutdown",
+                              "conditions.0.valeu_template", "x")
+
+    assert result["error"] == "bad_path"
+    assert "valeu_template" in result["detail"]
+    assert fake_ha.automation_configs["1684270733500"] == before
+    assert not any(
+        c.method == "POST"
+        and c.url.path == "/api/config/automation/config/1684270733500"
+        for c in fake_ha.rest_calls
+    )
+
+
+def test_patch_automation_index_out_of_range_returns_bad_path(fake_ha):
+    from tools.automations import patch_automation
+
+    result = patch_automation("automation.nas_shutdown", "actions.99.service", "x")
+
+    assert result["error"] == "bad_path"
+    assert fake_ha.automation_configs["1684270733500"]["action"][2]["service"] == "switch.turn_off"
+
+
+def test_patch_automation_yaml_defined_returns_not_found(fake_ha):
+    from tools.automations import patch_automation
+
+    result = patch_automation("automation.morning", "trigger.0.platform", "x")
+
+    assert result["error"] == "not_found"
+    assert "YAML" in result["detail"]

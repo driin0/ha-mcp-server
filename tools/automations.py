@@ -1,6 +1,6 @@
 import httpx
 
-from tools._aliases import stored_format, to_modern, to_stored
+from tools._aliases import PathError, get_path, set_path, stored_format, to_modern, to_stored
 from tools._base import (
     mcp, HA_URL, HEADERS, _slug, _ws, confirm_entity_exists, envelope, error,
     observe_actuation, wait_for_entity, ws_error,
@@ -497,17 +497,16 @@ def get_automation(entity_id: str) -> dict:
 
 def _not_found_for_edit(entity_id: str, automation_id: str, slug: str,
                         verb: str) -> dict:
-    """The error() update_automation() returns - and the sibling edit
-    tools built on the same fetch will share - when _fetch_config() cannot
-    resolve a stored config: no such entity, or a YAML-defined automation,
-    which has no config id and so cannot be reached through this API at
-    all. get_automation() reports the same situation with its own
-    hand-written error() (it predates this helper); this one exists so an
-    edit tool's refusal names what it was trying to DO, not just that it
-    could not find something to read.
+    """The error() update_automation() and patch_automation() both return
+    when _fetch_config() cannot resolve a stored config: no such entity,
+    or a YAML-defined automation, which has no config id and so cannot be
+    reached through this API at all. get_automation() reports the same
+    situation with its own hand-written error() (it predates this
+    helper); this one exists so an edit tool's refusal names what it was
+    trying to DO, not just that it could not find something to read.
 
-    verb: what the caller was trying to do ("updated"), for a message
-    specific to that tool rather than one written for reading.
+    verb: what the caller was trying to do ("updated", "patched"), for a
+    message specific to that tool rather than one written for reading.
     """
     return error(
         "not_found",
@@ -671,6 +670,90 @@ def update_automation(
         result.update(outcome)
 
     return result
+
+
+@mcp.tool()
+def patch_automation(
+    entity_id: str,
+    path: str,
+    value: dict | list | str | int | float | bool | None,
+) -> dict:
+    """
+    Change exactly one value inside an automation's stored config, by
+    dotted path, without touching - or restating - anything else.
+
+    entity_id: the automation to patch, e.g. 'automation.nas_shutdown'.
+    path: dotted, with integer list indices - e.g.
+      'conditions.0.value_template', 'actions.2.target.entity_id'. Written
+      in the modern vocabulary (triggers/conditions/actions,
+      trigger:/action: steps), but the legacy spelling (trigger/condition/
+      action, platform/service) is also accepted at any segment - a caller
+      does not need to know which one this particular automation is
+      stored in (see tools/_aliases.py's get_path()/set_path()). Exactly
+      one path notation is accepted, on purpose: dotted, not JSON Pointer
+      - supporting both doubles the ways to get a path wrong.
+    value: the new value at `path`, replacing whatever was there.
+
+    A path that does not resolve against the config actually fetched is an
+    error, never a creation - refused before anything is written, naming
+    what IS present at the point resolution failed (see PathError). This
+    is what makes a targeted patch safe to send blind: it cannot silently
+    grow the config with an empty branch nothing will ever read.
+
+    No dry_run parameter: get_automation() plus this call's own `old`
+    field already cover it - inspect first if you want to see the value
+    before changing it, or make the change and read `old` back from the
+    result to confirm what was actually there.
+
+    Writes go back in the stored vocabulary the same way update_automation()
+    does - see its own docstring for the live-measured caveat that Home
+    Assistant's config-write endpoint renames the root and action-step
+    spelling on every save regardless of what is posted.
+
+    Only automations editable in the HA UI can be patched this way - a
+    YAML-defined automation returns an error() envelope ("not_found")
+    mentioning YAML, the same as update_automation() and get_automation().
+
+    Returns: {automation_id, entity_id, path, old, new, stored_format} on
+    success, or an error() envelope - "not_found" (no such automation, or
+    YAML-defined) or "bad_path" (the path did not resolve - nothing was
+    written).
+    """
+    slug = entity_id.removeprefix("automation.")
+    with httpx.Client() as client:
+        automation_id = _resolve_automation_id(entity_id, client) or slug
+        resolved_id, raw = _fetch_config(automation_id, slug, client)
+
+    if raw is None:
+        return _not_found_for_edit(entity_id, automation_id, slug, "patched")
+
+    config, restore = to_modern(raw)
+    fmt = stored_format(restore)
+
+    try:
+        old = get_path(config, path)
+        set_path(config, path, value)
+    except PathError as exc:
+        return error("bad_path", str(exc), entity_id=entity_id, path=path)
+
+    payload = to_stored(config, restore)
+    with httpx.Client() as client:
+        r = client.post(
+            f"{HA_URL}/api/config/automation/config/{resolved_id}",
+            headers=HEADERS,
+            json=payload,
+            timeout=15,
+        )
+        r.raise_for_status()
+
+    return {
+        "automation_id": resolved_id,
+        "entity_id": entity_id,
+        "path": path,
+        "old": old,
+        "new": value,
+        "stored_format": fmt,
+    }
 
 
 @mcp.tool()
