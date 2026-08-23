@@ -172,3 +172,96 @@ async def _ws_commands(msgs: list) -> list:
                 results[m["id"] - 1] = m
                 pending.discard(m["id"])
         return results
+
+
+def envelope(items, *, key="items", total=None, offset=0, limit=None, note="") -> dict:
+    """Wrap a collection in the standard result shape.
+
+    The shape exists because the MCP SDK turns a bare list return into one
+    response block per element — and into no block at all for an empty list.
+    A caller then cannot tell "nothing found" from "the call failed", and a
+    truncated result has nowhere to say so. A dict has room for both.
+
+    items:  the complete filtered and sorted collection. Slicing happens here,
+            so pagination has one implementation rather than one per tool.
+    key:    the name the collection appears under — "lights", "automations".
+            Named rather than generic, because the reader is a language model.
+    total:  pass it when Home Assistant applied the limit server-side and
+            `items` is therefore already the page. `limit` cannot also be
+            passed with `total`, since `items` is already the paginated page.
+    limit:  0 or None means no limit.
+    note:   overrides the generated note.
+    """
+    rows = list(items)
+    if total is None:
+        count = len(rows)
+        page = rows[offset:offset + limit] if limit else rows[offset:]
+    else:
+        if limit:
+            raise ValueError(
+                "envelope(total=...) means `items` is already the page, so a "
+                "limit cannot also be applied - pass one or the other")
+        count = total
+        page = rows
+
+    out = {"total": count, "returned": len(page), "offset": offset}
+    if not note:
+        if count == 0:
+            note = f"no {key} found"
+        elif offset + len(page) < count:
+            note = (f"{len(page)} of {count} shown - raise limit, "
+                    f"advance offset, or refine the filters")
+    if note:
+        out["note"] = note
+    out[key] = page
+    return out
+
+
+def error(code: str, detail: str = "", **extra) -> dict:
+    """A failed call.
+
+    Never a list element: an error must not be reachable by iterating results,
+    or a caller reads it as a record that happens to have an `error` key.
+    """
+    out = {"error": code, "detail": detail}
+    out.update(extra)
+    return out
+
+
+def ws_error(result) -> dict | None:
+    """Return an error envelope if a WebSocket command failed, else None.
+
+    Two shapes reach here. Home Assistant answers a failed command with
+    {"success": false, "error": {"code", "message"}}; _ws itself returns
+    {"error": "..."} when the connection or the authentication fails.
+    A successful frame should always have a "result" key, but this branch
+    defends against a malformed response.
+
+    Timeouts raise exceptions (asyncio.TimeoutError or
+    concurrent.futures.TimeoutError) rather than returning a dict, so callers
+    see an exception rather than an error envelope.
+
+    Used as:
+
+        r = _ws({"type": "config_entries/list"})
+        if err := ws_error(r):
+            return err
+        entries = r["result"]
+
+    The alternative — r.get("result", []) — turns every one of those failures
+    into an empty list, which the SDK then renders as no output whatsoever.
+    """
+    if not isinstance(result, dict):
+        return error("bad_response",
+                     f"Unexpected WebSocket response: {result!r}")
+    if result.get("success") is False:
+        err = result.get("error") or {}
+        if isinstance(err, dict):
+            return error(err.get("code", "unknown"), err.get("message", ""))
+        return error("websocket_error", str(err))
+    if result.get("success") is True and "result" not in result:
+        return error("bad_response",
+                     "WebSocket response marked success but has no result key")
+    if "result" not in result and "error" in result:
+        return error("websocket_error", str(result["error"]))
+    return None
