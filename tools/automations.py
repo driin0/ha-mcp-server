@@ -76,6 +76,17 @@ def _set_and_verify_enabled(entity_id: str, enabled: bool) -> dict:
     Returns one of:
       error("automation_not_registered", ...) - entity_id never registered
         a state at all, so `enabled` could not be changed or confirmed.
+        Usually the registration race wait_for_entity() waits out - but
+        not always: an instance whose configuration.yaml has no
+        `automation:` key at all (nothing loads automations.yaml, though
+        `default_config:` alone does not add it - measured live against a
+        hand-built configuration.yaml) never registers ANY automation
+        entity, no matter how long this waits. A stock instance set up
+        through Home Assistant's own onboarding flow always has this key;
+        a minimal or hand-written configuration.yaml might not. This error
+        looks identical either way from here - a caller that keeps seeing
+        it after a config write may be looking at the second case, not a
+        slow retry.
       error("automation_not_disabled"|"automation_state_unverified", ...,
         enabled=bool, state=str) - the entity exists, but its state after
         the service call does not match what was requested. The code names
@@ -461,14 +472,27 @@ def get_automation(entity_id: str) -> dict:
     one from.
 
     Returns: {automation_id, entity_id, name, mode, stored_format, config}.
-    `stored_format` names what vocabulary the config actually has on disk
-    ("legacy" or "modern") - an edit tool must write back in that same
-    style, never migrate it as a side effect - and `config` is always
-    normalised to the modern vocabulary regardless, so a caller reads one
-    consistent shape either way. Returns an error() envelope ("not_found")
-    when neither the resolved id nor entity_id's own slug has a stored
-    config - a YAML-defined automation, or an entity_id with no
-    corresponding automation at all.
+    `stored_format` names what vocabulary the config actually had on disk
+    ("legacy" or "modern") at the moment this call read it; `config` is
+    always normalised to the modern vocabulary regardless, so a caller
+    reads one consistent shape either way.
+
+    update_automation() and patch_automation() send a config back in the
+    vocabulary `stored_format` names here - but whether it stays that way
+    is Home Assistant's call, not theirs. Measured live, posting a fully
+    legacy config through Home Assistant's own REST config-write endpoint
+    and reading it straight back: the root keys and an action step's
+    service: are renamed on every save, whatever is posted - only a
+    trigger step's platform: key survives as sent. That is Home
+    Assistant's own config-write endpoint doing it, not a migration
+    either edit tool performs or can prevent through this API - see
+    tools/_aliases.py's module docstring for the full breakdown.
+    `stored_format` is therefore a snapshot of what was read, not a
+    guarantee about what a later edit leaves on disk.
+
+    Returns an error() envelope ("not_found") when neither the resolved
+    id nor entity_id's own slug has a stored config - a YAML-defined
+    automation, or an entity_id with no corresponding automation at all.
     """
     slug = entity_id.removeprefix("automation.")
     with httpx.Client() as client:
@@ -582,19 +606,26 @@ def update_automation(
     resubmitting an unchanged config through Home Assistant's own
     normaliser (see the vocabulary paragraph below).
 
-    Writes go back in the stored vocabulary at the levels this tool
+    Writes go back in the vocabulary this tool read, at the levels it
     controls: `stored_format` below names the root/step spelling the
     fetched config actually used, and anything this call does not
-    explicitly replace keeps that spelling. Measured live, though: Home
-    Assistant's own config-write endpoint renames the root keys
-    (trigger/condition/action -> triggers/conditions/actions) and an
-    action step's service: to action: on every save, regardless of what
-    is posted - only a trigger step's platform: key survives exactly as
-    submitted. `stored_format` reports what was read and what this tool
-    tried to preserve; it is not a promise about what Home Assistant's own
-    validator leaves on disk afterward, which this tool has no way to
-    prevent through this API - see the module's own test/live notes for
-    how this was confirmed.
+    explicitly replace keeps that spelling on the way out. What lands on
+    disk after that is Home Assistant's call, not this tool's. Measured
+    live, posting a fully legacy config through this same REST endpoint
+    and reading it straight back:
+
+      root keys (trigger/condition/action -> triggers/conditions/actions):
+        renamed by Home Assistant on every save, whatever is posted
+      action step (service: -> action:):    renamed the same way, always
+      trigger step (platform: -> trigger:): survives exactly as sent
+
+    So a legacy automation edited through this tool comes back with
+    plural root keys and action: instead of service: on its next read -
+    that is Home Assistant's own config-write endpoint doing it, to any
+    client including its own UI editor, not a migration this tool
+    performs or can prevent through this API. `stored_format` reports
+    what this tool read and sent back unchanged; it is not a promise
+    about what Home Assistant's own validator leaves on disk afterward.
 
     Only automations editable in the HA UI can be updated this way - a
     YAML-defined automation has no config id and returns an error()

@@ -10,15 +10,32 @@ controls:
     action step:  service: ...                    <->  action: ...
 
 to_modern() renders a config in the modern vocabulary and records exactly
-what it renamed; to_stored() reverses exactly those renames. That split is
-what lets a caller work in one vocabulary while a write goes back in
-whatever style the automation already had - editing an automation must
-never migrate its file as a side effect, and never touching an automation
-this module cannot resolve a rename for is the price of that: a rename
-whose recorded path no longer exists on the way back is skipped rather
-than raised, because the restore map is a record of what normalisation did
-to one particular config, not a requirement every future version of it
-must keep satisfying (see to_stored()'s own docstring).
+what it renamed; to_stored() reverses exactly those renames, so a caller
+can work in one vocabulary while a write goes back in whatever style this
+module read the automation in - all three pairs, root and both steps.
+
+Whether that vocabulary survives on disk is not this module's call, though.
+Measured live, posting a fully legacy config through Home Assistant's own
+REST config-write endpoint and reading it straight back:
+
+    root keys (trigger/condition/action -> triggers/conditions/actions):
+      renamed by Home Assistant on every save, whatever is posted
+    action step (service: -> action:):    renamed the same way, always
+    trigger step (platform: -> trigger:): survives exactly as sent
+
+That renaming is Home Assistant's own config-write endpoint doing it - to
+any client, including its own UI editor - not something this module or a
+caller of this REST API can prevent. This module still sends back exactly
+what it read; a legacy automation edited through it will still come back
+with plural root keys and action: instead of service: on its next read,
+and that is not this module failing to do its job.
+
+Never touching an automation this module cannot resolve a rename for is
+still the price of the one thing it does control: a rename whose recorded
+path no longer exists on the way back is skipped rather than raised,
+because the restore map is a record of what normalisation did to one
+particular config, not a requirement every future version of it must keep
+satisfying (see to_stored()'s own docstring).
 
 get_path()/set_path() give dotted-path access into a config
 (`conditions.0.value_template`), for a tool that changes one nested value
@@ -150,8 +167,10 @@ def stored_format(restore: dict) -> str:
     config whose root was already modern but whose steps still said
     `platform`/`service` still reports "modern" here, because the root
     spelling is what a caller and an edit tool alike recognise an
-    automation's era by, and what a write must not migrate as a side
-    effect of an unrelated change.
+    automation's era by. An edit tool sends this spelling back unchanged
+    at its own end - see the module docstring above for why that is not
+    a promise about what Home Assistant's own config-write endpoint
+    leaves on disk afterward.
     """
     root_paths = set(_ROOT_LEGACY_TO_MODERN.values())
     return "legacy" if root_paths & restore.keys() else "modern"
