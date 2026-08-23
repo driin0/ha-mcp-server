@@ -1,11 +1,15 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS
+from tools._base import mcp, HA_URL, HEADERS, envelope
 
 
 @mcp.tool()
-def list_fans() -> list:
-    """List all fan entities with state and speed."""
+def list_fans() -> dict:
+    """
+    List all fan entities with state and speed.
+
+    Returns: {total, returned, offset, note?, fans: [...]}
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -24,7 +28,7 @@ def list_fans() -> list:
             "oscillating": attrs.get("oscillating"),
             "direction": attrs.get("direction"),
         })
-    return sorted(fans, key=lambda x: x["name"])
+    return envelope(sorted(fans, key=lambda x: x["name"]), key="fans")
 
 
 @mcp.tool()

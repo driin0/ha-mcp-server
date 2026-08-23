@@ -1,4 +1,4 @@
-from tools._base import mcp, _ws
+from tools._base import mcp, _ws, envelope, ws_error
 
 
 def _hacs_check(result: dict):
@@ -33,7 +33,7 @@ def list_hacs_repos(
     category: str = "",
     installed_only: bool = False,
     updates_only: bool = False,
-) -> list:
+) -> dict:
     """
     List repositories known to HACS (installed and available in the catalog).
 
@@ -42,22 +42,25 @@ def list_hacs_repos(
     installed_only: if True, return only installed repositories.
     updates_only:  if True, return only repositories with a pending update.
 
-    Returns: [{id, full_name, name, category, installed, installed_version,
-               available_version, pending_upgrade, custom, stars, description}]
+    Returns: {total, returned, offset, note?, repositories: [{id, full_name,
+             name, category, installed, installed_version, available_version,
+             pending_upgrade, custom, stars, description}]}
+
+    A failed call (e.g. HACS not installed) returns {error, detail} instead -
+    the WebSocket command's own code and message, unmodified.
     """
     msg: dict = {"type": "hacs/repositories/list"}
     if category:
         msg["categories"] = [category]
     result = _ws(msg)
-    err = _hacs_check(result)
-    if err:
-        return [err]
-    repos = result.get("result", [])
+    if err := ws_error(result):
+        return err
+    repos = result["result"]
     if installed_only:
         repos = [r for r in repos if r.get("installed")]
     if updates_only:
         repos = [r for r in repos if r.get("pending_upgrade")]
-    return [
+    out = [
         {
             "id": r.get("id"),
             "full_name": r.get("full_name"),
@@ -73,27 +76,36 @@ def list_hacs_repos(
         }
         for r in repos
     ]
+    return envelope(out, key="repositories")
 
 
 @mcp.tool()
-def search_hacs(query: str, category: str = "") -> list:
+def search_hacs(query: str, category: str = "", limit: int = 20) -> dict:
     """
     Search HACS catalog for repositories matching a query string.
 
     query:    substring to search in name, full_name, or description (case-insensitive)
     category: optional filter — 'integration', 'plugin', 'theme', 'appdaemon',
               'python_script', 'template'
+    limit:    max results to return, sorted by stars descending (default 20)
 
-    Returns the top 20 matches sorted by stars.
+    Returns: {total, returned, offset, note?, repositories: [{id, full_name,
+             name, category, installed, installed_version, available_version,
+             stars, description}]}
+
+    `total` counts every repository that matched the query/category, not
+    just the page returned - raise `limit` or narrow the query when it
+    exceeds `returned`. A failed call (e.g. HACS not installed) returns
+    {error, detail} instead - the WebSocket command's own code and message,
+    unmodified.
     """
     msg: dict = {"type": "hacs/repositories/list"}
     if category:
         msg["categories"] = [category]
     result = _ws(msg)
-    err = _hacs_check(result)
-    if err:
-        return [err]
-    repos = result.get("result", [])
+    if err := ws_error(result):
+        return err
+    repos = result["result"]
     q = query.lower()
     matches = [
         r for r in repos
@@ -102,7 +114,7 @@ def search_hacs(query: str, category: str = "") -> list:
         or q in (r.get("description") or "").lower()
     ]
     matches.sort(key=lambda x: x.get("stars", 0), reverse=True)
-    return [
+    out = [
         {
             "id": r.get("id"),
             "full_name": r.get("full_name"),
@@ -114,8 +126,9 @@ def search_hacs(query: str, category: str = "") -> list:
             "stars": r.get("stars", 0),
             "description": r.get("description", ""),
         }
-        for r in matches[:20]
+        for r in matches
     ]
+    return envelope(out, key="repositories", limit=limit)
 
 
 @mcp.tool()

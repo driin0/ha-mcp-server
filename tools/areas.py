@@ -2,21 +2,27 @@ import json
 
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws, _ws_multi
+from tools._base import mcp, HA_URL, HEADERS, _ws, _ws_multi, envelope, ws_error
 
 
 @mcp.tool()
-def list_areas() -> list:
+def list_areas() -> dict:
     """
     List all areas with their entities, floor name and floor_id.
-    Returns: [{area_id, name, floor_id, floor_name, entities: [...]}]
+
+    Returns: {total, returned, offset, note?, areas: [{area_id, name,
+             floor_id, floor_name, entities: [...]}]}
     """
     ws_results = _ws_multi([
         {"type": "config/area_registry/list"},
         {"type": "config/floor_registry/list"},
     ])
-    areas_raw = ws_results[0].get("result", [])
-    floor_map = {f["floor_id"]: f["name"] for f in ws_results[1].get("result", [])}
+    if err := ws_error(ws_results[0]):
+        return err
+    if err := ws_error(ws_results[1]):
+        return err
+    areas_raw = ws_results[0]["result"]
+    floor_map = {f["floor_id"]: f["name"] for f in ws_results[1]["result"]}
 
     template = (
         "{%- set area_ids = areas() | list %}"
@@ -46,7 +52,8 @@ def list_areas() -> list:
             "floor_name": floor_map.get(floor_id, "") if floor_id else "",
             "entities": entities_map.get(area_id, []),
         })
-    return sorted(result, key=lambda x: x["name"])
+    result.sort(key=lambda x: x["name"])
+    return envelope(result, key="areas")
 
 
 @mcp.tool()
@@ -199,10 +206,16 @@ def delete_label(label_id: str) -> dict:
 
 
 @mcp.tool()
-def get_entity_labels(entity_id: str) -> list:
-    """Get the labels currently assigned to an entity."""
+def get_entity_labels(entity_id: str) -> dict:
+    """
+    Get the labels assigned to an entity.
+
+    Returns: {entity_id, labels: [label_id, ...]}
+    """
     r = _ws({"type": "config/entity_registry/get", "entity_id": entity_id})
-    return list(r.get("result", {}).get("labels", []))
+    if err := ws_error(r):
+        return err
+    return {"entity_id": entity_id, "labels": list(r["result"].get("labels", []))}
 
 
 @mcp.tool()
@@ -307,10 +320,13 @@ def get_entity_registry(entity_id: str) -> dict:
 
 
 @mcp.tool()
-def list_zones() -> list:
+def list_zones() -> dict:
     """
     List all zone entities (home, work, school, etc.) with GPS coordinates and radius.
     Zones are used for presence detection and location-based automations.
+
+    Returns: {total, returned, offset, note?, zones: [{entity_id, name,
+             latitude, longitude, radius, icon, passive}]}
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -329,7 +345,8 @@ def list_zones() -> list:
                 "icon": attrs.get("icon", ""),
                 "passive": attrs.get("passive", False),
             })
-    return sorted(zones, key=lambda x: x["name"])
+    zones.sort(key=lambda x: x["name"])
+    return envelope(zones, key="zones")
 
 
 @mcp.tool()

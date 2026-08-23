@@ -1,17 +1,18 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS
+from tools._base import mcp, HA_URL, HEADERS, envelope
 
 
 @mcp.tool()
-def list_alerts() -> list:
+def list_alerts() -> dict:
     """
     List all alert entities (alert.*) with their current state.
 
     Alert entities fire repeatedly (with configurable intervals) while a condition is active,
     until acknowledged. Useful for monitoring critical conditions like gas leaks, flooding, etc.
 
-    Returns: [{entity_id, name, state, last_changed, attributes}]
+    Returns: {total, returned, offset, note?, alerts: [{entity_id, name, state,
+             last_changed, attributes}]}
     States: 'idle' (condition inactive), 'on' (firing), 'off' (acknowledged/snoozed)
     """
     with httpx.Client() as client:
@@ -30,7 +31,7 @@ def list_alerts() -> list:
             "notification_frequency_minutes": attrs.get("notification_frequency"),
             "data": attrs.get("data", {}),
         })
-    return sorted(alerts, key=lambda x: x["name"])
+    return envelope(sorted(alerts, key=lambda x: x["name"]), key="alerts")
 
 
 @mcp.tool()

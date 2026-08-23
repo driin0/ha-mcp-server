@@ -1,11 +1,15 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _slug
+from tools._base import mcp, HA_URL, HEADERS, _slug, envelope
 
 
 @mcp.tool()
-def list_scenes() -> list:
-    """List all scenes with their entity list and current states."""
+def list_scenes() -> dict:
+    """
+    List all scenes with their entity list and current states.
+
+    Returns: {total, returned, offset, note?, scenes: [...]}
+    """
     with httpx.Client() as client:
         states_r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         states_r.raise_for_status()
@@ -21,7 +25,7 @@ def list_scenes() -> list:
                 "name": attrs.get("friendly_name", s["entity_id"]),
                 "entities": {eid: all_states.get(eid, "unknown") for eid in entity_ids},
             })
-        return sorted(scenes, key=lambda x: x["name"])
+        return envelope(sorted(scenes, key=lambda x: x["name"]), key="scenes")
 
 
 @mcp.tool()

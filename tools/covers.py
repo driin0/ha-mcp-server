@@ -1,11 +1,15 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS
+from tools._base import mcp, HA_URL, HEADERS, envelope
 
 
 @mcp.tool()
-def list_covers() -> list:
-    """List all cover entities (blinds, shutters, garage doors, etc.) with state and position."""
+def list_covers() -> dict:
+    """
+    List all cover entities (blinds, shutters, garage doors, etc.) with state and position.
+
+    Returns: {total, returned, offset, note?, covers: [...]}
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -22,7 +26,7 @@ def list_covers() -> list:
             "tilt_position": attrs.get("current_tilt_position"),
             "device_class": attrs.get("device_class"),
         })
-    return sorted(covers, key=lambda x: x["name"])
+    return envelope(sorted(covers, key=lambda x: x["name"]), key="covers")
 
 
 @mcp.tool()

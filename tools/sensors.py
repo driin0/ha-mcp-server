@@ -1,15 +1,18 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, REMOTE_PREFIXES, _ws
+from tools._base import mcp, HA_URL, HEADERS, REMOTE_PREFIXES, _ws, envelope
 
 
 @mcp.tool()
-def get_energy(include_zero: bool = False) -> list:
+def get_energy(include_zero: bool = False) -> dict:
     """
     Get current power consumption (W) for all power-measuring sensor entities,
     sorted from highest to lowest consumption.
 
     include_zero: if True, also include devices reporting 0W (default: False)
+
+    Returns: {total, returned, offset, note?, consumers: [{entity_id, name,
+             power_w, unit}]}
 
     Useful to answer "what is consuming the most power right now?"
     Requires smart plugs or energy monitors with power (W) sensors.
@@ -40,7 +43,8 @@ def get_energy(include_zero: bool = False) -> list:
             "unit": attrs.get("unit_of_measurement", "W"),
         })
 
-    return sorted(results, key=lambda x: x["power_w"], reverse=True)
+    results.sort(key=lambda x: x["power_w"], reverse=True)
+    return envelope(results, key="consumers")
 
 
 @mcp.tool()
@@ -127,13 +131,20 @@ def get_energy_summary() -> dict:
 
 
 @mcp.tool()
-def list_sensors(domain: str = "sensor", search: str = "", limit: int = 100) -> list:
+def list_sensors(domain: str = "sensor", search: str = "", limit: int = 100) -> dict:
     """
     List sensor or binary_sensor entities.
 
     domain: 'sensor' (default) or 'binary_sensor'
     search: optional substring filter on name or entity_id
     limit: max results (default 100)
+
+    Returns: {total, returned, offset, note?, sensors: [{entity_id, name,
+             state, unit, device_class, state_class}]}
+
+    `total` counts every matching entity, not just the page returned - the
+    loop used to stop collecting at `limit` and so could never report a
+    total larger than it.
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -154,6 +165,5 @@ def list_sensors(domain: str = "sensor", search: str = "", limit: int = 100) -> 
             "device_class": attrs.get("device_class"),
             "state_class": attrs.get("state_class"),
         })
-        if len(results) >= limit:
-            break
-    return sorted(results, key=lambda x: x["name"])
+    results.sort(key=lambda x: x["name"])
+    return envelope(results, key="sensors", limit=limit)

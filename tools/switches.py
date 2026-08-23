@@ -1,15 +1,19 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS
+from tools._base import mcp, HA_URL, HEADERS, envelope
 
 
 @mcp.tool()
-def list_switches() -> list:
-    """List all switch entities with their current state."""
+def list_switches() -> dict:
+    """
+    List all switch entities with their current state.
+
+    Returns: {total, returned, offset, note?, switches: [...]}
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
-    return sorted([
+    switches = sorted([
         {
             "entity_id": s["entity_id"],
             "name": s.get("attributes", {}).get("friendly_name", s["entity_id"]),
@@ -18,6 +22,7 @@ def list_switches() -> list:
         for s in r.json()
         if s["entity_id"].startswith("switch.")
     ], key=lambda x: x["name"])
+    return envelope(switches, key="switches")
 
 
 @mcp.tool()

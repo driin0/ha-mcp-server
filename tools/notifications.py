@@ -2,7 +2,7 @@ import re
 
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws
+from tools._base import mcp, HA_URL, HEADERS, _ws, envelope, ws_error
 
 
 def _resolve_telegram_chat_id(entity_id: str) -> int:
@@ -54,9 +54,12 @@ def _telegram_type(chat_id: int | None) -> str:
 
 
 @mcp.tool()
-def list_notify_services() -> list:
+def list_notify_services() -> dict:
     """
-    List all available notification services with entity_id, friendly_name and type.
+    List all available notification services.
+
+    Returns: {total, returned, offset, note?, services: [{entity_id, name,
+             type, state}]}
     type: 'telegram_private', 'telegram_group', or 'other' (mobile app, Alexa, file, etc.)
     Includes Telegram targets, mobile app, Alexa and other notify entities.
     """
@@ -76,7 +79,8 @@ def list_notify_services() -> list:
                 "type": _telegram_type(chat_id),
                 "state": entity.get("state"),
             })
-        return sorted(results, key=lambda x: x["entity_id"])
+        results.sort(key=lambda x: x["entity_id"])
+    return envelope(results, key="services")
 
 
 @mcp.tool()
@@ -252,19 +256,26 @@ def create_persistent_notification(message: str, title: str = "", notification_i
 
 
 @mcp.tool()
-def list_persistent_notifications() -> list:
-    """List all active persistent notifications in Home Assistant."""
+def list_persistent_notifications() -> dict:
+    """
+    List all active persistent notifications in Home Assistant.
+
+    Returns: {total, returned, offset, note?, notifications: [{notification_id,
+             title, message, created_at}]}
+    """
     result = _ws({"type": "persistent_notification/get"})
-    notifications = result.get("result", [])
-    return [
+    if err := ws_error(result):
+        return err
+    out = [
         {
             "notification_id": n.get("notification_id"),
             "title": n.get("title", ""),
             "message": n.get("message", ""),
             "created_at": n.get("created_at"),
         }
-        for n in notifications
+        for n in result["result"]
     ]
+    return envelope(out, key="notifications")
 
 
 @mcp.tool()

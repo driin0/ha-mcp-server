@@ -1,16 +1,18 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS
+from tools._base import mcp, HA_URL, HEADERS, envelope
 
 
 @mcp.tool()
-def list_lights(area_id: str = "", search: str = "", state: str = "") -> list:
+def list_lights(area_id: str = "", search: str = "", state: str = "") -> dict:
     """
     List all light entities with their current state, brightness and color.
 
     area_id: filter by area_id (use list_areas() to find IDs)
     search:  optional substring filter on entity_id or friendly name (case-insensitive)
     state:   filter by exact state — 'on', 'off', 'unavailable'
+
+    Returns: {total, returned, offset, note?, lights: [...]}
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -37,7 +39,7 @@ def list_lights(area_id: str = "", search: str = "", state: str = "") -> list:
             "color_mode": attrs.get("color_mode"),
             "supported_color_modes": attrs.get("supported_color_modes", []),
         })
-    return sorted(lights, key=lambda x: x["name"])
+    return envelope(sorted(lights, key=lambda x: x["name"]), key="lights")
 
 
 @mcp.tool()

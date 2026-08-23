@@ -1,12 +1,14 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws
+from tools._base import mcp, HA_URL, HEADERS, _ws, envelope
 
 
 @mcp.tool()
-def list_persons() -> list:
+def list_persons() -> dict:
     """
     List all person entities with their state (home/away/zone) and GPS coordinates.
+
+    Returns: {total, returned, offset, note?, persons: [...]}
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -26,7 +28,7 @@ def list_persons() -> list:
             "source": attrs.get("source"),
             "last_changed": s.get("last_changed"),
         })
-    return sorted(persons, key=lambda x: x["name"])
+    return envelope(sorted(persons, key=lambda x: x["name"]), key="persons")
 
 
 @mcp.tool()

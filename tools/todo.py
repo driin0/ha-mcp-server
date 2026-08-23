@@ -1,15 +1,19 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws
+from tools._base import mcp, HA_URL, HEADERS, _ws, envelope, ws_error
 
 
 @mcp.tool()
-def list_todo_lists() -> list:
-    """List all todo list entities."""
+def list_todo_lists() -> dict:
+    """
+    List all todo list entities.
+
+    Returns: {total, returned, offset, note?, lists: [{entity_id, name, item_count}]}
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
-    return [
+    out = [
         {
             "entity_id": s["entity_id"],
             "name": s.get("attributes", {}).get("friendly_name", s["entity_id"]),
@@ -18,11 +22,18 @@ def list_todo_lists() -> list:
         for s in r.json()
         if s["entity_id"].startswith("todo.")
     ]
+    return envelope(out, key="lists")
 
 
 @mcp.tool()
-def get_todo_items(entity_id: str) -> list:
-    """Get all items from a todo list. entity_id: e.g. 'todo.shopping_list'"""
+def get_todo_items(entity_id: str) -> dict:
+    """
+    Get all items from a todo list.
+
+    entity_id: e.g. 'todo.shopping_list'
+
+    Returns: {total, returned, offset, note?, items: [...]}
+    """
     result = _ws({
         "type": "call_service",
         "domain": "todo",
@@ -30,9 +41,12 @@ def get_todo_items(entity_id: str) -> list:
         "service_data": {"entity_id": entity_id},
         "return_response": True,
     })
+    if err := ws_error(result):
+        return err
     # Response result: {"response": {"todo.shopping_list": {"items": [...]}}}
-    response = (result.get("result") or {}).get("response", {})
-    return response.get(entity_id, {}).get("items", [])
+    response = result["result"].get("response", {})
+    items = response.get(entity_id, {}).get("items", [])
+    return envelope(items, key="items")
 
 
 @mcp.tool()

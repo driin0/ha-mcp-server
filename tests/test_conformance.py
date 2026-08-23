@@ -5,43 +5,19 @@ answer: did I miss one. This walks the AST and answers it, and goes on
 answering it for tools written later.
 """
 import ast
+import importlib
+import inspect
 import pathlib
+import warnings
 
 TOOLS_DIR = pathlib.Path(__file__).resolve().parents[1] / "tools"
 
 # The three tools that legitimately return a string.
 STRING_TOOLS = {"get_addon_logs", "get_error_log", "render_template"}
 
-# Tools still returning a list. Shrinks to empty as the sweep proceeds; a
-# second test fails if a name stays here after being converted.
-NOT_YET_CONVERTED = {
-    # automations.py
-    "list_automations", "get_automation_trace", "list_blueprints",
-    "list_device_triggers", "list_device_conditions", "list_device_actions",
-    "list_schedules",
-    # diagnostics.py
-    "get_states_by_domain", "get_history", "get_logbook",
-    "list_entities_by_integration", "get_entity_exposure", "search_entities",
-    "call_service",
-    # system.py
-    "list_config_entries", "list_repairs", "list_backups", "list_updates",
-    "list_config_flows",
-    # areas.py
-    "list_areas", "get_entity_labels", "list_zones",
-    # multi-tool files
-    "list_calendars", "get_calendar_events",
-    "list_dashboards", "list_lovelace_resources",
-    "list_hacs_repos", "search_hacs",
-    "list_notify_services", "list_persistent_notifications",
-    "get_energy", "list_sensors",
-    "get_statistics", "get_statistics_summary",
-    "list_todo_lists", "get_todo_items",
-    # single-tool files
-    "list_addons", "get_alarm_state", "list_alerts", "list_cameras",
-    "list_climate", "list_covers", "list_fans", "list_groups", "list_helpers",
-    "list_lights", "list_locks", "list_media_players", "list_persons",
-    "list_scenes", "list_scripts", "list_switches", "list_tags", "list_users",
-}
+# Tools still returning a list. Empty: the sweep is complete, and this check
+# now applies to all 182 tools, and to every tool written from here on.
+NOT_YET_CONVERTED = set()
 
 
 def _tools():
@@ -102,4 +78,101 @@ def test_the_allowlist_has_no_stale_entries():
     stale = NOT_YET_CONVERTED & converted
     assert not stale, (
         "Converted — remove from NOT_YET_CONVERTED:\n" + "\n".join(sorted(stale))
+    )
+
+
+def test_every_zero_arg_tool_actually_returns_a_dict_at_runtime(fake_ha):
+    """Runtime companion to test_every_tool_returns_dict.
+
+    The two checks above read source, not behaviour: one looks at the return
+    annotation, the other looks for a literal `return [...]`. Neither
+    evaluates the function body. A tool converted by hand across eighteen
+    near-identical files can end up annotated `-> dict` while a stray line
+    still does `return sorted(rows, key=...)` — a plain `Call`, not an
+    `ast.List`, so it is invisible to both static checks and yet returns a
+    list at runtime. This test calls the tool for real and looks at what
+    comes back.
+
+    What it proves: every tool that (a) is not one of STRING_TOOLS, (b) can
+    be called with zero arguments because every one of its parameters has a
+    default, and (c) does not raise when called against the fake Home
+    Assistant, returns a dict rather than a list or anything else.
+
+    What it does NOT prove: nothing about a tool that requires at least one
+    argument — the large majority of the 182, mostly the *_control /
+    create_* / delete_* actions — and nothing about a tool that raises here
+    (an unmapped WebSocket command, a REST route the fake does not serve, a
+    real bug). Both kinds are skipped, not failed. The breakdown is emitted
+    as a warning (visible in the summary of a plain `pytest tests/` run, no
+    flags needed) rather than only printed, so the gap stays visible instead
+    of requiring `-s` to see it — a `print()` on a passing test is invisible
+    under pytest's default capture, which is exactly how this coverage
+    figure went dark the first time. Behavioural coverage for the skipped
+    tools is the job of test_tools_shape.py and test_harness.py, not this
+    test.
+    """
+    covered = []
+    skipped_needs_args = []
+    skipped_raised = []
+
+    for fname, node in _tools():
+        if node.name in STRING_TOOLS:
+            continue
+        module = importlib.import_module(f"tools.{fname[:-3]}")
+        func = getattr(module, node.name)
+        sig = inspect.signature(func)
+        callable_with_no_args = all(
+            p.default is not inspect.Parameter.empty
+            or p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            for p in sig.parameters.values()
+        )
+        if not callable_with_no_args:
+            skipped_needs_args.append(node.name)
+            continue
+        try:
+            result = func()
+        except Exception as exc:
+            skipped_raised.append(f"{node.name} ({exc.__class__.__name__}: {exc})")
+            continue
+        covered.append((node.name, result))
+
+    offenders = [
+        f"{name} -> {type(result).__name__}"
+        for name, result in covered if not isinstance(result, dict)
+    ]
+    assert not offenders, (
+        "These tools passed both static checks but returned a non-dict at "
+        "runtime — the exact hole this test exists to close:\n"
+        + "\n".join(offenders)
+    )
+
+    total_candidates = sum(
+        1 for _, node in _tools() if node.name not in STRING_TOOLS
+    )
+    assert len(covered) + len(skipped_needs_args) + len(skipped_raised) == total_candidates
+    # A regression to near-zero coverage (e.g. every tool starting to raise
+    # against the fake) would make the offenders check above vacuously pass.
+    assert len(covered) >= 15, (
+        f"only {len(covered)} tools were actually exercised at runtime — "
+        "too few for this test to mean anything"
+    )
+
+    # print() is invisible under pytest's default capture for a passing
+    # test - only useful with -s. warnings.warn survives a plain `pytest
+    # tests/`: pytest collects it and prints it in the warnings summary at
+    # the end of the run, no flag required. That is the actual disclosure;
+    # the print() below is a convenience on top of it, not a substitute.
+    print(
+        f"\nruntime dict-shape sweep: {len(covered)} covered, "
+        f"{len(skipped_needs_args)} skipped (need arguments), "
+        f"{len(skipped_raised)} skipped (raised against the fake)"
+    )
+    print("skipped, need arguments:", sorted(skipped_needs_args))
+    print("skipped, raised:", sorted(skipped_raised))
+
+    warnings.warn(
+        f"runtime shape check covered {len(covered)} of {total_candidates} "
+        f"tools; {len(skipped_needs_args)} skipped (need arguments), "
+        f"{len(skipped_raised)} skipped (raised): {sorted(skipped_raised)}",
+        stacklevel=2,
     )

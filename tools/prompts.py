@@ -9,7 +9,10 @@ def automation_health_audit() -> str:
     return """Perform a complete automation health audit on this Home Assistant instance.
 
 Steps:
-1. Call list_automations() to get all automations with their state and last_triggered.
+1. Call list_automations(limit=0) for the full inventory. The result is
+   {total, returned, offset, automations: [...]}, with each automation
+   carrying its state and last_triggered; if `note` is present the list was
+   truncated and the true count is in `total`.
 2. Identify and group:
    - Disabled automations (state == 'off') — might have been forgotten
    - Automations that have never triggered (last_triggered is null)
@@ -57,7 +60,7 @@ def naming_convention_audit() -> str:
 
 Steps:
 1. Call list_areas() to understand the current area/room structure.
-2. Call list_automations() and list_scripts() to review automation/script names.
+2. Call list_automations(limit=0) and list_scripts() to review automation/script names — list_automations defaults to a 50-item page, so pass limit=0 for the full set (check `total` in the result if in doubt).
 3. Call list_lights(), list_sensors(), list_switches() for a sample of entity names.
 4. Call list_labels() to review label naming.
 
@@ -107,7 +110,7 @@ def routine_optimizer() -> str:
 
 Steps:
 1. Call get_live_context() for current state.
-2. Call list_automations() to understand what's already automated.
+2. Call list_automations(limit=0) to understand what's already automated (limit=0 returns the full inventory instead of the default 50-item page).
 3. Call list_persons() to understand household composition.
 4. Call list_climate() to see heating/cooling setup.
 5. Call list_lights() to see the lighting setup.

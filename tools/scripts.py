@@ -1,11 +1,15 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _slug
+from tools._base import mcp, HA_URL, HEADERS, _slug, envelope
 
 
 @mcp.tool()
-def list_scripts() -> list:
-    """List all scripts with their state (on = running, off = idle)."""
+def list_scripts() -> dict:
+    """
+    List all scripts with their state (on = running, off = idle).
+
+    Returns: {total, returned, offset, note?, scripts: [...]}
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -18,7 +22,7 @@ def list_scripts() -> list:
             for s in r.json()
             if s["entity_id"].startswith("script.")
         ]
-        return sorted(scripts, key=lambda x: x["name"])
+        return envelope(sorted(scripts, key=lambda x: x["name"]), key="scripts")
 
 
 @mcp.tool()

@@ -1,4 +1,4 @@
-from tools._base import mcp, _ws
+from tools._base import mcp, _ws, envelope, ws_error
 
 
 def _dashboard_id(url_path: str) -> str:
@@ -16,17 +16,19 @@ def _dashboard_id(url_path: str) -> str:
 
 
 @mcp.tool()
-def list_dashboards() -> list:
+def list_dashboards() -> dict:
     """
     List all Lovelace dashboards configured in Home Assistant.
 
-    Returns: [{url_path, title, mode, icon, show_in_sidebar, require_admin}]
+    Returns: {total, returned, offset, note?, dashboards: [{url_path, title,
+             mode, icon, show_in_sidebar, require_admin}]}
     mode is 'storage' (UI-managed) or 'yaml' (file-based).
     """
     result = _ws({"type": "lovelace/dashboards/list"})
-    dashboards = result.get("result", [])
+    if err := ws_error(result):
+        return err
     out = []
-    for d in dashboards:
+    for d in result["result"]:
         out.append({
             "url_path": d.get("url_path"),
             "title": d.get("title") or d.get("url_path") or "default",
@@ -35,7 +37,8 @@ def list_dashboards() -> list:
             "show_in_sidebar": d.get("show_in_sidebar", True),
             "require_admin": d.get("require_admin", False),
         })
-    return sorted(out, key=lambda x: (x.get("title") or "").lower())
+    out.sort(key=lambda x: (x.get("title") or "").lower())
+    return envelope(out, key="dashboards")
 
 
 @mcp.tool()
@@ -188,27 +191,28 @@ def delete_dashboard(url_path: str) -> dict:
 # ─── Lovelace frontend resources ─────────────────────────────────────────────
 
 @mcp.tool()
-def list_lovelace_resources() -> list:
+def list_lovelace_resources() -> dict:
     """
     List all Lovelace frontend resources (JavaScript modules and CSS stylesheets).
 
     These are the custom card JS files and theme CSS files loaded by the HA frontend.
     Useful to audit what's installed or to add new custom cards manually.
 
-    Returns: [{id, url, type}]  — type is 'module' (JS) or 'css'
+    Returns: {total, returned, offset, note?, resources: [{id, url, type}]}
+    type is 'module' (JS) or 'css'
     """
     result = _ws({"type": "lovelace/resources/list"})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return [{"error": err.get("code", "unknown"), "detail": err.get("message", "")}]
-    return [
+    if err := ws_error(result):
+        return err
+    out = [
         {
             "id": r.get("id"),
             "url": r.get("url"),
             "type": r.get("res_type", r.get("type", "")),
         }
-        for r in (result.get("result") or [])
+        for r in (result["result"] or [])
     ]
+    return envelope(out, key="resources")
 
 
 @mcp.tool()

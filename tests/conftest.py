@@ -35,25 +35,38 @@ def fake_ha(monkeypatch):
 
     # Tool modules do `from tools._base import _ws`, binding the function into
     # their own namespace. Patching tools._base._ws alone would not reach them.
+    # _ws_multi gets the same treatment: it is not implemented in terms of
+    # _ws (both are separate wrappers around _ws_commands), and a few tools
+    # (list_areas, get_statistics_summary, bulk_set_entity_labels) call it
+    # directly to batch several commands over one connection — patching only
+    # _ws would leave those hitting the real network.
     import tools._base
     real_ws = tools._base._ws
+    real_ws_multi = tools._base._ws_multi
     monkeypatch.setattr(tools._base, "_ws", state.ws)
+    monkeypatch.setattr(tools._base, "_ws_multi", state.ws_multi)
     for module in list(sys.modules.values()):
         name = getattr(module, "__name__", "")
-        if name.startswith("tools.") and hasattr(module, "_ws"):
-            monkeypatch.setattr(module, "_ws", state.ws, raising=False)
+        if name.startswith("tools."):
+            if hasattr(module, "_ws"):
+                monkeypatch.setattr(module, "_ws", state.ws, raising=False)
+            if hasattr(module, "_ws_multi"):
+                monkeypatch.setattr(module, "_ws_multi", state.ws_multi, raising=False)
 
     yield state
 
     # A module imported for the first time *during* a test (e.g. via an
-    # import inside the test body) binds _ws through its own
-    # `from tools._base import _ws`, not through monkeypatch.setattr — so
+    # import inside the test body) binds _ws/_ws_multi through its own
+    # `from tools._base import ...`, not through monkeypatch.setattr — so
     # monkeypatch has no record of it and will not undo it. Left alone, that
     # module would keep pointing at this test's fake forever, and the loop
     # above in the *next* test would repoint it at the next fake instead of
-    # the real function. Restore every tools.* module to the real _ws here
-    # so each test starts from a clean, real baseline.
+    # the real function. Restore every tools.* module to the real functions
+    # here so each test starts from a clean, real baseline.
     for module in list(sys.modules.values()):
         name = getattr(module, "__name__", "")
-        if name.startswith("tools.") and hasattr(module, "_ws"):
-            setattr(module, "_ws", real_ws)
+        if name.startswith("tools."):
+            if hasattr(module, "_ws"):
+                setattr(module, "_ws", real_ws)
+            if hasattr(module, "_ws_multi"):
+                setattr(module, "_ws_multi", real_ws_multi)

@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from tools._base import mcp, _ws, _ws_multi
+from tools._base import mcp, _ws, _ws_multi, envelope, ws_error
 
 
 @mcp.tool()
@@ -9,7 +9,7 @@ def get_statistics(
     period: str = "hour",
     start_time: str = "",
     end_time: str = "",
-) -> list:
+) -> dict:
     """
     Get long-term statistics for a sensor entity (energy, temperature, etc.).
 
@@ -17,6 +17,12 @@ def get_statistics(
     period: 'hour' | 'day' | 'month' | 'week' (default: 'hour')
     start_time: ISO8601 (default: 24h ago)
     end_time: ISO8601 (default: now)
+
+    Returns: {total, returned, note?, statistics: [{start, end, mean, min,
+             max, sum, state}]}
+
+    A series is not paginated by offset - if it is too short or too long,
+    narrow it with `start_time`/`end_time` instead.
     """
     now = datetime.now(timezone.utc)
     if not start_time:
@@ -32,8 +38,10 @@ def get_statistics(
         "period": period,
         "units": {},
     })
-    stats = (result.get("result") or {}).get(entity_id, [])
-    return [
+    if err := ws_error(result):
+        return err
+    stats = result["result"].get(entity_id, [])
+    out = [
         {
             "start": s.get("start"),
             "end": s.get("end"),
@@ -45,6 +53,8 @@ def get_statistics(
         }
         for s in stats
     ]
+    return envelope(out, key="statistics",
+                    note="" if out else "no statistics in the window - widen `start_time`/`end_time`")
 
 
 @mcp.tool()
@@ -52,7 +62,7 @@ def get_statistics_summary(
     entity_ids: list,
     period: str = "day",
     days: int = 7,
-) -> list:
+) -> dict:
     """
     Get aggregated statistics summary for one or more sensor entities.
 
@@ -60,9 +70,16 @@ def get_statistics_summary(
     period:     aggregation period — 'hour', 'day' (default), 'week', 'month'
     days:       how many days back to look (default: 7)
 
+    Returns: {total, returned, note?, statistics: [{entity_id, period, days,
+             samples, mean, min, max, sum_delta?}]}
+
     Returns per entity: mean, min, max over the period, plus delta (last - first) for
     cumulative sensors (energy, gas, water). Useful for quick "how did X behave this week?"
     questions without wading through raw hourly data.
+
+    One entity's statistics call failing does not fail the others - that
+    entity's row is {entity_id, error, detail} instead of a summary, and one
+    with no recorded data reports {entity_id, error: "no_data"}.
     """
     now = datetime.now(timezone.utc)
     start_time = (now - timedelta(days=days)).isoformat()
@@ -83,7 +100,11 @@ def get_statistics_summary(
 
     summaries = []
     for eid, res in zip(entity_ids, results):
-        stats = (res.get("result") or {}).get(eid, [])
+        if err := ws_error(res):
+            summaries.append({"entity_id": eid, **err})
+            continue
+
+        stats = res["result"].get(eid, [])
         if not stats:
             summaries.append({"entity_id": eid, "error": "no_data"})
             continue
@@ -108,4 +129,4 @@ def get_statistics_summary(
 
         summaries.append(summary)
 
-    return summaries
+    return envelope(summaries, key="statistics")

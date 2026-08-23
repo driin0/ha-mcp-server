@@ -1,7 +1,7 @@
 import httpx
 from datetime import datetime, timedelta, timezone
 
-from tools._base import mcp, HA_URL, HEADERS, default_language, _ws, _ws_multi
+from tools._base import mcp, HA_URL, HEADERS, default_language, _ws, _ws_multi, envelope, ws_error
 
 
 @mcp.tool()
@@ -38,16 +38,19 @@ def get_entity(entity_id: str) -> dict:
 
 
 @mcp.tool()
-def get_states_by_domain(domain: str) -> list:
+def get_states_by_domain(domain: str) -> dict:
     """
     Get all entity states for a given domain.
     Examples: 'light', 'switch', 'sensor', 'binary_sensor', 'climate',
               'media_player', 'automation', 'script', 'scene', 'person'
+
+    Returns: {total, returned, offset, note?, entities: [{entity_id, name,
+             state, attributes, last_changed}]}
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
-        return [
+        out = [
             {
                 "entity_id": s["entity_id"],
                 "name": s.get("attributes", {}).get("friendly_name", ""),
@@ -58,11 +61,19 @@ def get_states_by_domain(domain: str) -> list:
             for s in r.json()
             if s["entity_id"].startswith(f"{domain}.")
         ]
+    return envelope(out, key="entities")
 
 
 @mcp.tool()
-def get_history(entity_id: str, hours: int = 24) -> list:
-    """Get state history for an entity over the last N hours (default 24)."""
+def get_history(entity_id: str, hours: int = 24) -> dict:
+    """
+    Get state history for an entity over the last N hours (default 24).
+
+    Returns: {total, returned, note?, history: [...]}
+
+    A series is not paginated by offset - if it is too short or too long,
+    narrow it with `hours` instead.
+    """
     start = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     with httpx.Client() as client:
         r = client.get(
@@ -73,14 +84,19 @@ def get_history(entity_id: str, hours: int = 24) -> list:
         )
         r.raise_for_status()
         result = r.json()
-        return result[0] if result else []
+        series = result[0] if result else []
+    return envelope(series, key="history",
+                    note="" if series else "no history in the window - widen `hours`")
 
 
 @mcp.tool()
-def get_logbook(hours: int = 6, entity_id: str = "") -> list:
+def get_logbook(hours: int = 6, entity_id: str = "") -> dict:
     """
     Get the logbook (events and state changes) for the last N hours (default 6).
     Optionally filter by entity_id to reduce output size.
+
+    Returns: {total, returned, offset, note?, events: [{when, domain, name,
+             message, entity_id}]}
     """
     start = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     params = {}
@@ -95,17 +111,18 @@ def get_logbook(hours: int = 6, entity_id: str = "") -> list:
         )
         r.raise_for_status()
         entries = r.json()
-        return [
-            {
-                "when": e.get("when", "")[:16],
-                "domain": e.get("domain", ""),
-                "name": e.get("name", ""),
-                "message": e.get("message", ""),
-                "entity_id": e.get("entity_id", ""),
-            }
-            for e in entries
-            if e.get("domain")
-        ]
+    events = [
+        {
+            "when": e.get("when", "")[:16],
+            "domain": e.get("domain", ""),
+            "name": e.get("name", ""),
+            "message": e.get("message", ""),
+            "entity_id": e.get("entity_id", ""),
+        }
+        for e in entries
+        if e.get("domain")
+    ]
+    return envelope(events, key="events")
 
 
 @mcp.tool()
@@ -269,7 +286,7 @@ def fire_event(event_type: str, event_data: dict = None) -> dict:
 
 
 @mcp.tool()
-def list_entities_by_integration(integration: str, search: str = "", limit: int = 0) -> list:
+def list_entities_by_integration(integration: str, search: str = "", limit: int = 0) -> dict:
     """
     List all entities belonging to a specific integration (platform).
 
@@ -277,13 +294,15 @@ def list_entities_by_integration(integration: str, search: str = "", limit: int 
     search: optional substring filter on entity_id or name (case-insensitive)
     limit: max results to return (0 = no limit)
 
-    Returns entity_id, name, area_id for each matching entity.
+    Returns: {total, returned, offset, note?, entities: [{entity_id, name,
+             platform, area_id, disabled}]}
     Useful to discover which entities come from a specific integration or remote HA instance.
     """
     result = _ws({"type": "config/entity_registry/list"})
-    entities = result.get("result", [])
+    if err := ws_error(result):
+        return err
     out = []
-    for e in entities:
+    for e in result["result"]:
         if e.get("platform") != integration:
             continue
         name = e.get("name") or e.get("original_name", "")
@@ -296,9 +315,8 @@ def list_entities_by_integration(integration: str, search: str = "", limit: int 
             "area_id": e.get("area_id"),
             "disabled": e.get("disabled_by") is not None,
         })
-        if limit and len(out) >= limit:
-            break
-    return out
+    out.sort(key=lambda x: x["entity_id"])
+    return envelope(out, key="entities", limit=limit)
 
 
 @mcp.tool()
@@ -475,26 +493,27 @@ def get_entity_dependencies(entity_id: str) -> dict:
 
 
 @mcp.tool()
-def get_entity_exposure() -> list:
+def get_entity_exposure() -> dict:
     """
     List which entities are exposed to Home Assistant voice assistants
     (Assist, Alexa, Google Assistant, etc.).
 
-    Returns: [{entity_id, assistants: {assist: bool, amazon_alexa: bool, google_assistant: bool}}]
+    Returns: {total, returned, offset, note?, entities: [{entity_id,
+             assistants: {assist: bool, amazon_alexa: bool, google_assistant: bool}}]}
     Only returns entities with at least one exposure setting configured.
     Useful to audit what the voice assistant can control.
     """
     result = _ws({"type": "conversation/expose_entity/list"})
-    exposed = (result.get("result") or {}).get("exposed_entities", [])
-    out = []
-    for e in exposed:
-        assistants = e.get("assistants", {})
-        if assistants:
-            out.append({
-                "entity_id": e.get("entity_id"),
-                "assistants": assistants,
-            })
-    return sorted(out, key=lambda x: x["entity_id"])
+    if err := ws_error(result):
+        return err
+    exposed = (result["result"] or {}).get("exposed_entities", [])
+    out = [
+        {"entity_id": e.get("entity_id"), "assistants": e.get("assistants", {})}
+        for e in exposed
+        if e.get("assistants")
+    ]
+    out.sort(key=lambda x: x["entity_id"])
+    return envelope(out, key="entities")
 
 
 @mcp.tool()
@@ -505,7 +524,7 @@ def search_entities(
     label: str = "",
     state: str = "",
     limit: int = 50,
-) -> list:
+) -> dict:
     """
     Search for entities across all domains using multiple filters simultaneously.
 
@@ -517,7 +536,11 @@ def search_entities(
     state:   filter by exact state value, e.g. 'on', 'off', 'unavailable', '23.5'
     limit:   max results to return (default 50)
 
-    Returns: [{entity_id, name, domain, state, area_id, labels}]
+    Returns: {total, returned, offset, note?, entities: [{entity_id, name,
+             domain, state, area_id, labels}]}
+
+    `total` counts every entity that matched the filters, not just the page
+    returned - raise `limit` or narrow the filters when it exceeds `returned`.
 
     Examples:
       Find all temperature sensors in the living room:
@@ -529,7 +552,9 @@ def search_entities(
     """
     # Fetch states and entity registry in parallel
     ws_result = _ws({"type": "config/entity_registry/list"})
-    registry = {e["entity_id"]: e for e in ws_result.get("result", [])}
+    if err := ws_error(ws_result):
+        return err
+    registry = {e["entity_id"]: e for e in ws_result["result"]}
 
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -564,10 +589,9 @@ def search_entities(
             "area_id": reg_entry.get("area_id"),
             "labels": list(reg_entry.get("labels", [])),
         })
-        if len(out) >= limit:
-            break
 
-    return out
+    out.sort(key=lambda x: x["entity_id"])
+    return envelope(out, key="entities", limit=limit)
 
 
 @mcp.tool()
@@ -610,7 +634,7 @@ def get_system_health() -> dict:
 
 
 @mcp.tool()
-def call_service(domain: str, service: str, entity_id: str = "", service_data: dict = None) -> list:
+def call_service(domain: str, service: str, entity_id: str = "", service_data: dict = None) -> dict:
     """
     Call any Home Assistant service.
 
@@ -619,6 +643,14 @@ def call_service(domain: str, service: str, entity_id: str = "", service_data: d
     - Set brightness:  domain='light', service='turn_on', entity_id='light.living_room',
                        service_data={'brightness_pct': 80}
     - Reload config:   domain='homeassistant', service='reload_config_entry'
+
+    Returns: {result: ...} - the service's own JSON response, passed through
+    unexamined. Home Assistant services do not share one response shape (most
+    return the list of changed states, some return nothing, a few return a
+    service-specific payload), so this tool does not wrap, count, or sort
+    what comes back. A non-2xx response is still raised as an error like any
+    other tool - "opaque passthrough" only covers the shape of a successful
+    call, not whether the call succeeded at all.
     """
     data = dict(service_data) if service_data else {}
     if entity_id:
@@ -631,4 +663,4 @@ def call_service(domain: str, service: str, entity_id: str = "", service_data: d
             timeout=15,
         )
         r.raise_for_status()
-        return r.json()
+        return {"result": r.json()}

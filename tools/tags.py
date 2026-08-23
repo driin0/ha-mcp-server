@@ -1,20 +1,20 @@
-from tools._base import mcp, _ws
+from tools._base import mcp, _ws, envelope, ws_error
 
 
 @mcp.tool()
-def list_tags() -> list:
+def list_tags() -> dict:
     """
     List all NFC tags registered in Home Assistant.
 
-    Returns: [{id, name, last_scanned, last_scanned_by_device_id}]
+    Returns: {total, returned, offset, note?, tags: [{id, name, last_scanned,
+             last_scanned_by_device_id}]}
     Tags can be used to trigger automations when scanned with an NFC reader or phone.
     """
     result = _ws({"type": "tag/list"})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return [{"error": err.get("code", "unknown"), "detail": err.get("message", "")}]
-    tags = result.get("result", [])
-    return [
+    if err := ws_error(result):
+        return err
+    tags = result["result"]
+    rows = [
         {
             "id": t.get("id"),
             "name": t.get("name") or "",
@@ -23,6 +23,7 @@ def list_tags() -> list:
         }
         for t in sorted(tags, key=lambda x: (x.get("name") or x.get("id", "")).lower())
     ]
+    return envelope(rows, key="tags")
 
 
 @mcp.tool()

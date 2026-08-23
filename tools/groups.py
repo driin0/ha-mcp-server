@@ -1,16 +1,17 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws
+from tools._base import mcp, HA_URL, HEADERS, _ws, envelope
 
 
 @mcp.tool()
-def list_groups(search: str = "") -> list:
+def list_groups(search: str = "") -> dict:
     """
     List all entity groups (group.* domain) with their members.
 
     search: optional substring filter on group name (case-insensitive)
 
-    Returns: [{entity_id, name, state, entities: [...], all_entities: bool}]
+    Returns: {total, returned, offset, note?, groups: [{entity_id, name, state,
+             entities: [...], all_entities: bool}]}
 
     Note: these are logical groups (group.*) used for grouping entity states.
     For device/area grouping, use list_areas(). For light groups, use list_lights().
@@ -34,7 +35,7 @@ def list_groups(search: str = "") -> list:
             "all_entities": attrs.get("all", False),
             "icon": attrs.get("icon", ""),
         })
-    return sorted(groups, key=lambda x: x["name"])
+    return envelope(sorted(groups, key=lambda x: x["name"]), key="groups")
 
 
 @mcp.tool()

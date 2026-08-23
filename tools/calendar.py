@@ -1,34 +1,38 @@
 import httpx
 from datetime import datetime, timezone, timedelta
 
-from tools._base import mcp, HA_URL, HEADERS, _ws
+from tools._base import mcp, HA_URL, HEADERS, _ws, envelope
 
 
 @mcp.tool()
-def list_calendars() -> list:
+def list_calendars() -> dict:
     """
     List all calendar entities.
 
-    Returns an empty list on an instance with no calendars: Home Assistant only
-    registers /api/calendars once the calendar integration has loaded, so its
-    absence means "none", not a failure.
+    Returns: {total, returned, offset, note?, calendars: [...]}
+
+    total 0 on an instance with no calendars: Home Assistant only registers
+    /api/calendars once the calendar integration has loaded, so its absence
+    means "none", not a failure.
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/calendars", headers=HEADERS, timeout=10)
         if r.status_code == 404:
-            return []
+            return envelope([], key="calendars")
         r.raise_for_status()
-        return r.json()
+        return envelope(r.json(), key="calendars")
 
 
 @mcp.tool()
-def get_calendar_events(entity_id: str, start: str = "", end: str = "") -> list:
+def get_calendar_events(entity_id: str, start: str = "", end: str = "") -> dict:
     """
     Get events from a calendar entity.
 
     entity_id: e.g. 'calendar.home'
     start: ISO8601 datetime (default: now)
     end: ISO8601 datetime (default: 7 days from now)
+
+    Returns: {total, returned, offset, note?, events: [...]}
     """
     now = datetime.now(timezone.utc)
     start_dt = start or now.isoformat()
@@ -41,7 +45,7 @@ def get_calendar_events(entity_id: str, start: str = "", end: str = "") -> list:
             timeout=10,
         )
         r.raise_for_status()
-        return r.json()
+        return envelope(r.json(), key="events")
 
 
 @mcp.tool()

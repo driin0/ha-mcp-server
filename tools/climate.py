@@ -1,11 +1,15 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS
+from tools._base import mcp, HA_URL, HEADERS, envelope
 
 
 @mcp.tool()
-def list_climate() -> list:
-    """List all climate entities (AC, heaters, etc.) with current state."""
+def list_climate() -> dict:
+    """
+    List all climate entities (AC, heaters, etc.) with current state.
+
+    Returns: {total, returned, offset, note?, climate: [...]}
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -26,7 +30,7 @@ def list_climate() -> list:
                 "swing_mode": attrs.get("swing_mode"),
                 "swing_modes": attrs.get("swing_modes", []),
             })
-        return sorted(result, key=lambda x: x["name"])
+        return envelope(sorted(result, key=lambda x: x["name"]), key="climate")
 
 
 @mcp.tool()

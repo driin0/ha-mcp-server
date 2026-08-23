@@ -1,11 +1,15 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS
+from tools._base import mcp, HA_URL, HEADERS, envelope
 
 
 @mcp.tool()
-def list_locks() -> list:
-    """List all lock entities with their state."""
+def list_locks() -> dict:
+    """
+    List all lock entities with their state.
+
+    Returns: {total, returned, offset, note?, locks: [...]}
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -20,7 +24,7 @@ def list_locks() -> list:
             "state": s["state"],
             "changed_by": attrs.get("changed_by"),
         })
-    return sorted(locks, key=lambda x: x["name"])
+    return envelope(sorted(locks, key=lambda x: x["name"]), key="locks")
 
 
 @mcp.tool()

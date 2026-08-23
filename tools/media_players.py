@@ -1,11 +1,15 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, ALEXA_KEYWORDS, default_language, _ws
+from tools._base import mcp, HA_URL, HEADERS, ALEXA_KEYWORDS, default_language, _ws, envelope
 
 
 @mcp.tool()
-def list_media_players() -> list:
-    """List all media player entities with current state."""
+def list_media_players() -> dict:
+    """
+    List all media player entities with current state.
+
+    Returns: {total, returned, offset, note?, media_players: [...]}
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -25,7 +29,7 @@ def list_media_players() -> list:
                 "source": attrs.get("source"),
                 "source_list": attrs.get("source_list", []),
             })
-        return sorted(result, key=lambda x: x["name"])
+        return envelope(sorted(result, key=lambda x: x["name"]), key="media_players")
 
 
 @mcp.tool()

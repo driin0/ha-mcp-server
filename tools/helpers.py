@@ -1,16 +1,18 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, HELPER_DOMAINS, _slug, _ws
+from tools._base import mcp, HA_URL, HEADERS, HELPER_DOMAINS, _slug, _ws, envelope
 
 
 @mcp.tool()
-def list_helpers(domain: str = "") -> list:
+def list_helpers(domain: str = "") -> dict:
     """
     List helpers, optionally filtered by domain.
 
     domain: leave empty for all, or one of:
       input_boolean, input_number, input_text, input_select,
       input_datetime, counter, timer, input_button
+
+    Returns: {total, returned, offset, note?, helpers: [...]}
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -32,7 +34,7 @@ def list_helpers(domain: str = "") -> list:
                     if k not in ("friendly_name", "icon", "editable")
                 },
             })
-        return sorted(helpers, key=lambda x: (x["domain"], x["name"]))
+        return envelope(sorted(helpers, key=lambda x: (x["domain"], x["name"])), key="helpers")
 
 
 @mcp.tool()

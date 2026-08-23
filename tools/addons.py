@@ -2,7 +2,7 @@ import os
 
 import httpx
 
-from tools._base import mcp, HA_URL, HA_TOKEN
+from tools._base import mcp, HA_URL, HA_TOKEN, envelope, error
 
 # Supervisor API is available only in HA OS / Supervised add-on context.
 # In the add-on, HA_URL = "http://supervisor/core" and the token is the SUPERVISOR_TOKEN.
@@ -29,18 +29,19 @@ def _check_supervisor():
 
 
 @mcp.tool()
-def list_addons(search: str = "") -> list:
+def list_addons(search: str = "") -> dict:
     """
     List all installed add-ons with their current state and version.
 
     search: optional substring filter on name or slug (case-insensitive)
 
-    Returns: [{slug, name, version, version_latest, state, update_available, repository}]
+    Returns: {total, returned, offset, note?, addons: [{slug, name, version,
+             version_latest, state, update_available, repository}]}
     Requires: Home Assistant OS or Supervised installation.
     """
     err = _check_supervisor()
     if err:
-        return [err]
+        return error(err["error"], err["detail"])
     with httpx.Client() as client:
         r = client.get(f"{_SUPERVISOR_BASE}/addons", headers=_SUPERVISOR_HEADERS, timeout=15)
         r.raise_for_status()
@@ -59,7 +60,7 @@ def list_addons(search: str = "") -> list:
             "repository": a.get("repository"),
             "description": a.get("description", ""),
         })
-    return sorted(out, key=lambda x: (x.get("name") or "").lower())
+    return envelope(sorted(out, key=lambda x: (x.get("name") or "").lower()), key="addons")
 
 
 # Option names whose value is a credential. Matched as substrings, so

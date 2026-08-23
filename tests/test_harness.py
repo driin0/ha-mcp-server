@@ -11,7 +11,7 @@ def test_fake_ha_reaches_a_rest_tool(fake_ha):
 
     result = list_lights()
 
-    assert [row["entity_id"] for row in result] == ["light.kitchen", "light.study"]
+    assert [row["entity_id"] for row in result["lights"]] == ["light.kitchen", "light.study"]
     assert any(call.url.path == "/api/states" for call in fake_ha.rest_calls)
 
 
@@ -23,7 +23,7 @@ def test_fake_ha_reaches_a_ws_tool(fake_ha):
         "result": {"entity_id": "automation.nas_shutdown", "labels": ["power"]},
     }
 
-    assert get_entity_labels("automation.nas_shutdown") == ["power"]
+    assert get_entity_labels("automation.nas_shutdown")["labels"] == ["power"]
 
 
 def test_fake_ha_reaches_a_ws_tool_imported_before_the_fixture_ran(fake_ha):
@@ -44,5 +44,5 @@ def test_fake_ha_reaches_a_ws_tool_imported_before_the_fixture_ran(fake_ha):
 
     result = list_repairs()
 
-    assert [row["issue_id"] for row in result] == ["low_battery"]
+    assert [row["issue_id"] for row in result["repairs"]] == ["low_battery"]
     assert any(call.get("type") == "repairs/list_issues" for call in fake_ha.ws_calls)

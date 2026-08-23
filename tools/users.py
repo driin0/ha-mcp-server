@@ -1,23 +1,23 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws
+from tools._base import mcp, HA_URL, HEADERS, _ws, envelope, ws_error
 
 
 @mcp.tool()
-def list_users() -> list:
+def list_users() -> dict:
     """
     List all Home Assistant user accounts.
 
-    Returns: [{id, name, is_admin, is_active, local_only, system_generated}]
+    Returns: {total, returned, offset, note?, users: [{id, name, is_admin,
+             is_active, local_only, system_generated}]}
     Requires admin privileges.
     """
     # WS config/auth/list — the correct command used by the HA frontend
     result = _ws({"type": "config/auth/list"})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return [{"error": err.get("code", "unknown"), "detail": err.get("message", "")}]
-    users = result.get("result", [])
-    return [
+    if err := ws_error(result):
+        return err
+    users = result["result"]
+    rows = [
         {
             "id": u.get("id"),
             "name": u.get("name"),
@@ -29,6 +29,7 @@ def list_users() -> list:
         for u in sorted(users, key=lambda x: (x.get("system_generated", False), (x.get("name") or "").lower()))
         if not u.get("system_generated")  # hide internal system accounts
     ]
+    return envelope(rows, key="users")
 
 
 @mcp.tool()

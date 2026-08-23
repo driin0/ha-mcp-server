@@ -1,6 +1,6 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS
+from tools._base import mcp, HA_URL, HEADERS, envelope
 
 
 @mcp.tool()
@@ -33,8 +33,12 @@ def alarm_control(entity_id: str, command: str, code: str = "") -> dict:
 
 
 @mcp.tool()
-def get_alarm_state() -> list:
-    """Get the current state of all alarm control panels (Alarmo and others)."""
+def get_alarm_state() -> dict:
+    """
+    Get the current state of all alarm control panels (Alarmo and others).
+
+    Returns: {total, returned, offset, note?, alarms: [...]}
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -53,4 +57,4 @@ def get_alarm_state() -> list:
                 "bypassed_sensors": attrs.get("bypassed_sensors", []),
                 "last_changed": s.get("last_changed", ""),
             })
-        return sorted(alarms, key=lambda x: x["name"])
+        return envelope(sorted(alarms, key=lambda x: x["name"]), key="alarms")

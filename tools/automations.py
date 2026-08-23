@@ -1,31 +1,60 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _slug, _ws
+from tools._base import mcp, HA_URL, HEADERS, _slug, _ws, envelope, error, ws_error
 
 
 @mcp.tool()
-def list_automations(search: str = "") -> list:
+def list_automations(search: str = "", label: str = "", limit: int = 50,
+                     offset: int = 0) -> dict:
     """
-    List all automations with their state (on/off) and last triggered time.
+    List automations with their state and last triggered time.
+
     search: optional substring filter on automation name (case-insensitive)
+    label:  filter by label ID (use list_labels() to find label IDs)
+    limit:  max automations to return (default 50, 0 for no limit)
+    offset: skip the first N (for pagination)
+
+    Returns: {total, returned, offset, note?, automations: [{entity_id, name,
+             state, last_triggered, labels}]}
+
+    `total` counts what matched the filters, not what was returned: when it
+    exceeds `returned`, `note` says so. An instance with a few hundred
+    automations is normal, so filter by label before raising the limit.
     """
+    r = _ws({"type": "config/entity_registry/list"})
+    registry_err = ws_error(r)
+    if registry_err and label:
+        # Filtering by a label we could not read would silently return
+        # nothing, which is the failure mode this work removes.
+        return registry_err
+    registry = ({} if registry_err
+                else {e["entity_id"]: e for e in r["result"]})
+
     with httpx.Client() as client:
-        r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        automations = []
-        for s in r.json():
-            if not s["entity_id"].startswith("automation."):
-                continue
-            name = s.get("attributes", {}).get("friendly_name", s["entity_id"])
-            if search and search.lower() not in name.lower():
-                continue
-            automations.append({
-                "entity_id": s["entity_id"],
-                "name": name,
-                "state": s["state"],
-                "last_triggered": s.get("attributes", {}).get("last_triggered"),
-            })
-        return sorted(automations, key=lambda x: x["name"])
+        resp = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+
+    automations = []
+    for s in resp.json():
+        if not s["entity_id"].startswith("automation."):
+            continue
+        attrs = s.get("attributes", {})
+        name = attrs.get("friendly_name", s["entity_id"])
+        if search and search.lower() not in name.lower():
+            continue
+        labels = list(registry.get(s["entity_id"], {}).get("labels", []))
+        if label and label not in labels:
+            continue
+        automations.append({
+            "entity_id": s["entity_id"],
+            "name": name,
+            "state": s["state"],
+            "last_triggered": attrs.get("last_triggered"),
+            "labels": labels,
+        })
+
+    automations.sort(key=lambda x: x["name"])
+    return envelope(automations, key="automations", limit=limit, offset=offset)
 
 
 @mcp.tool()
@@ -188,20 +217,26 @@ def get_automation(entity_id: str) -> dict:
 
 
 @mcp.tool()
-def get_automation_trace(entity_id: str, limit: int = 5) -> list:
+def get_automation_trace(entity_id: str, limit: int = 5) -> dict:
     """
     Get the latest execution traces for an automation.
-    Useful for debugging why an automation did or didn't trigger.
+    Useful for debugging why an automation did or did not trigger.
 
     entity_id: e.g. 'automation.living_room_lights'
     limit: number of recent traces to return (default 5)
+
+    Returns: {total, returned, offset, note?, traces: [...]}
+
+    Traces are held in memory by Home Assistant and are lost on restart, so an
+    empty result means "no traces available", never "the automation never ran".
     """
     result = _ws({
         "type": "automation/trace/list",
         "automation_id": entity_id.replace("automation.", ""),
     })
-    traces = (result.get("result") or [])[:limit]
-    return [
+    if err := ws_error(result):
+        return err
+    traces = [
         {
             "run_id": t.get("run_id"),
             "state": t.get("state"),
@@ -210,20 +245,26 @@ def get_automation_trace(entity_id: str, limit: int = 5) -> list:
             "error": t.get("error"),
             "script_execution": t.get("script_execution"),
         }
-        for t in traces
+        for t in (result["result"] or [])
     ]
+    note = ("no traces available - Home Assistant keeps them in memory and "
+            "loses them on restart") if not traces else ""
+    return envelope(traces, key="traces", limit=limit, note=note)
 
 
 @mcp.tool()
-def list_blueprints(domain: str = "automation") -> list:
+def list_blueprints(domain: str = "automation") -> dict:
     """
     List available blueprints.
 
     domain: 'automation' (default) or 'script'
+    Returns: {total, returned, offset, note?, blueprints: [...]}
     """
     result = _ws({"type": "blueprint/list", "domain": domain})
-    blueprints = result.get("result") or {}
-    return [
+    if err := ws_error(result):
+        return err
+    blueprints = result["result"] or {}
+    rows = [
         {
             "path": path,
             "name": data.get("metadata", {}).get("name", path),
@@ -233,6 +274,7 @@ def list_blueprints(domain: str = "automation") -> list:
         }
         for path, data in blueprints.items()
     ]
+    return envelope(rows, key="blueprints")
 
 
 @mcp.tool()
@@ -264,57 +306,45 @@ def create_automation_from_blueprint(
 
 
 @mcp.tool()
-def list_device_triggers(device_id: str) -> list:
+def list_device_triggers(device_id: str) -> dict:
     """
-    List all available automation triggers for a specific device.
+    List the triggers a device offers (device automation).
 
-    device_id: use list_devices() to find device IDs.
-
-    Returns the triggers you can use in create_automation() — e.g. button presses,
-    state changes, motion detection events, etc. specific to this device.
-    Each trigger object can be used directly in the 'trigger' list of create_automation().
+    device_id: from list_devices()
+    Returns: {total, returned, offset, note?, triggers: [...]}
     """
     result = _ws({"type": "device_automation/trigger/list", "device_id": device_id})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return [{"error": err.get("code", "unknown"), "detail": err.get("message", "")}]
-    return result.get("result", [])
+    if err := ws_error(result):
+        return err
+    return envelope(result["result"], key="triggers")
 
 
 @mcp.tool()
-def list_device_conditions(device_id: str) -> list:
+def list_device_conditions(device_id: str) -> dict:
     """
-    List all available automation conditions for a specific device.
+    List the conditions a device offers (device automation).
 
-    device_id: use list_devices() to find device IDs.
-
-    Returns conditions you can use in create_automation() — e.g. is device on/off,
-    is a sensor above/below threshold, etc.
-    Each condition object can be used directly in the 'condition' list of create_automation().
+    device_id: from list_devices()
+    Returns: {total, returned, offset, note?, conditions: [...]}
     """
     result = _ws({"type": "device_automation/condition/list", "device_id": device_id})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return [{"error": err.get("code", "unknown"), "detail": err.get("message", "")}]
-    return result.get("result", [])
+    if err := ws_error(result):
+        return err
+    return envelope(result["result"], key="conditions")
 
 
 @mcp.tool()
-def list_device_actions(device_id: str) -> list:
+def list_device_actions(device_id: str) -> dict:
     """
-    List all available automation actions for a specific device.
+    List the actions a device offers (device automation).
 
-    device_id: use list_devices() to find device IDs.
-
-    Returns actions you can use in create_automation() — e.g. turn on/off, set brightness,
-    lock/unlock, etc. specific to this device.
-    Each action object can be used directly in the 'action' list of create_automation().
+    device_id: from list_devices()
+    Returns: {total, returned, offset, note?, actions: [...]}
     """
     result = _ws({"type": "device_automation/action/list", "device_id": device_id})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return [{"error": err.get("code", "unknown"), "detail": err.get("message", "")}]
-    return result.get("result", [])
+    if err := ws_error(result):
+        return err
+    return envelope(result["result"], key="actions")
 
 
 @mcp.tool()
@@ -345,22 +375,29 @@ def import_blueprint(url: str) -> dict:
 
 
 @mcp.tool()
-def list_schedules() -> list:
+def list_schedules() -> dict:
     """
     List all schedules from the Scheduler integration (HACS custom component).
-    Returns an empty list with a note if the integration is not installed.
+
+    Returns: {total, returned, offset, note?, schedules: [...]}
+    Returns an error if the Scheduler custom component is not installed, or if
+    the call otherwise fails — the two are not the same thing and are reported
+    differently.
     """
     r = _ws({"type": "scheduler/items"})
-    # If scheduler is not installed, HA returns an error result
-    if not r.get("success", True) or "error" in r:
-        return [{
-            "error": "scheduler_not_available",
-            "detail": "The Scheduler custom integration is not installed or not loaded.",
-        }]
-    items = r.get("result", [])
-    result = []
-    for item in items:
-        result.append({
+    if err := ws_error(r):
+        # HA answers an unregistered command type when the custom component
+        # is not loaded; any other failure is a different problem and must
+        # not be reported as a missing integration (see tools/hacs.py's
+        # _hacs_check for the same distinction made for HACS).
+        if err.get("error") in ("unknown_command", "not_found"):
+            return error("scheduler_not_available",
+                         "The Scheduler custom component is not installed.",
+                         detail_from_ha=err.get("detail", ""))
+        return err
+    items = r["result"]
+    rows = [
+        {
             "schedule_id": item.get("schedule_id"),
             "entity_id": item.get("entity_id"),
             "name": item.get("name", ""),
@@ -368,5 +405,8 @@ def list_schedules() -> list:
             "next_trigger": item.get("next_trigger"),
             "timeslots": item.get("timeslots", []),
             "actions": item.get("actions", []),
-        })
-    return sorted(result, key=lambda x: x.get("name", ""))
+        }
+        for item in items
+    ]
+    rows.sort(key=lambda x: x.get("name", ""))
+    return envelope(rows, key="schedules")
