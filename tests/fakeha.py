@@ -4,9 +4,42 @@ Tools reach Home Assistant two ways: httpx for the REST API and `_ws` for the
 WebSocket API. This module answers both from the same in-memory dataset, so a
 test can say "the registry contains X" once and have every tool see it.
 """
+import copy
 import json
 
 import httpx
+
+# /api/config/automation/config/<id>, seeded for automation.nas_shutdown
+# (id "1684270733500" in DEFAULT_STATES below) - the incident automation
+# the automation-editing plan exists because of: a legacy-vocabulary config
+# (trigger/condition/action, platform/service) whose condition template
+# references an entity that had been renamed, button.nas_shutdown, and
+# whose actions press that button, wait for it to confirm, then cut power
+# at the switch. Real enough to exercise get_automation()'s normalisation
+# against, not a synthetic minimal shape.
+DEFAULT_AUTOMATION_CONFIGS = {
+    "1684270733500": {
+        "alias": "NAS shutdown",
+        "description": "",
+        "trigger": [
+            {"platform": "state", "entity_id": "input_boolean.nas_shutdown_request",
+             "to": "on"},
+        ],
+        "condition": [
+            {"condition": "template",
+             "value_template": "{{ is_state('button.nas_shutdown', 'unavailable') }}"},
+        ],
+        "action": [
+            {"service": "button.press", "target": {"entity_id": "button.nas_shutdown"}},
+            {"wait_for_trigger": [
+                {"platform": "state", "entity_id": "button.nas_shutdown",
+                 "to": "unavailable"},
+            ], "timeout": "00:00:30", "continue_on_timeout": True},
+            {"service": "switch.turn_off", "target": {"entity_id": "switch.nas_power"}},
+        ],
+        "mode": "single",
+    },
+}
 
 DEFAULT_STATES = [
     {"entity_id": "light.kitchen", "state": "on",
@@ -109,8 +142,11 @@ class FakeHA:
         # updates a matching row in self.states, the way a real create
         # immediately registers an entity (verified live) - automations
         # default to "on" (armed) and scripts to "off" (idle), Home
-        # Assistant's own defaults for a freshly created one.
-        self.automation_configs = {}
+        # Assistant's own defaults for a freshly created one. Seeded with
+        # DEFAULT_AUTOMATION_CONFIGS above, matching the id already on
+        # automation.nas_shutdown in DEFAULT_STATES; script_configs has no
+        # such default seed.
+        self.automation_configs = copy.deepcopy(DEFAULT_AUTOMATION_CONFIGS)
         self.script_configs = {}
         # Everything the tools sent, for assertions.
         self.rest_calls = []

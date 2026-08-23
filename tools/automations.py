@@ -1,9 +1,60 @@
 import httpx
 
+from tools._aliases import stored_format, to_modern
 from tools._base import (
     mcp, HA_URL, HEADERS, _slug, _ws, confirm_entity_exists, envelope, error,
     observe_actuation, wait_for_entity, ws_error,
 )
+
+
+def _resolve_automation_id(entity_id: str, client: httpx.Client) -> str | None:
+    """Resolve the config id Home Assistant's automation config API is
+    keyed by, from entity_id's own registered state.
+
+    A UI-created automation carries a numeric timestamp config id,
+    unrelated to its entity_id's own object_id, in the entity's `id`
+    attribute - see delete_automation()'s docstring for how this was
+    measured live. An automation created by create_automation() in this
+    codebase has the two equal by construction, so falling back to the
+    slug when the entity has no `id` attribute is correct for both
+    origins.
+
+    Returns None when entity_id has no registered state at all - the
+    caller decides what that means (does not exist, or a config might
+    still be found by slug alone; see _fetch_config()).
+    """
+    r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    numeric_id = r.json().get("attributes", {}).get("id")
+    return str(numeric_id) if numeric_id else entity_id.removeprefix("automation.")
+
+
+def _fetch_config(automation_id: str, slug: str, client: httpx.Client) -> tuple[str | None, dict | None]:
+    """GET an automation's stored config, trying automation_id first and
+    falling back to slug (entity_id's own object_id) when that 404s and
+    the two differ.
+
+    The id read from an entity's state can be stale, absent, or simply
+    not yet how a not-yet-created automation is addressed - a config can
+    exist under its slug with no numeric id anywhere to have resolved.
+
+    Returns (id_that_worked, config) on success, (None, None) when
+    neither id resolves to a stored config.
+    """
+    r = client.get(f"{HA_URL}/api/config/automation/config/{automation_id}",
+                   headers=HEADERS, timeout=10)
+    if r.status_code != 404:
+        r.raise_for_status()
+        return automation_id, r.json()
+    if automation_id != slug:
+        r2 = client.get(f"{HA_URL}/api/config/automation/config/{slug}",
+                        headers=HEADERS, timeout=10)
+        if r2.status_code != 404:
+            r2.raise_for_status()
+            return slug, r2.json()
+    return None, None
 
 
 @mcp.tool()
@@ -123,17 +174,15 @@ def create_automation(
     entity_id = f"automation.{automation_id}"
 
     if not overwrite:
-        # A transient failure reading the existing config should not block
-        # a legitimate create, so this check only acts on a confirmed 200 -
-        # anything else (404 "no such id" included) falls through as "no
-        # collision" rather than raising.
+        # automation_id doubles as its own slug here (nothing exists yet
+        # to read a different config id from), so this is a single GET
+        # with no fallback attempt - see _fetch_config()'s docstring. A
+        # 404 (no such id) falls through as "no collision" the same way
+        # it always did.
         with httpx.Client() as client:
-            existing = client.get(
-                f"{HA_URL}/api/config/automation/config/{automation_id}",
-                headers=HEADERS, timeout=10,
-            )
-        if existing.status_code == 200:
-            existing_alias = existing.json().get("alias", "")
+            _, existing = _fetch_config(automation_id, automation_id, client)
+        if existing is not None:
+            existing_alias = existing.get("alias", "")
             if existing_alias != name:
                 return error(
                     "id_collision",
@@ -248,14 +297,11 @@ def delete_automation(entity_id: str) -> dict:
     failure.
     """
     with httpx.Client() as client:
-        state_r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
-        if state_r.status_code == 404:
+        automation_id = _resolve_automation_id(entity_id, client)
+        if automation_id is None:
             return error("entity_not_found",
                          f"{entity_id} does not exist on this Home Assistant instance.",
                          entity_id=entity_id)
-        state_r.raise_for_status()
-        automation_id = (state_r.json().get("attributes", {}).get("id")
-                        or entity_id.removeprefix("automation."))
 
         r = client.delete(
             f"{HA_URL}/api/config/automation/config/{automation_id}",
@@ -341,44 +387,47 @@ def toggle_automation(entity_id: str) -> dict:
 @mcp.tool()
 def get_automation(entity_id: str) -> dict:
     """
-    Get the full config (triggers, conditions, actions) of an automation by entity_id.
-    Resolves the numeric id from entity attributes and calls the HA config API directly,
-    falling back to slug if no numeric id is available.
+    Get an automation's stored config by entity_id, normalised to the
+    modern vocabulary (triggers/conditions/actions, trigger:/action: steps).
+
+    Resolves the config id from the entity's own state the same way
+    delete_automation() does - a UI-created automation's config id is a
+    numeric timestamp unrelated to its entity_id - falling back to
+    entity_id's own slug when there is no registered id or entity to read
+    one from.
+
+    Returns: {automation_id, entity_id, name, mode, stored_format, config}.
+    `stored_format` names what vocabulary the config actually has on disk
+    ("legacy" or "modern") - an edit tool must write back in that same
+    style, never migrate it as a side effect - and `config` is always
+    normalised to the modern vocabulary regardless, so a caller reads one
+    consistent shape either way. Returns an error() envelope ("not_found")
+    when neither the resolved id nor entity_id's own slug has a stored
+    config - a YAML-defined automation, or an entity_id with no
+    corresponding automation at all.
     """
-    automation_slug = entity_id.removeprefix("automation.")
+    slug = entity_id.removeprefix("automation.")
     with httpx.Client() as client:
-        # Resolve numeric id from entity attributes (GUI automations use a timestamp id)
-        automation_id = automation_slug
-        state_r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
-        if state_r.status_code == 200:
-            numeric_id = state_r.json().get("attributes", {}).get("id")
-            if numeric_id:
-                automation_id = numeric_id
+        automation_id = _resolve_automation_id(entity_id, client) or slug
+        resolved_id, raw = _fetch_config(automation_id, slug, client)
 
-        r = client.get(
-            f"{HA_URL}/api/config/automation/config/{automation_id}",
-            headers=HEADERS,
-            timeout=10,
+    if raw is None:
+        return error(
+            "not_found",
+            f"No stored automation config found for {entity_id} (tried "
+            f"id {automation_id!r} and slug {slug!r}). It may not exist, "
+            "or may be defined in YAML, which has no config id.",
+            entity_id=entity_id,
         )
-        if r.status_code != 404:
-            r.raise_for_status()
-            return r.json()
 
-        # Fallback: try slug if numeric id didn't work
-        if automation_id != automation_slug:
-            r2 = client.get(
-                f"{HA_URL}/api/config/automation/config/{automation_slug}",
-                headers=HEADERS,
-                timeout=10,
-            )
-            if r2.status_code != 404:
-                r2.raise_for_status()
-                return r2.json()
-
+    config, restore = to_modern(raw)
     return {
-        "error": "not_found",
+        "automation_id": resolved_id,
         "entity_id": entity_id,
-        "detail": "Automation not found via HA config API.",
+        "name": config.get("alias", ""),
+        "mode": config.get("mode", "single"),
+        "stored_format": stored_format(restore),
+        "config": config,
     }
 
 
