@@ -319,6 +319,24 @@ def test_create_automation_overwrite_proceeds_despite_a_failed_collision_check(f
     assert fake_ha.automation_configs["morning_lights"]["alias"] == "Morning lights"
 
 
+def test_create_automation_mode_defaults_to_single(fake_ha):
+    from tools.automations import create_automation
+
+    create_automation("Morning lights", trigger=[], action=[])
+
+    assert fake_ha.automation_configs["morning_lights"]["mode"] == "single"
+
+
+def test_create_automation_mode_is_passed_through(fake_ha):
+    """mode used to be hardcoded to "single" - create_automation() now
+    exposes it, matching update_automation()."""
+    from tools.automations import create_automation
+
+    create_automation("Morning lights", trigger=[], action=[], mode="restart")
+
+    assert fake_ha.automation_configs["morning_lights"]["mode"] == "restart"
+
+
 def test_create_script_refuses_a_colliding_name_by_default(fake_ha):
     from tools.scripts import create_script
 

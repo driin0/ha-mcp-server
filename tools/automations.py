@@ -195,13 +195,27 @@ def create_automation(
     action: list,
     condition: list = None,
     description: str = "",
+    mode: str = "single",
     enabled: bool = True,
     overwrite: bool = False,
 ) -> dict:
     """
-    Create or update an automation. The automation ID is derived from the name.
+    Create a new automation, or replace one this same tool created earlier
+    under the exact same name (see `overwrite`). The automation's id is
+    derived from `name` through a lossy slug - which is also what this
+    tool cannot get past: it can never reach a UI-created automation, no
+    matter what `overwrite` is set to, because a UI-created automation's
+    config id is a numeric timestamp unrelated to its name, and this tool
+    only ever addresses the slug it derives. To change an existing
+    automation in place - UI-created or not, without touching its id -
+    use update_automation() (whole fields) or patch_automation() (one
+    value by dotted path) instead; this tool starts a config from scratch
+    every time it is called.
 
     trigger, condition and action must be valid HA trigger/condition/action objects.
+
+    mode: 'single' (default), 'restart', 'queued', or 'parallel' - Home
+      Assistant's own automation run modes, passed straight through.
 
     overwrite: the automation id is derived from `name` through a lossy
       slug (see _slug()) - "Morning lights" and "Morning, lights!" both
@@ -212,7 +226,10 @@ def create_automation(
       without changing the scheme, so refusing is the honest default. Pass
       overwrite=True to replace it deliberately. Calling again with the
       exact same `name` is treated as an intentional update, not a
-      collision, and always succeeds without this flag.
+      collision, and always succeeds without this flag. Even with
+      overwrite=True, this can only ever replace an automation this tool's
+      own slug scheme already owns - never a UI-created automation, whose
+      id this tool has no way to derive or address (see above).
 
     Example — turn on a light at sunset:
       name: "Turn on light at sunset"
@@ -309,7 +326,7 @@ def create_automation(
         "trigger": trigger,
         "condition": condition or [],
         "action": action,
-        "mode": "single",
+        "mode": mode,
     }
     with httpx.Client() as client:
         r = client.post(
