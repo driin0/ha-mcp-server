@@ -1,0 +1,59 @@
+"""Test configuration.
+
+The os.environ block MUST run before anything imports tools._base, which
+raises RuntimeError when HA_URL or HA_TOKEN is missing. conftest.py is
+imported by pytest before the test modules, which is what makes this work.
+"""
+import os
+
+os.environ.setdefault("HA_URL", "http://fake-ha.test:8123")
+os.environ.setdefault("HA_TOKEN", "fake-token")
+os.environ.setdefault("MCP_SECRET", "fake-secret")
+
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import httpx  # noqa: E402
+import pytest  # noqa: E402
+
+from tests.fakeha import FakeHA  # noqa: E402
+
+
+@pytest.fixture
+def fake_ha(monkeypatch):
+    """Route every REST and WebSocket call to an in-process fake."""
+    state = FakeHA()
+    real_client = httpx.Client
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(state.handle)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", client_factory)
+
+    # Tool modules do `from tools._base import _ws`, binding the function into
+    # their own namespace. Patching tools._base._ws alone would not reach them.
+    import tools._base
+    real_ws = tools._base._ws
+    monkeypatch.setattr(tools._base, "_ws", state.ws)
+    for module in list(sys.modules.values()):
+        name = getattr(module, "__name__", "")
+        if name.startswith("tools.") and hasattr(module, "_ws"):
+            monkeypatch.setattr(module, "_ws", state.ws, raising=False)
+
+    yield state
+
+    # A module imported for the first time *during* a test (e.g. via an
+    # import inside the test body) binds _ws through its own
+    # `from tools._base import _ws`, not through monkeypatch.setattr — so
+    # monkeypatch has no record of it and will not undo it. Left alone, that
+    # module would keep pointing at this test's fake forever, and the loop
+    # above in the *next* test would repoint it at the next fake instead of
+    # the real function. Restore every tools.* module to the real _ws here
+    # so each test starts from a clean, real baseline.
+    for module in list(sys.modules.values()):
+        name = getattr(module, "__name__", "")
+        if name.startswith("tools.") and hasattr(module, "_ws"):
+            setattr(module, "_ws", real_ws)
