@@ -72,6 +72,10 @@ def list_lights(area_id: str = "", search: str = "", state: str = "") -> dict:
     state:   filter by exact state — 'on', 'off', 'unavailable'
 
     Returns: {total, returned, offset, note?, lights: [...]}
+
+    ⚠️ third-party-settable: `name` is an entity's `friendly_name`, settable
+    by any integration that names its own entities - see tools/_base.py's
+    "Third-party-settable fields" note.
     """
     area_map = {}
     if area_id:

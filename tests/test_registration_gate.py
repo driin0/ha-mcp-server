@@ -27,14 +27,14 @@ def test_user_management_disabled_by_default(monkeypatch):
     monkeypatch.delenv("MCP_ENABLE_USER_MANAGEMENT", raising=False)
     from tools._base import disabled_tool_names
 
-    assert disabled_tool_names() == {"create_user", "update_user", "delete_user"}
+    assert disabled_tool_names() >= {"create_user", "update_user", "delete_user"}
 
 
 def test_user_management_enabled_when_flag_is_true(monkeypatch):
     monkeypatch.setenv("MCP_ENABLE_USER_MANAGEMENT", "true")
     from tools._base import disabled_tool_names
 
-    assert disabled_tool_names() == set()
+    assert disabled_tool_names().isdisjoint({"create_user", "update_user", "delete_user"})
 
 
 def test_user_management_enabled_accepts_1_and_yes(monkeypatch):
@@ -42,7 +42,9 @@ def test_user_management_enabled_accepts_1_and_yes(monkeypatch):
 
     for truthy in ("1", "yes", "TRUE", "Yes"):
         monkeypatch.setenv("MCP_ENABLE_USER_MANAGEMENT", truthy)
-        assert disabled_tool_names() == set(), f"{truthy!r} should enable the group"
+        assert disabled_tool_names().isdisjoint({"create_user", "update_user", "delete_user"}), (
+            f"{truthy!r} should enable the group"
+        )
 
 
 def test_user_management_disabled_by_any_other_value(monkeypatch):
@@ -50,7 +52,7 @@ def test_user_management_disabled_by_any_other_value(monkeypatch):
 
     for falsy in ("false", "0", "no", "garbage"):
         monkeypatch.setenv("MCP_ENABLE_USER_MANAGEMENT", falsy)
-        assert disabled_tool_names() == {"create_user", "update_user", "delete_user"}
+        assert disabled_tool_names() >= {"create_user", "update_user", "delete_user"}
 
 
 def test_list_disabled_tools_reports_the_gated_group(monkeypatch):
@@ -68,6 +70,127 @@ def test_list_disabled_tools_reports_the_gated_group(monkeypatch):
     assert set(um["tools"]) == {"create_user", "update_user", "delete_user"}
     assert um["env"] == "MCP_ENABLE_USER_MANAGEMENT"
     assert um["reason"]  # non-empty, explains the tier
+
+
+# ---- physical_security: lock_control, alarm_control - security review item 5 ------
+#
+# Unlike user_management, this group defaults ON: locks and the alarm panel
+# are a normal reason to run this server, so disabling them by default would
+# break the common case. It is still gated because they are the two tools a
+# prompt-injection payload would most want to reach (see get_live_context()'s
+# docstring). Gated using the exact same mechanism as user_management, so
+# these tests mirror that group's tests one for one.
+
+def test_physical_security_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("MCP_ENABLE_PHYSICAL_SECURITY", raising=False)
+    from tools._base import disabled_tool_names
+
+    assert "lock_control" not in disabled_tool_names()
+    assert "alarm_control" not in disabled_tool_names()
+
+
+def test_physical_security_disabled_when_flag_is_false(monkeypatch):
+    monkeypatch.setenv("MCP_ENABLE_PHYSICAL_SECURITY", "false")
+    from tools._base import disabled_tool_names
+
+    assert disabled_tool_names() >= {"lock_control", "alarm_control"}
+
+
+def test_physical_security_disabled_accepts_0_and_no(monkeypatch):
+    from tools._base import disabled_tool_names
+
+    for falsy in ("0", "no", "FALSE", "No"):
+        monkeypatch.setenv("MCP_ENABLE_PHYSICAL_SECURITY", falsy)
+        assert disabled_tool_names() >= {"lock_control", "alarm_control"}, (
+            f"{falsy!r} should disable the group"
+        )
+
+
+def test_physical_security_explicitly_enabled_confirms_the_default(monkeypatch):
+    from tools._base import disabled_tool_names
+
+    for truthy in ("true", "1", "yes", "TRUE", "Yes"):
+        monkeypatch.setenv("MCP_ENABLE_PHYSICAL_SECURITY", truthy)
+        assert "lock_control" not in disabled_tool_names()
+        assert "alarm_control" not in disabled_tool_names()
+
+
+def test_physical_security_unrecognized_value_fails_closed(monkeypatch):
+    """_group_enabled() treats any non-empty value it does not recognize as
+    truthy the same way as an explicit falsy one - a typo disables the
+    group rather than silently keeping its default. For user_management
+    (default off) that coincides with the default; for physical_security
+    (default ON) it does not, so this is the one place the two groups
+    actually behave differently and is worth its own test."""
+    from tools._base import disabled_tool_names
+
+    monkeypatch.setenv("MCP_ENABLE_PHYSICAL_SECURITY", "garbage")
+    assert disabled_tool_names() >= {"lock_control", "alarm_control"}
+
+
+def test_list_disabled_tools_reports_physical_security(monkeypatch):
+    monkeypatch.setenv("MCP_ENABLE_PHYSICAL_SECURITY", "false")
+    from tools.system import list_config_entries  # noqa: F401
+    from tools._base import list_disabled_tools
+
+    result = list_disabled_tools()
+
+    groups = {g["group"]: g for g in result["groups"]}
+    assert "physical_security" in groups
+    ps = groups["physical_security"]
+    assert ps["enabled"] is False
+    assert set(ps["tools"]) == {"lock_control", "alarm_control"}
+    assert ps["env"] == "MCP_ENABLE_PHYSICAL_SECURITY"
+    assert ps["reason"]
+
+
+def test_gate_keeps_physical_security_tools_by_default():
+    names = _registered_tool_names({})
+
+    assert "lock_control" in names
+    assert "alarm_control" in names
+
+
+def test_gate_removes_physical_security_tools_when_flag_is_false():
+    names = _registered_tool_names({"MCP_ENABLE_PHYSICAL_SECURITY": "false"})
+
+    assert "lock_control" not in names
+    assert "alarm_control" not in names
+    # call_service is deliberately NOT covered by this gate - see
+    # GATED_TOOL_GROUPS["physical_security"]["reason"].
+    assert "call_service" in names
+
+
+# ---- addon_api: call_addon_api - security review item 5 ---------------------------
+#
+# Off by default, and a genuine capability removal when disabled: unlike
+# physical_security, neither call_service nor fire_event can reach the
+# Supervisor's per-add-on API endpoint at all.
+
+def test_addon_api_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("MCP_ENABLE_ADDON_API", raising=False)
+    from tools._base import disabled_tool_names
+
+    assert "call_addon_api" in disabled_tool_names()
+
+
+def test_addon_api_enabled_when_flag_is_true(monkeypatch):
+    monkeypatch.setenv("MCP_ENABLE_ADDON_API", "true")
+    from tools._base import disabled_tool_names
+
+    assert "call_addon_api" not in disabled_tool_names()
+
+
+def test_gate_removes_addon_api_by_default():
+    names = _registered_tool_names({})
+
+    assert "call_addon_api" not in names
+
+
+def test_gate_keeps_addon_api_when_flag_is_set():
+    names = _registered_tool_names({"MCP_ENABLE_ADDON_API": "true"})
+
+    assert "call_addon_api" in names
 
 
 def _registered_tool_names(extra_env: dict) -> set[str]:

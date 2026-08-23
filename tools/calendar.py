@@ -33,6 +33,11 @@ def get_calendar_events(entity_id: str, start: str = "", end: str = "") -> dict:
     end: ISO8601 datetime (default: 7 days from now)
 
     Returns: {total, returned, offset, note?, events: [...]}
+
+    ⚠️ third-party-settable: an event's summary and description come from
+    whoever created it - for a shared calendar, that can be a genuinely
+    third party with no Home Assistant account or LAN access at all. See
+    tools/_base.py's "Third-party-settable fields" note.
     """
     now = datetime.now(timezone.utc)
     start_dt = start or now.isoformat()

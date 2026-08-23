@@ -2,7 +2,13 @@
 # header restano fuori dall'immagine finale, che dimezza di dimensione.
 FROM python:3.13-alpine AS builder
 
-RUN apk add --no-cache gcc musl-dev python3-dev
+# python3-dev deliberately excluded: it pulls in Alpine's own Python
+# interpreter (currently 3.14, into a 3.13 image), redundant since pip
+# already resolves build headers through the running interpreter's own
+# sysconfig - the 3.13 headers this base image ships - and a latent ABI
+# hazard for no benefit, since only /usr/local/lib/python3.13/site-packages
+# is copied into the final stage below.
+RUN apk add --no-cache gcc musl-dev
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt

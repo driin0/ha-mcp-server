@@ -2748,6 +2748,136 @@ def test_list_addons_wraps_a_success(fake_ha, monkeypatch):
     assert result["addons"][0]["slug"] == "core_mosquitto"
 
 
+def test_get_addon_logs_reports_supervisor_unavailable_as_prose_not_a_dict_repr(fake_ha):
+    """Security review M9: get_addon_logs() returns str (its output IS the
+    log), so its error path used to `return str(err)` - a Python dict repr
+    handed to the model as prose ("{'error': 'supervisor_not_available',
+    ...}"), unlike every other error path in this file which returns the
+    error() dict directly. Fixed to the same "code: message" prose
+    get_error_log() already uses for its own str-typed error case."""
+    from tools.addons import get_addon_logs
+
+    result = get_addon_logs("core_mosquitto")
+
+    assert isinstance(result, str)
+    assert result == (
+        "supervisor_not_available: Add-on management requires Home "
+        "Assistant OS or Supervised installation. This feature is not "
+        "available in standalone mode."
+    )
+    assert "{'error'" not in result
+
+
+# ---- tools/addons.py: call_addon_api path-traversal guard -------------------------
+#
+# Security review finding C1 (before publication): `path.lstrip("/")` strips
+# leading slashes and nothing else, and httpx resolves '../' segments and
+# sends the collapsed path on the wire - `call_addon_api(slug="x",
+# path="../../../host/shutdown", method="POST")` reached `POST
+# /host/shutdown` on a real Supervisor proxy with the add-on's own
+# manager-role token attached. These tests exercise the fix: `slug` and
+# `path` are rejected outright on a '..' segment (raw or percent-encoded),
+# and the built URL is independently re-checked to still resolve inside
+# `/addons/{slug}/api/` before anything is sent.
+
+def test_call_addon_api_allows_a_legitimate_call(fake_ha, monkeypatch):
+    from tools import addons
+
+    monkeypatch.setattr(addons, "_SUPERVISOR_BASE", "http://supervisor")
+    # path='/api/devices' -> lstripped to 'api/devices' -> appended after
+    # the tool's own '.../api/' -> the doubled 'api/api/' the docstring's
+    # own examples show; not something this fix changes.
+    fake_ha.rest_responses["/addons/a0d7b954_zigbee2mqtt/api/api/devices"] = (
+        200, {"devices": []})
+
+    result = addons.call_addon_api(slug="a0d7b954_zigbee2mqtt", path="/api/devices")
+
+    assert result == {"devices": []}
+
+
+def test_call_addon_api_rejects_literal_path_traversal(fake_ha, monkeypatch):
+    """The review's own reproduction: a raw '../' sequence that httpx
+    collapses into a request outside the add-on's own API entirely."""
+    from tools import addons
+
+    monkeypatch.setattr(addons, "_SUPERVISOR_BASE", "http://supervisor")
+
+    result = addons.call_addon_api(slug="x", path="../../../host/shutdown", method="POST")
+
+    assert result["error"] == "invalid_path"
+    assert fake_ha.rest_calls == []
+
+
+def test_call_addon_api_rejects_percent_encoded_path_traversal(fake_ha, monkeypatch):
+    """'%2e%2e' decodes to '..' - a plain `'..' in path` check alone would
+    miss this; the decoded form is checked too."""
+    from tools import addons
+
+    monkeypatch.setattr(addons, "_SUPERVISOR_BASE", "http://supervisor")
+
+    result = addons.call_addon_api(slug="x", path="%2e%2e/%2e%2e/%2e%2e/host/shutdown")
+
+    assert result["error"] == "invalid_path"
+    assert fake_ha.rest_calls == []
+
+
+def test_call_addon_api_rejects_traversal_with_an_encoded_slash(fake_ha, monkeypatch):
+    """The '..' segments are literal here; only the separating slashes are
+    percent-encoded ('%2f') - still rejected."""
+    from tools import addons
+
+    monkeypatch.setattr(addons, "_SUPERVISOR_BASE", "http://supervisor")
+
+    result = addons.call_addon_api(slug="x", path="..%2f..%2f..%2fhost%2fshutdown")
+
+    assert result["error"] == "invalid_path"
+    assert fake_ha.rest_calls == []
+
+
+def test_call_addon_api_rejects_traversal_in_an_absolute_path(fake_ha, monkeypatch):
+    """A leading slash goes through path.lstrip("/") before the traversal
+    check runs - confirms that stripping the leading slash does not also
+    strip away the '..' segments behind it."""
+    from tools import addons
+
+    monkeypatch.setattr(addons, "_SUPERVISOR_BASE", "http://supervisor")
+
+    result = addons.call_addon_api(slug="x", path="/../../../host/shutdown")
+
+    assert result["error"] == "invalid_path"
+    assert fake_ha.rest_calls == []
+
+
+def test_call_addon_api_rejects_slug_traversal(fake_ha, monkeypatch):
+    from tools import addons
+
+    monkeypatch.setattr(addons, "_SUPERVISOR_BASE", "http://supervisor")
+
+    result = addons.call_addon_api(slug="../../host", path="devices")
+
+    assert result["error"] == "invalid_slug"
+    assert fake_ha.rest_calls == []
+
+
+def test_call_addon_api_resolved_url_check_blocks_traversal_even_if_the_string_check_is_bypassed(
+    fake_ha, monkeypatch,
+):
+    """Belt and braces, proven independently: with the '..' string check
+    disabled (standing in for a future encoding trick it fails to catch),
+    the second check - resolving the built URL and confirming it still
+    starts with /addons/{slug}/api/ - still blocks the review's own
+    reproduction on its own."""
+    from tools import addons
+
+    monkeypatch.setattr(addons, "_SUPERVISOR_BASE", "http://supervisor")
+    monkeypatch.setattr(addons, "_contains_dotdot", lambda value: False)
+
+    result = addons.call_addon_api(slug="x", path="../../../host/shutdown", method="POST")
+
+    assert result["error"] == "invalid_path"
+    assert fake_ha.rest_calls == []
+
+
 def test_list_tags_wraps_a_success(fake_ha):
     from tools.tags import list_tags
 

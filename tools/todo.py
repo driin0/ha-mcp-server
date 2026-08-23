@@ -55,6 +55,11 @@ def get_todo_items(entity_id: str) -> dict:
     entity_id: e.g. 'todo.shopping_list'
 
     Returns: {total, returned, offset, note?, items: [...]}
+
+    ⚠️ third-party-settable: an item's summary comes from whoever added it -
+    for a shared list, that can be anyone with access to it, not just this
+    installation's owner. See tools/_base.py's "Third-party-settable
+    fields" note.
     """
     items = _todo_items(entity_id)
     if isinstance(items, dict):  # ws_error()
@@ -73,10 +78,12 @@ def add_todo_item(entity_id: str, item: str, description: str = "", due_date: st
     due_date: optional due date in YYYY-MM-DD format
 
     Returns: {entity_id, item, verified} on a call Home Assistant accepted,
-    or {error: "entity_not_found", ...} when entity_id has no state at
-    all. `verified` is true only when an item with this summary is present
-    in get_todo_items() read back after the call - not merely that the
-    call returned 2xx.
+    or an error() envelope - {error: "entity_not_found", ...} when
+    entity_id has no state at all, or {error: "home_assistant_error",
+    status, detail} when Home Assistant rejects the call itself (e.g. a
+    due_date it does not accept). `verified` is true only when an item
+    with this summary is present in get_todo_items() read back after the
+    call - not merely that the call returned 2xx.
     """
     if missing := confirm_entity_exists(entity_id):
         return missing
@@ -92,7 +99,8 @@ def add_todo_item(entity_id: str, item: str, description: str = "", due_date: st
             json=data,
             timeout=10,
         )
-        r.raise_for_status()
+        if err := rest_error(r):
+            return err
 
     items = _todo_items(entity_id)
     if isinstance(items, dict):  # ws_error()
@@ -162,9 +170,12 @@ def remove_todo_item(entity_id: str, item: str) -> dict:
     ⚠️ This is irreversible.
 
     Returns: {entity_id, item, verified} on a call Home Assistant accepted,
-    or {error: "entity_not_found", ...} when entity_id has no state at
-    all. `verified` is true only when no item with this summary remains in
-    get_todo_items() read back after the call.
+    or an error() envelope - {error: "entity_not_found", ...} when
+    entity_id has no state at all, or {error: "home_assistant_error",
+    status, detail} when Home Assistant rejects the call itself (e.g. an
+    item that does not exist under `item`). `verified` is true only when
+    no item with this summary remains in get_todo_items() read back after
+    the call.
     """
     if missing := confirm_entity_exists(entity_id):
         return missing
@@ -175,7 +186,8 @@ def remove_todo_item(entity_id: str, item: str) -> dict:
             json={"entity_id": entity_id, "item": item},
             timeout=10,
         )
-        r.raise_for_status()
+        if err := rest_error(r):
+            return err
 
     items = _todo_items(entity_id)
     if isinstance(items, dict):  # ws_error()

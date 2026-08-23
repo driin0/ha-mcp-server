@@ -1460,6 +1460,27 @@ def test_add_todo_item_reports_accepted_but_unverified(fake_ha):
     assert result["verified"] is False
 
 
+def test_add_todo_item_reports_a_rejected_call_as_an_error_not_a_crash(fake_ha):
+    """Security review item 7 (leftover from a previous wave): a due_date
+    Home Assistant does not accept makes todo/add_item reject the call
+    itself with a non-2xx REST response. The old code had no try/except
+    around r.raise_for_status(), so this propagated as an uncaught
+    HTTPStatusError instead of the error() envelope every sibling in this
+    file returns - same fix as update_todo_item, its already-fixed
+    sibling."""
+    from tools.todo import add_todo_item
+
+    fake_ha.states = [{"entity_id": "todo.shopping_list", "state": "0", "attributes": {}}]
+    fake_ha.fail_rest("/api/services/todo/add_item", status=400,
+                      message="Bad Request")
+
+    result = add_todo_item("todo.shopping_list", "Milk", due_date="not-a-date")
+
+    assert result["error"] == "home_assistant_error"
+    assert result["status"] == 400
+    assert "verified" not in result
+
+
 def test_update_todo_item_matches_by_uid_or_summary(fake_ha):
     from tools.todo import update_todo_item
 
@@ -1503,6 +1524,27 @@ def test_remove_todo_item_verifies_absence(fake_ha):
     result = remove_todo_item("todo.shopping_list", "Milk")
 
     assert result["verified"] is True
+
+
+def test_remove_todo_item_reports_a_rejected_call_as_an_error_not_a_crash(fake_ha):
+    """Security review item 7 (leftover from a previous wave): an item that
+    does not exist under `item` makes todo/remove_item reject the call
+    itself with a non-2xx REST response. The old code had no try/except
+    around r.raise_for_status(), so this propagated as an uncaught
+    HTTPStatusError instead of the error() envelope every sibling in this
+    file returns - same fix as update_todo_item, its already-fixed
+    sibling."""
+    from tools.todo import remove_todo_item
+
+    fake_ha.states = [{"entity_id": "todo.shopping_list", "state": "1", "attributes": {}}]
+    fake_ha.fail_rest("/api/services/todo/remove_item", status=500,
+                      message="Server got itself in trouble")
+
+    result = remove_todo_item("todo.shopping_list", "NoSuchItemXYZ")
+
+    assert result["error"] == "home_assistant_error"
+    assert result["status"] == 500
+    assert "verified" not in result
 
 
 # ---- tools/calendar.py: add_calendar_event ---------------------------------------
@@ -1719,6 +1761,29 @@ def test_send_tts_skips_engine_check_for_alexa_players(fake_ha):
     assert result["accepted"] is True
 
 
+def test_send_tts_reports_a_rejected_call_as_an_error_not_a_crash(fake_ha):
+    """Security review item 7 (leftover from a previous wave): send_tts()
+    had no try/except around r.raise_for_status(), so a call Home Assistant
+    rejects itself (a malformed notify service call, a TTS engine that
+    refuses the payload) propagated as an uncaught HTTPStatusError instead
+    of the error() envelope every sibling in this file already returns.
+    Same fix as update_todo_item/add_calendar_event: rest_error()."""
+    from tools.media_players import send_tts
+
+    fake_ha.states = [
+        {"entity_id": "media_player.kitchen", "state": "idle", "attributes": {}},
+        {"entity_id": "tts.google_translate", "state": "idle", "attributes": {}},
+    ]
+    fake_ha.fail_rest("/api/services/tts/speak", status=500,
+                      message="Server got itself in trouble")
+
+    result = send_tts("media_player.kitchen", "hello")
+
+    assert result["error"] == "home_assistant_error"
+    assert result["status"] == 500
+    assert "accepted" not in result
+
+
 def test_media_player_control_reports_a_nonexistent_target(fake_ha):
     from tools.media_players import media_player_control
 
@@ -1750,6 +1815,28 @@ def test_media_player_control_rejects_an_unknown_command(fake_ha):
     result = media_player_control("media_player.kitchen", "levitate")
 
     assert result["error"] == "invalid_command"
+
+
+def test_media_player_control_reports_a_rejected_call_as_an_error_not_a_crash(fake_ha):
+    """Security review item 7 (leftover from a previous wave): a volume
+    outside 0.0-1.0, or any other payload Home Assistant rejects itself,
+    makes media_player/volume_set answer with a non-2xx REST response -
+    the old code had no try/except around r.raise_for_status(), so this
+    propagated as an uncaught HTTPStatusError instead of the error()
+    envelope every other failure path in this file returns."""
+    from tools.media_players import media_player_control
+
+    fake_ha.states = [
+        {"entity_id": "media_player.kitchen", "state": "playing", "attributes": {}},
+    ]
+    fake_ha.fail_rest("/api/services/media_player/volume_set", status=400,
+                      message="Bad Request")
+
+    result = media_player_control("media_player.kitchen", "volume", volume=1.5)
+
+    assert result["error"] == "home_assistant_error"
+    assert result["status"] == 400
+    assert "accepted" not in result
 
 
 def test_search_and_play_media_reports_a_nonexistent_target(fake_ha):

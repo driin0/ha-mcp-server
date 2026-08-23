@@ -14,7 +14,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response as StarletteResponse
 from starlette.routing import Route
 
-from tools._base import HA_INGRESS_MODE, HA_URL, HEADERS, MCP_ALLOW_NO_AUTH, MCP_PORT, MCP_SECRET, UI_SECRET, mcp
+from tools._base import HA_INGRESS_MODE, HA_URL, HEADERS, MCP_PORT, MCP_SECRET, UI_ALLOW_NO_AUTH, UI_SECRET, mcp
 import stats as _stats
 
 START_TIME = datetime.now(timezone.utc)
@@ -106,6 +106,23 @@ async def status_json(request: Request) -> JSONResponse:
     })
 
 
+def _json_for_script(value) -> str:
+    """json.dumps(), safe to embed inside a <script> block.
+
+    json.dumps() escapes quotes and backslashes but not the two characters
+    "</" - a string value containing them can close the surrounding
+    <script> element early and inject markup after it. index() below embeds
+    X-Ingress-Path this way; that header is set by the HA Supervisor in the
+    normal case, but this function does not assume that is the only way it
+    is ever reached (a reverse proxy, a future caller) and escapes
+    unconditionally rather than trusting the source. Escaping the slash as
+    "\\/" keeps the value valid JSON - "<\\/script>" still parses back to
+    the string "</script>" - so nothing downstream that expects JSON.parse-
+    compatible output changes.
+    """
+    return json.dumps(value).replace("</", "<\\/")
+
+
 def _render_items(items: list) -> str:
     if not items:
         return '<p class="empty">None</p>'
@@ -158,7 +175,7 @@ def _render_errors(errors: list) -> str:
 
 async def index(request: Request) -> HTMLResponse:
     ingress_path = request.headers.get("X-Ingress-Path", "").rstrip("/")
-    api_url_js = json.dumps(f"{ingress_path}/api/status")
+    api_url_js = _json_for_script(f"{ingress_path}/api/status")
 
     uptime_seconds = int((datetime.now(timezone.utc) - START_TIME).total_seconds())
     h, rem = divmod(uptime_seconds, 3600)
@@ -643,12 +660,19 @@ if HA_INGRESS_MODE:
     pass
 elif UI_SECRET:
     app.add_middleware(BasicAuthMiddleware, secret=UI_SECRET)
-elif not MCP_ALLOW_NO_AUTH:
+elif not UI_ALLOW_NO_AUTH:
     raise RuntimeError(
-        "UI_SECRET is not set and MCP_SECRET is empty. Set UI_SECRET (or MCP_SECRET) "
-        "to a strong random token, set HA_INGRESS_MODE=true when running behind HA "
-        "Ingress, or set MCP_ALLOW_NO_AUTH=true to expose the status UI without "
-        "authentication (trusted networks only)."
+        "UI_SECRET is not set, so the status dashboard would be served with no "
+        "authentication at all. It no longer falls back to MCP_SECRET - the "
+        "dashboard sends its password as HTTP Basic, base64-encoded and "
+        "unencrypted, so reusing the MCP bearer token there would hand a passive "
+        "LAN observer the full-admin credential from a single page load. Set "
+        "UI_SECRET to its own strong random token (openssl rand -base64 32), set "
+        "HA_INGRESS_MODE=true when running behind HA Ingress (which authenticates "
+        "upstream), or set UI_ALLOW_NO_AUTH=true to explicitly expose the dashboard "
+        "without authentication (trusted networks only). This is a separate "
+        "decision from MCP_ALLOW_NO_AUTH, which concerns only the MCP endpoint and "
+        "does not affect the dashboard."
     )
 
 

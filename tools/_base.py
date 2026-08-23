@@ -95,6 +95,30 @@ never appears in the model's menu in the first place. See
 GATED_TOOL_GROUPS/disabled_tool_names()/apply_registration_gate() below, and
 list_disabled_tools() for how that absence stays discoverable rather than a
 silent capability gap.
+
+## Third-party-settable fields
+
+Some fields this codebase reads back and hands to a model are not this
+installation's own data - they are set by whoever can name a device, cast
+to a speaker, or write to a shared calendar, with no Home Assistant account
+and often no LAN access at all: a guest's phone naming itself over
+Bluetooth, anyone who can cast to a media player, a persistent-notification
+body, a third-party shared calendar's event text. That text reaches the
+model's context verbatim, unmarked, the same as anything this installation's
+own owner typed - this server has no way to tell the two apart, and does not
+try to; detecting prompt injection from inside the thing being injected into
+is not a problem this layer can solve.
+
+What it CAN do is say plainly, in the docstring of a tool whose result
+carries one of these fields, which fields they are - `name` (an entity's
+`friendly_name`), `media_title`/`media_artist`, `message` (a notification
+body) - so a client that wants to treat them as untrusted input has
+something in the response shape to act on, rather than having to guess
+which of a dozen string fields might be attacker-controlled. Marked with
+"⚠️ third-party-settable:" in the tools below that carry one of these
+fields; see get_live_context()'s docstring (tools/diagnostics.py) for the
+one that carries the most of them at once, since it is also the tool most
+client integrations call first.
 """
 import asyncio
 import json
@@ -113,16 +137,39 @@ HA_TOKEN = os.getenv("HA_TOKEN", "")
 MCP_PORT = int(os.getenv("MCP_PORT", "47821"))
 MCP_SECRET = os.getenv("MCP_SECRET", "")
 MCP_ALLOW_NO_AUTH = os.getenv("MCP_ALLOW_NO_AUTH", "").lower() in ("1", "true", "yes")
-UI_SECRET = os.getenv("UI_SECRET", "") or MCP_SECRET
+# Deliberately NOT `or MCP_SECRET`: the dashboard sends this as HTTP Basic,
+# base64-encoded and unencrypted (this project ships no TLS) - defaulting it
+# to the MCP bearer token meant a passive LAN observer who saw one dashboard
+# page load recovered the same, full-admin credential the MCP endpoint
+# accepts. The two are independent secrets now; see web.py's own guard for
+# what happens when this is left unset (refuse to start, unless
+# HA_INGRESS_MODE or UI_ALLOW_NO_AUTH says otherwise).
+UI_SECRET = os.getenv("UI_SECRET", "")
+# A separate opt-in from MCP_ALLOW_NO_AUTH: that flag only suppresses the
+# RuntimeError below, about the MCP endpoint (where tools are called). The
+# dashboard (read-only status/stats, no tool-calling surface) is a different
+# thing to authenticate and needs its own explicit decision - see web.py's
+# own guard, which used to (wrongly) accept MCP_ALLOW_NO_AUTH for this too.
+UI_ALLOW_NO_AUTH = os.getenv("UI_ALLOW_NO_AUTH", "").lower() in ("1", "true", "yes")
 HA_INGRESS_MODE = os.getenv("HA_INGRESS_MODE", "").lower() in ("1", "true", "yes")
+# Extra hostnames/IPs (bare, no scheme or port) the MCP endpoint may legitimately
+# be reached at - beyond localhost, which is always allowed. See server.py's
+# OriginHostMiddleware for how this is used; comma-separated, e.g.
+# "192.168.1.50,homeassistant.local".
+MCP_ALLOWED_HOSTS = os.getenv("MCP_ALLOWED_HOSTS", "")
 
 if not HA_URL or not HA_TOKEN:
     raise RuntimeError("HA_URL and HA_TOKEN must be set in .env")
 
 if not MCP_SECRET and not MCP_ALLOW_NO_AUTH:
     raise RuntimeError(
-        "MCP_SECRET is not set. Set it to a strong random token (openssl rand -base64 32) "
-        "or set MCP_ALLOW_NO_AUTH=true to explicitly run without authentication (trusted networks only)."
+        "MCP_SECRET is not set, so the MCP endpoint - where tools are called, with "
+        "full control over Home Assistant - would accept every request with no "
+        "authentication at all. Set MCP_SECRET to a strong random token (openssl rand "
+        "-base64 32), or set MCP_ALLOW_NO_AUTH=true to explicitly run the MCP endpoint "
+        "without authentication (trusted networks only). This flag concerns ONLY the "
+        "MCP endpoint: the status dashboard is authenticated separately, by UI_SECRET "
+        "(or UI_ALLOW_NO_AUTH) - see web.py's own startup check."
     )
 
 HEADERS = {
@@ -695,6 +742,28 @@ def verified_allowing_transit(obs: dict, transitional_states: frozenset) -> bool
 # upgrading from v1.1.0 must not find capabilities gone with no error, only
 # absence. See list_disabled_tools() below for how the absence that DOES
 # happen (user_management, until explicitly enabled) stays discoverable.
+#
+# "physical_security" is a second exception to that "stays enabled" rule,
+# but in the opposite direction: it defaults ON, not off. Locks and the
+# alarm panel are a normal, common reason to run this server at all -
+# unlike creating a login account - so defaulting them off would break the
+# ordinary case. They are gated (unlike other actuators) because they are
+# also the two tools a prompt-injection payload would most want to reach:
+# get_live_context() (tools/diagnostics.py) - the tool most clients call
+# first - carries attacker-settable text (an entity's own friendly_name,
+# a cast speaker's media_title) into the model's context before any tool
+# is ever invoked. Gating gives an operator who is uneasy about that a
+# one-flag way to remove the two highest-value physical targets, without
+# changing the default anyone upgrading depends on.
+#
+# "addon_api" (call_addon_api) defaults OFF: it is a generic proxy into
+# whatever HTTP API an installed add-on exposes - useful to few
+# installations, not why anyone runs this server, and the docstring already
+# asks a caller to treat an unfamiliar add-on's API as untrusted before
+# using anything but GET. call_addon_api validates its own slug/path
+# against escaping its own add-on's API (see tools/addons.py) independently
+# of this gate, so this is defense in depth, not the only thing standing
+# between a caller and the Supervisor.
 GATED_TOOL_GROUPS: dict[str, dict] = {
     "user_management": {
         "tools": {"create_user", "update_user", "delete_user"},
@@ -705,6 +774,39 @@ GATED_TOOL_GROUPS: dict[str, dict] = {
             "different risk tier from controlling entities, and the tier "
             "where a disguised request (\"add a maintenance user\") is "
             "really a privileged account-management action."
+        ),
+    },
+    "physical_security": {
+        "tools": {"lock_control", "alarm_control"},
+        "env": "MCP_ENABLE_PHYSICAL_SECURITY",
+        "default": True,
+        "reason": (
+            "locks and the alarm panel - unlike user management, a normal "
+            "reason to run this server, so enabled by default. Gated "
+            "because they are the two tools a prompt-injection payload "
+            "(e.g. a cast speaker's media_title, an entity's own "
+            "friendly_name - see get_live_context()'s docstring) would "
+            "most want to reach. CAVEAT: call_service can invoke "
+            "lock.unlock and alarm_control_panel.disarm directly and is "
+            "not covered by this or any gate, so disabling this group "
+            "removes the named, discoverable tool - it does not remove "
+            "the underlying capability from a caller willing to use "
+            "call_service instead. Set MCP_ENABLE_PHYSICAL_SECURITY=false "
+            "to remove the named tools anyway."
+        ),
+    },
+    "addon_api": {
+        "tools": {"call_addon_api"},
+        "env": "MCP_ENABLE_ADDON_API",
+        "default": False,
+        "reason": (
+            "a generic HTTP proxy into an installed add-on's own HTTP API "
+            "- few installations need a language model to have this, and "
+            "unlike locks or the alarm panel it is not why most people "
+            "run this server, so disabled by default. Unlike "
+            "physical_security, call_service and fire_event cannot reach "
+            "the Supervisor's add-on-proxy endpoint at all, so this gate "
+            "is a genuine capability removal, not just a named shortcut."
         ),
     },
 }
@@ -779,21 +881,38 @@ def list_disabled_tools() -> dict:
     while the actual registration - decided once, at startup - has not
     moved: restart the server for a changed flag to take effect.
 
-    call_service, fire_event and call_addon_api are deliberately absent
-    from every group and from this list: they are generic passthroughs
-    (any HA service, any event, any add-on's own HTTP API) that a
-    named-tool gate cannot cover without also restricting them specifically
-    - gating create_user while leaving call_service enabled would be
-    decorative if call_service could reach the same WebSocket command, so
-    this was checked directly rather than assumed: Home Assistant's user
-    and person registries (config/auth/*, person/*) are WebSocket-only
-    config commands, not services, and call_service only proxies POST
-    /api/services/{domain}/{service} - there is no domain/service that
-    creates, edits or deletes a login account or a person for it to reach.
-    fire_event and call_addon_api touch neither registry. A future group
-    gating something call_service CAN reach (e.g. lock_control, which
-    lock.unlock duplicates exactly) would need to restrict call_service
-    too, or it would be exactly that decorative gate.
+    call_service and fire_event are deliberately absent from every group
+    and from this list: they are generic passthroughs (any HA service, any
+    event) that a named-tool gate cannot cover without also restricting
+    them specifically. This was checked directly rather than assumed, group
+    by group:
+
+    - user_management: Home Assistant's user and person registries
+      (config/auth/*, person/*) are WebSocket-only config commands, not
+      services, and call_service only proxies POST
+      /api/services/{domain}/{service} - there is no domain/service that
+      creates, edits or deletes a login account or a person for it to
+      reach. Disabling this group is a genuine capability removal.
+    - physical_security: NOT the same story. call_service CAN invoke
+      lock.lock/unlock/open and every alarm_control_panel.* service
+      directly - lock_control and alarm_control are convenience wrappers
+      around exactly those calls. Disabling this group removes the named,
+      discoverable tools from an MCP client's tools/list, which is real
+      value against an injection that names a tool by its obvious name or
+      against a client that only calls what it can see - but it does NOT
+      remove the capability from a caller willing to use call_service
+      instead. See GATED_TOOL_GROUPS["physical_security"]["reason"] for
+      the same caveat, and this docstring's own earlier note (now acted
+      on) that a gate on something call_service can reach needs restricting
+      call_service too to be more than decorative - here it deliberately
+      is not, because locks/alarm are common enough that gating
+      call_service itself would break far more than it protects; the
+      named-tool removal is offered as a lighter, honestly-scoped middle
+      ground instead.
+    - addon_api: call_addon_api proxies to the Supervisor's per-add-on API
+      endpoint, which call_service and fire_event touch not at all - no
+      HA service or event reaches it. Disabling this group is a genuine
+      capability removal, like user_management.
     """
     groups = []
     for group, spec in sorted(GATED_TOOL_GROUPS.items()):

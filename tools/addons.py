@@ -1,4 +1,5 @@
 import os
+import urllib.parse
 
 import httpx
 
@@ -26,6 +27,25 @@ def _check_supervisor():
             ),
         }
     return None
+
+
+def _contains_dotdot(value: str) -> bool:
+    """True if `value` carries a '..' path segment, raw or percent-encoded.
+
+    Checked against both the raw string and its percent-decoded form,
+    unquoted up to three times so a double- or triple-encoded ``%252e%252e``
+    is caught too, not just a single ``%2e%2e``. Three is generous — one
+    extra pass beyond a single level of encoding is already more than any
+    legitimate caller would produce — and bounded so a pathological input
+    cannot loop.
+    """
+    decoded = value
+    for _ in range(3):
+        new = urllib.parse.unquote(decoded)
+        if new == decoded:
+            break
+        decoded = new
+    return ".." in value or ".." in decoded
 
 
 @mcp.tool()
@@ -208,7 +228,13 @@ def get_addon_logs(slug: str, lines: int = 100) -> str:
     """
     err = _check_supervisor()
     if err:
-        return str(err)
+        # This tool returns str (its output IS the log), so a dict error()
+        # envelope cannot be returned directly - str(err) used to hand the
+        # model a Python dict repr as prose ("{'error': ..., 'detail':
+        # ...}"). Formatted as "code: message" instead, the same prose
+        # convention get_error_log() (tools/diagnostics.py) already uses
+        # for its own str-typed error case.
+        return f"{err['error']}: {err['detail']}"
     with httpx.Client() as client:
         r = client.get(f"{_SUPERVISOR_BASE}/addons/{slug}/logs", headers=_SUPERVISOR_HEADERS, timeout=15)
         r.raise_for_status()
@@ -266,23 +292,59 @@ def call_addon_api(
 
     Requires: Home Assistant OS or Supervised installation.
 
-    ⚠️ This is a generic HTTP proxy into whatever the add-on's own API
-    exposes - method=PUT/POST/DELETE can change or delete data the add-on
-    manages (a Zigbee2MQTT device pairing, a Node-RED flow) with no
-    verification here of what that path actually does; this tool has no
-    way to know. Treat an unfamiliar add-on's API as untrusted before
-    calling it with anything other than GET.
+    ⚠️ This is a proxy into the *named add-on's own* HTTP API and nothing
+    else - `slug` and `path` are rejected outright if either carries a
+    '..' path segment (raw or percent-encoded), and the request URL is
+    then re-checked after being built to confirm it still resolves inside
+    `/addons/{slug}/api/` before anything is sent. That is what keeps this
+    scoped to one add-on's API rather than the Supervisor API as a whole -
+    the Supervisor proxy that serves this endpoint carries a manager-role
+    token in the Home Assistant app deployment, and `/host/shutdown`,
+    `/backups/{slug}/download` (the whole configuration, secrets.yaml
+    included) and `/store/addons/{slug}/install` (arbitrary add-on
+    install) all sit on that same token one path segment away. Within the
+    named add-on's own API, method=PUT/POST/DELETE can still change or
+    delete data the add-on manages (a Zigbee2MQTT device pairing, a
+    Node-RED flow) with no verification here of what that path actually
+    does; this tool has no way to know. Treat an unfamiliar add-on's API
+    as untrusted before calling it with anything other than GET.
 
     Returns: the add-on's own JSON response, or {text, status_code} when
     the response body is not JSON. Passed through unexamined, like
     call_service() - this tool does not know the add-on's response shape
     any more than call_service() knows a Home Assistant service's.
+    Returns {error: "invalid_slug"/"invalid_path", ...} instead of making
+    any request when `slug` or `path` fails the checks above.
     """
     err = _check_supervisor()
     if err:
         return err
+    if _contains_dotdot(slug):
+        return error("invalid_slug",
+                     f"slug must not contain a '..' path segment: {slug!r}")
     path = path.lstrip("/")
-    url = f"{_SUPERVISOR_BASE}/addons/{slug}/api/{path}"
+    if _contains_dotdot(path):
+        return error("invalid_path",
+                     f"path must not contain a '..' path segment: {path!r}")
+
+    expected_prefix = f"/addons/{slug}/api/"
+    url = f"{_SUPERVISOR_BASE}{expected_prefix}{path}"
+    # Belt and braces: the checks above reject the traversal itself, this
+    # confirms where the request actually resolves to - httpx (like a
+    # browser) collapses '../' segments when a URL is built from one, so a
+    # dot-segment sequence that neither check above caught would still be
+    # visible here as a resolved path that has left expected_prefix. See
+    # this module's earlier version (and the security review that found
+    # it) for why relying on the string checks alone was not enough: they
+    # are what a future encoding trick could slip past, not what decides
+    # where the request goes.
+    resolved_path = httpx.URL(url).path
+    if not resolved_path.startswith(expected_prefix) or ".." in resolved_path:
+        return error(
+            "invalid_path",
+            f"Resolved request path {resolved_path!r} would leave the "
+            f"add-on's own API ({expected_prefix}...) - refusing to send it.",
+        )
     with httpx.Client() as client:
         if method.upper() == "GET":
             r = client.get(url, headers=_SUPERVISOR_HEADERS, timeout=15)

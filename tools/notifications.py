@@ -409,6 +409,11 @@ def list_persistent_notifications() -> dict:
 
     Returns: {total, returned, offset, note?, notifications: [{notification_id,
              title, message, created_at}]}
+
+    ⚠️ third-party-settable: `title` and `message` come from whatever called
+    persistent_notification.create - any integration, any automation, not
+    necessarily this installation's owner. See tools/_base.py's
+    "Third-party-settable fields" note.
     """
     result = _ws({"type": "persistent_notification/get"})
     if err := ws_error(result):

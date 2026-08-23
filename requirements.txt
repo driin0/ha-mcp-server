@@ -1,4 +1,12 @@
 mcp[cli]>=2,<3
-httpx>=0.27.0
+# Upper bound deliberate, not habitual: call_addon_api's path-traversal fix
+# (tools/addons.py) depends on httpx's own URL dot-segment normalisation
+# behaving the way it was verified to here - an unbounded requirement let a
+# future httpx release change that out from under a security fix with no
+# signal at install time. Bumping this bound is a decision, not a routine
+# dependency update - re-verify tests/test_tools_shape.py's call_addon_api
+# tests (and ideally the echo-server reproduction the fix's commit message
+# describes) against the new version first.
+httpx>=0.27.0,<0.29.0
 python-dotenv>=1.0.0
 websockets>=13.0

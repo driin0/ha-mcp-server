@@ -26,7 +26,12 @@ def get_config() -> dict:
 
 @mcp.tool()
 def get_entity(entity_id: str) -> dict:
-    """Get the current state and attributes of a single entity by entity_id."""
+    """Get the current state and attributes of a single entity by entity_id.
+
+    ⚠️ third-party-settable: `attributes.friendly_name` is settable by any
+    integration that names its own entities, not just this installation's
+    owner - see tools/_base.py's "Third-party-settable fields" note.
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
         r.raise_for_status()
@@ -49,6 +54,10 @@ def get_states_by_domain(domain: str) -> dict:
 
     Returns: {total, returned, offset, note?, entities: [{entity_id, name,
              state, attributes, last_changed}]}
+
+    ⚠️ third-party-settable: `name` is an entity's `friendly_name`, settable
+    by any integration that names its own entities - see tools/_base.py's
+    "Third-party-settable fields" note.
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -400,6 +409,15 @@ def get_live_context() -> dict:
     Includes: who's home, lights on, alarm state, active media players,
     open covers, climate summary, and any active alerts/warnings.
     Useful as a quick situational overview before issuing commands.
+
+    ⚠️ third-party-settable: every `name` field here is an entity's
+    `friendly_name` - settable by any integration that names its own
+    entities (a guest's phone, a Chromecast), not just this installation's
+    owner. `media_title`/`media_artist` are settable by anyone who can cast
+    to a speaker, no Home Assistant account or LAN credentials required.
+    Both channels can carry arbitrary text into a model's context; see
+    tools/_base.py's "Third-party-settable fields" note for what this means
+    and why this server does not try to detect or filter it.
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -680,6 +698,10 @@ def search_entities(
         domain='light', state='on'
       Find entities carrying a given label:
         label='outdoor'
+
+    ⚠️ third-party-settable: `name` is an entity's `friendly_name`, settable
+    by any integration that names its own entities - see tools/_base.py's
+    "Third-party-settable fields" note.
     """
     # Fetch states and entity registry in parallel
     ws_result = _ws({"type": "config/entity_registry/list"})

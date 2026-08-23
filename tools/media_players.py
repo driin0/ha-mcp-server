@@ -1,7 +1,8 @@
 import httpx
 
 from tools._base import (
-    mcp, HA_URL, HEADERS, ALEXA_KEYWORDS, default_language, _ws, confirm_entity_exists, envelope, error, ws_error,
+    mcp, HA_URL, HEADERS, ALEXA_KEYWORDS, default_language, _ws, confirm_entity_exists, envelope, error,
+    rest_error, ws_error,
 )
 
 
@@ -11,6 +12,12 @@ def list_media_players() -> dict:
     List all media player entities with current state.
 
     Returns: {total, returned, offset, note?, media_players: [...]}
+
+    ⚠️ third-party-settable: `name` is an entity's `friendly_name`, settable
+    by any integration that names its own entities; `media_title`/
+    `media_artist` are settable by anyone who can cast to the speaker, no
+    Home Assistant account or LAN credentials required. See tools/_base.py's
+    "Third-party-settable fields" note.
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -51,9 +58,11 @@ def send_tts(entity_id: str, message: str, language: str = "", engine: str = "tt
     to match speaker groups named after a room or the household.
 
     Returns: {entity_id, message, method, accepted: true, verified: null,
-    detail} once Home Assistant accepts the call, or
+    detail} once Home Assistant accepts the call, or an error() envelope -
     {error: "entity_not_found", ...} when entity_id (or, for a non-Alexa
-    player, `engine`) has no state at all. `tts.speak` accepts a
+    player, `engine`) has no state at all, or {error: "home_assistant_error",
+    status, detail} when Home Assistant rejects the call itself (e.g. a
+    malformed notify service call). `tts.speak` accepts a
     nonexistent engine entity_id exactly like any other target that does
     not exist — a 200 [] no-op, the same shape as a real announcement
     queued — so `engine` is confirmed to exist before the call is made for
@@ -93,7 +102,8 @@ def send_tts(entity_id: str, message: str, language: str = "", engine: str = "tt
                 },
                 timeout=15,
             )
-        r.raise_for_status()
+        if err := rest_error(r):
+            return err
     return {
         "entity_id": entity_id,
         "message": message,
@@ -131,8 +141,10 @@ def media_player_control(
       - 'play_media'  play specific media (requires media_content_id, optional media_content_type)
 
     Returns: {command, entity_id, accepted: true, verified: null, detail}
-    once Home Assistant accepts the call, or {error: "entity_not_found"/
-    "invalid_command", ...} otherwise.
+    once Home Assistant accepts the call, or an error() envelope -
+    {error: "entity_not_found"/"invalid_command", ...}, or
+    {error: "home_assistant_error", status, detail} when Home Assistant
+    rejects the call itself (e.g. a volume outside 0.0-1.0).
 
     `verified` stays null rather than checked against the player's state:
     the media_player domain spans dozens of unrelated integrations (a
@@ -173,7 +185,8 @@ def media_player_control(
         else:
             return error("invalid_command", f"Unknown command or missing parameters: {command}",
                          entity_id=entity_id, command=command)
-        r.raise_for_status()
+        if err := rest_error(r):
+            return err
     return {
         "command": command,
         "entity_id": entity_id,
