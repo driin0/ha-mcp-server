@@ -38,6 +38,9 @@ def create_tag(name: str, tag_id: str = "") -> dict:
     or write it to a physical NFC sticker.
     Use create_automation() to trigger actions when the tag is scanned:
       trigger: [{"platform": "tag", "tag_id": "<id>"}]
+
+    Returns the created tag object from Home Assistant, or an error()
+    envelope on failure.
     """
     msg: dict = {"type": "tag/create", "name": name}
     if tag_id:
@@ -55,6 +58,10 @@ def update_tag(tag_id: str, name: str) -> dict:
 
     tag_id: tag ID (use list_tags() to find it)
     name:   new display name
+
+    Returns the updated tag object from Home Assistant (or
+    {tag_id, name} when Home Assistant's response is empty), or an
+    error() envelope on failure.
     """
     result = _ws({"type": "tag/update", "tag_id": tag_id, "name": name})
     if err := ws_error(result):
@@ -68,6 +75,12 @@ def delete_tag(tag_id: str) -> dict:
     Delete an NFC tag.
 
     tag_id: tag ID (use list_tags() to find it)
+
+    ⚠️ This is irreversible. Any automation triggered by this tag_id stops
+    matching a scan until a new tag with that id is created.
+
+    Returns: {deleted: tag_id, success: true} on success, or an error()
+    envelope with Home Assistant's actual error code/message on failure.
     """
     result = _ws({"type": "tag/delete", "tag_id": tag_id})
     if err := ws_error(result):

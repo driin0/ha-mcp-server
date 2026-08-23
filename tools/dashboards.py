@@ -90,6 +90,9 @@ def create_dashboard(
     require_admin:   restrict access to admins only (default: False)
 
     After creating, use update_dashboard_config() to populate views and cards.
+
+    Returns the created dashboard object from Home Assistant, or an
+    error() envelope on failure.
     """
     msg: dict = {
         "type": "lovelace/dashboards/create",
@@ -122,6 +125,10 @@ def update_dashboard(
     Only fields with non-None/non-empty values are updated.
 
     To update the actual views and cards content, use update_dashboard_config() instead.
+
+    Returns the updated dashboard object from Home Assistant, or an
+    error() envelope ("not_found" when url_path does not exist, or Home
+    Assistant's own error otherwise) on failure.
     """
     dashboard_id, err = _dashboard_id(url_path)
     if err:
@@ -166,7 +173,12 @@ def update_dashboard_config(url_path: str, config: dict) -> dict:
     }
 
     ⚠️ This REPLACES the entire dashboard config. Call get_dashboard() first
-    to read the current config if you want to make incremental changes.
+    to read the current config if you want to make incremental changes -
+    this is not undoable once saved, other than by writing the previous
+    config back.
+
+    Returns: {saved: true, url_path} on success, or an error() envelope
+    with Home Assistant's actual error code/message on failure.
     """
     msg: dict = {"type": "lovelace/config/save", "config": config}
     if url_path:
@@ -184,6 +196,12 @@ def delete_dashboard(url_path: str) -> dict:
 
     url_path: dashboard URL path (use list_dashboards() to find url_paths).
     Note: the default dashboard cannot be deleted.
+
+    ⚠️ This is irreversible. The dashboard's views and card layout are gone.
+
+    Returns: {deleted: url_path, success: true} on success, or an error()
+    envelope ("not_found" when url_path does not exist, or Home
+    Assistant's own error otherwise) on failure.
     """
     dashboard_id, err = _dashboard_id(url_path)
     if err:
@@ -235,6 +253,10 @@ def add_lovelace_resource(url: str, resource_type: str = "module") -> dict:
 
     After adding a JS module, reload the browser to load the new card.
     Note: HACS-installed cards are added automatically — use this for manual installs.
+
+    Returns the created resource object from Home Assistant (or
+    {added: true, url, type} when Home Assistant's response is empty), or
+    an error() envelope on failure.
     """
     result = _ws({"type": "lovelace/resources/create", "url": url, "res_type": resource_type})
     if err := ws_error(result):
@@ -248,6 +270,14 @@ def remove_lovelace_resource(resource_id: int) -> dict:
     Remove a Lovelace frontend resource by its ID.
 
     resource_id: integer ID (use list_lovelace_resources() to find IDs)
+
+    ⚠️ This is irreversible. Any dashboard card relying on this resource
+    (a custom card's JS, a theme's CSS) stops rendering until it is
+    re-added.
+
+    Returns: {deleted: resource_id, success: true} on success, or an
+    error() envelope with Home Assistant's actual error code/message on
+    failure.
     """
     result = _ws({"type": "lovelace/resources/delete", "id": resource_id})
     if err := ws_error(result):

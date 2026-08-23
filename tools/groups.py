@@ -181,6 +181,9 @@ def delete_group(entity_id: str) -> dict:
     Note: only groups created via the 'group.set' service can be deleted this way.
     YAML-defined groups (in groups.yaml) must be removed manually from the file.
 
+    ⚠️ This is irreversible: the group and its membership list are gone
+    (recreate it with create_group() using the same members if needed).
+
     Returns: {entity_id, verified} on a call Home Assistant accepted, or
     {error: "entity_not_found", ...} when entity_id had no state even
     before the call — nothing to delete. `verified` is true only when

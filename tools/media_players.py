@@ -52,15 +52,24 @@ def send_tts(entity_id: str, message: str, language: str = "", engine: str = "tt
 
     Returns: {entity_id, message, method, accepted: true, verified: null,
     detail} once Home Assistant accepts the call, or
-    {error: "entity_not_found", ...} when entity_id has no state at all.
-    Whether the announcement was actually heard has no state in Home
-    Assistant to read back, so `verified` stays null.
+    {error: "entity_not_found", ...} when entity_id (or, for a non-Alexa
+    player, `engine`) has no state at all. `tts.speak` accepts a
+    nonexistent engine entity_id exactly like any other target that does
+    not exist — a 200 [] no-op, the same shape as a real announcement
+    queued — so `engine` is confirmed to exist before the call is made for
+    a non-Alexa player, the same check broadcast_tts() does for the same
+    reason; Alexa players go through notify.alexa_media_* instead and are
+    unaffected. Whether the announcement was actually heard has no state
+    in Home Assistant to read back, so `verified` stays null.
     """
     if missing := confirm_entity_exists(entity_id):
         return missing
     language = language or default_language()
     name = entity_id.split(".", 1)[1]
     is_alexa = any(kw in name.lower() for kw in ALEXA_KEYWORDS)
+
+    if not is_alexa and (missing := confirm_entity_exists(engine)):
+        return missing
 
     with httpx.Client() as client:
         if is_alexa:

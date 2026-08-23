@@ -78,6 +78,9 @@ def update_user(
     local_only: restrict to local network only
 
     Only non-None fields are updated.
+
+    Returns the updated user object from Home Assistant, or an error()
+    envelope with Home Assistant's actual error code/message on failure.
     """
     msg: dict = {"type": "config/auth/update", "user_id": user_id}
     if name:
@@ -102,6 +105,9 @@ def delete_user(user_id: str) -> dict:
     user_id: user ID (use list_users() to find it).
     ⚠️ This is irreversible. The user will lose access immediately.
     Cannot delete the owner account or your own account.
+
+    Returns: {deleted: user_id, success: true} on success, or an error()
+    envelope with Home Assistant's actual error code/message on failure.
     """
     result = _ws({"type": "config/auth/delete", "user_id": user_id})
     if err := ws_error(result):

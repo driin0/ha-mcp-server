@@ -2,7 +2,7 @@ import json
 
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws, _ws_multi, envelope, ws_error
+from tools._base import mcp, HA_URL, HEADERS, _ws, _ws_multi, envelope, error, ws_error
 
 
 @mcp.tool()
@@ -58,12 +58,18 @@ def list_areas() -> dict:
 
 @mcp.tool()
 def create_area(name: str, icon: str = "") -> dict:
-    """Create a new area. icon: MDI icon, e.g. 'mdi:sofa'."""
+    """Create a new area. icon: MDI icon, e.g. 'mdi:sofa'.
+
+    Returns the created area object (area_id, name, floor_id, icon, ...)
+    from Home Assistant, or an error() envelope on failure.
+    """
     msg: dict = {"type": "config/area_registry/create", "name": name}
     if icon:
         msg["icon"] = icon
     r = _ws(msg)
-    return r.get("result", r)
+    if err := ws_error(r):
+        return err
+    return r["result"]
 
 
 @mcp.tool()
@@ -71,6 +77,9 @@ def update_area(area_id: str, name: str = "", icon: str = "") -> dict:
     """
     Update an existing area's name and/or icon.
     Use list_areas() to find area_ids.
+
+    Returns the updated area object from Home Assistant, or an error()
+    envelope on failure.
     """
     msg: dict = {"type": "config/area_registry/update", "area_id": area_id}
     if name:
@@ -78,14 +87,25 @@ def update_area(area_id: str, name: str = "", icon: str = "") -> dict:
     if icon:
         msg["icon"] = icon
     r = _ws(msg)
-    return r.get("result", r)
+    if err := ws_error(r):
+        return err
+    return r["result"]
 
 
 @mcp.tool()
 def delete_area(area_id: str) -> dict:
-    """Delete an area by area_id."""
+    """Delete an area by area_id.
+
+    ⚠️ This is irreversible. Entities and devices assigned to this area lose
+    that assignment; the area itself cannot be recovered.
+
+    Returns: {deleted: area_id, success: true}, or an error() envelope with
+    Home Assistant's actual error code/message on failure.
+    """
     r = _ws({"type": "config/area_registry/delete", "area_id": area_id})
-    return {"deleted": area_id, "success": r.get("success", False)}
+    if err := ws_error(r):
+        return err
+    return {"deleted": area_id, "success": True}
 
 
 @mcp.tool()
@@ -139,17 +159,22 @@ def rename_entity(entity_id: str, name: str) -> dict:
     """
     Set a custom display name for an entity (overrides the default name).
     Pass name='' to reset to the original integration-provided name.
+
+    Returns: {entity_id, name, success: true} on success, or an error()
+    envelope with Home Assistant's actual error code/message on failure.
     """
     r = _ws({
         "type": "config/entity_registry/update",
         "entity_id": entity_id,
         "name": name or None,
     })
-    entry = r.get("result", {}).get("entity_entry", {})
+    if err := ws_error(r):
+        return err
+    entry = r["result"].get("entity_entry", {})
     return {
         "entity_id": entity_id,
         "name": entry.get("name") or entry.get("original_name", ""),
-        "success": r.get("success", False),
+        "success": True,
     }
 
 
@@ -174,6 +199,9 @@ def create_label(name: str, color: str = "", icon: str = "") -> dict:
 
     color: CSS color string, e.g. '#ff5733' or 'red'
     icon:  MDI icon, e.g. 'mdi:star'
+
+    Returns the created label object from Home Assistant, or an error()
+    envelope on failure.
     """
     msg: dict = {"type": "config/label_registry/create", "name": name}
     if color:
@@ -181,7 +209,9 @@ def create_label(name: str, color: str = "", icon: str = "") -> dict:
     if icon:
         msg["icon"] = icon
     r = _ws(msg)
-    return r.get("result", r)
+    if err := ws_error(r):
+        return err
+    return r["result"]
 
 
 @mcp.tool()
@@ -193,6 +223,9 @@ def update_label(label_id: str, name: str = "", color: str = "", icon: str = "")
     name:     new display name (leave empty to keep current)
     color:    CSS color string, e.g. '#ff5733' or 'red'
     icon:     MDI icon, e.g. 'mdi:star'
+
+    Returns the updated label object from Home Assistant, or an error()
+    envelope on failure.
     """
     msg: dict = {"type": "config/label_registry/update", "label_id": label_id}
     if name:
@@ -202,14 +235,25 @@ def update_label(label_id: str, name: str = "", color: str = "", icon: str = "")
     if icon:
         msg["icon"] = icon
     r = _ws(msg)
-    return r.get("result", r)
+    if err := ws_error(r):
+        return err
+    return r["result"]
 
 
 @mcp.tool()
 def delete_label(label_id: str) -> dict:
-    """Delete a label by label_id."""
+    """Delete a label by label_id.
+
+    ⚠️ This is irreversible. The label is removed from every entity it was
+    assigned to; it cannot be recovered.
+
+    Returns: {deleted: label_id, success: true}, or an error() envelope
+    with Home Assistant's actual error code/message on failure.
+    """
     r = _ws({"type": "config/label_registry/delete", "label_id": label_id})
-    return {"deleted": label_id, "success": r.get("success", False)}
+    if err := ws_error(r):
+        return err
+    return {"deleted": label_id, "success": True}
 
 
 @mcp.tool()
@@ -232,18 +276,34 @@ def set_entity_labels(entity_id: str, labels: list) -> dict:
 
     labels: list of label_id strings, e.g. ["energia", "illuminazione"]
     Use list_labels() to discover available label IDs.
+
+    Returns: {entity_id, labels, success: true} on success, or an error()
+    envelope with Home Assistant's actual error code/message on failure.
     """
     r = _ws({
         "type": "config/entity_registry/update",
         "entity_id": entity_id,
         "labels": labels,
     })
-    entry = r.get("result", {}).get("entity_entry", {})
+    if err := ws_error(r):
+        return err
+    entry = r["result"].get("entity_entry", {})
     return {
         "entity_id": entity_id,
         "labels": list(entry.get("labels", labels)),
-        "success": r.get("success", False),
+        "success": True,
     }
+
+
+# config/entity_registry/update commands are sent over one shared WebSocket
+# connection (_ws_multi), all before any reply is read back - see
+# _ws_commands()'s docstring in tools/_base.py. Home Assistant's own queue
+# depth for unacknowledged commands on one connection is not published and
+# has not been measured against a real instance, so this is a conservative
+# bound rather than a discovered limit: a caller with more entities than
+# this gets a clear, actionable error instead of a batch that silently
+# stalls or drops replies mid-write on a large enough list.
+_BULK_LABEL_MAX = 200
 
 
 @mcp.tool()
@@ -251,11 +311,23 @@ def bulk_set_entity_labels(entity_ids: list, labels: list) -> dict:
     """
     Assign labels to multiple entities at once (replaces existing labels on each entity).
 
-    entity_ids: list of entity_id strings
+    entity_ids: list of entity_id strings (max 200 per call - split a larger
+                list into batches; see the error this returns above that)
     labels: list of label_id strings to assign to all entities
 
-    Returns: {total, succeeded, failed: [...]}
+    Returns: {total, succeeded, failed: [...]} on a batch that was sent, or
+    an error() envelope ("too_many_entities") without sending anything when
+    entity_ids exceeds the 200-entity limit.
     """
+    if len(entity_ids) > _BULK_LABEL_MAX:
+        return error(
+            "too_many_entities",
+            f"{len(entity_ids)} entity_ids given, {_BULK_LABEL_MAX} max per "
+            "call - all commands in a batch are sent before any reply is "
+            "read back, so a larger batch is split into multiple calls "
+            "rather than sent in one.",
+            entity_count=len(entity_ids), max_entities=_BULK_LABEL_MAX,
+        )
     msgs = [
         {"type": "config/entity_registry/update", "entity_id": eid, "labels": labels}
         for eid in entity_ids
@@ -291,19 +363,33 @@ def create_floor(name: str, level: int = 0, icon: str = "") -> dict:
 
     level: integer floor level (0 = ground floor, 1 = first floor, -1 = basement, …)
     icon:  MDI icon, e.g. 'mdi:home-floor-0'
+
+    Returns the created floor object from Home Assistant, or an error()
+    envelope on failure.
     """
     msg: dict = {"type": "config/floor_registry/create", "name": name, "level": level}
     if icon:
         msg["icon"] = icon
     r = _ws(msg)
-    return r.get("result", r)
+    if err := ws_error(r):
+        return err
+    return r["result"]
 
 
 @mcp.tool()
 def delete_floor(floor_id: str) -> dict:
-    """Delete a floor by floor_id."""
+    """Delete a floor by floor_id.
+
+    ⚠️ This is irreversible. Areas assigned to this floor lose that
+    assignment; the floor itself cannot be recovered.
+
+    Returns: {deleted: floor_id, success: true}, or an error() envelope
+    with Home Assistant's actual error code/message on failure.
+    """
     r = _ws({"type": "config/floor_registry/delete", "floor_id": floor_id})
-    return {"deleted": floor_id, "success": r.get("success", False)}
+    if err := ws_error(r):
+        return err
+    return {"deleted": floor_id, "success": True}
 
 
 @mcp.tool()
@@ -383,26 +469,40 @@ def disable_entity(entity_id: str) -> dict:
     Disable an entity in the entity registry.
     Disabled entities are hidden from HA and stop reporting state.
     Use enable_entity() to re-enable.
+
+    Returns: {entity_id, disabled: true, success: true} once Home Assistant
+    accepts the change, or an error() envelope with Home Assistant's actual
+    error code/message on failure — `disabled: true` is only ever returned
+    once that has actually been confirmed, never asserted alongside a
+    failure.
     """
     r = _ws({
         "type": "config/entity_registry/update",
         "entity_id": entity_id,
         "disabled_by": "user",
     })
-    return {"entity_id": entity_id, "disabled": True, "success": r.get("success", False)}
+    if err := ws_error(r):
+        return err
+    return {"entity_id": entity_id, "disabled": True, "success": True}
 
 
 @mcp.tool()
 def enable_entity(entity_id: str) -> dict:
     """
     Re-enable a previously disabled entity in the entity registry.
+
+    Returns: {entity_id, enabled: true, success: true} once Home Assistant
+    accepts the change, or an error() envelope with Home Assistant's actual
+    error code/message on failure.
     """
     r = _ws({
         "type": "config/entity_registry/update",
         "entity_id": entity_id,
         "disabled_by": None,
     })
-    return {"entity_id": entity_id, "enabled": True, "success": r.get("success", False)}
+    if err := ws_error(r):
+        return err
+    return {"entity_id": entity_id, "enabled": True, "success": True}
 
 
 @mcp.tool()
@@ -410,17 +510,22 @@ def set_area_floor(area_id: str, floor_id: str) -> dict:
     """
     Assign an area to a floor (pass floor_id='' to remove the assignment).
     Use list_areas() for area_ids and list_floors() for floor_ids.
+
+    Returns: {area_id, floor_id, success: true} on success, or an error()
+    envelope with Home Assistant's actual error code/message on failure.
     """
     r = _ws({
         "type": "config/area_registry/update",
         "area_id": area_id,
         "floor_id": floor_id or None,
     })
-    entry = r.get("result", {})
+    if err := ws_error(r):
+        return err
+    entry = r["result"]
     return {
         "area_id": area_id,
         "floor_id": entry.get("floor_id"),
-        "success": r.get("success", False),
+        "success": True,
     }
 
 
@@ -434,15 +539,20 @@ def set_entity_area(entity_id: str, area_id: str) -> dict:
                Pass '' (empty string) to remove the entity from its current area.
 
     Note: this overrides the device-level area for this specific entity.
+
+    Returns: {entity_id, area_id, success: true} on success, or an error()
+    envelope with Home Assistant's actual error code/message on failure.
     """
     r = _ws({
         "type": "config/entity_registry/update",
         "entity_id": entity_id,
         "area_id": area_id or None,
     })
-    entry = r.get("result", {}).get("entity_entry", {})
+    if err := ws_error(r):
+        return err
+    entry = r["result"].get("entity_entry", {})
     return {
         "entity_id": entity_id,
         "area_id": entry.get("area_id"),
-        "success": r.get("success", False),
+        "success": True,
     }

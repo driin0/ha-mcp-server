@@ -152,6 +152,8 @@ def update_todo_item(entity_id: str, item: str, status: str = "", rename: str = 
 def remove_todo_item(entity_id: str, item: str) -> dict:
     """Remove an item from a todo list. item: item name or uid.
 
+    ⚠️ This is irreversible.
+
     Returns: {entity_id, item, verified} on a call Home Assistant accepted,
     or {error: "entity_not_found", ...} when entity_id has no state at
     all. `verified` is true only when no item with this summary remains in

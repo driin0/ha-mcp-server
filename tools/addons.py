@@ -137,6 +137,13 @@ def start_addon(slug: str) -> dict:
     Start an add-on.
 
     slug: add-on slug, e.g. 'core_mosquitto'. Use list_addons() to find slugs.
+
+    Returns: {slug, action: "start", result} once the Supervisor accepts
+    the request - `result` is the Supervisor's own response field ("ok" by
+    default), passed through rather than re-verified: use get_addon(slug)
+    afterward to confirm the add-on's state actually changed, since
+    starting can still fail after being accepted (a port conflict, a
+    missing dependency).
     """
     err = _check_supervisor()
     if err:
@@ -153,6 +160,10 @@ def stop_addon(slug: str) -> dict:
     Stop a running add-on.
 
     slug: add-on slug, e.g. 'core_mosquitto'. Use list_addons() to find slugs.
+
+    Returns: {slug, action: "stop", result} once the Supervisor accepts
+    the request. See start_addon() for why `result` is passed through
+    rather than re-verified.
     """
     err = _check_supervisor()
     if err:
@@ -169,6 +180,14 @@ def restart_addon(slug: str) -> dict:
     Restart an add-on (stop then start).
 
     slug: add-on slug, e.g. 'core_mosquitto'. Use list_addons() to find slugs.
+
+    Interrupts whatever the add-on was doing (a running MQTT broker drops
+    its connections, a Node-RED flow stops mid-run) for as long as the
+    restart takes.
+
+    Returns: {slug, action: "restart", result} once the Supervisor accepts
+    the request. See start_addon() for why `result` is passed through
+    rather than re-verified.
     """
     err = _check_supervisor()
     if err:
@@ -246,6 +265,18 @@ def call_addon_api(
       Node-RED flows:        slug='a0d7b954_nodered', path='/flows'
 
     Requires: Home Assistant OS or Supervised installation.
+
+    ⚠️ This is a generic HTTP proxy into whatever the add-on's own API
+    exposes - method=PUT/POST/DELETE can change or delete data the add-on
+    manages (a Zigbee2MQTT device pairing, a Node-RED flow) with no
+    verification here of what that path actually does; this tool has no
+    way to know. Treat an unfamiliar add-on's API as untrusted before
+    calling it with anything other than GET.
+
+    Returns: the add-on's own JSON response, or {text, status_code} when
+    the response body is not JSON. Passed through unexamined, like
+    call_service() - this tool does not know the add-on's response shape
+    any more than call_service() knows a Home Assistant service's.
     """
     err = _check_supervisor()
     if err:

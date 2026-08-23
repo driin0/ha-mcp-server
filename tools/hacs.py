@@ -171,7 +171,14 @@ def install_hacs_repo(repository_id: str, version: str = "") -> dict:
     version:       specific version/tag to install (leave empty for latest)
 
     ⚠️ Integrations require a Home Assistant restart to take effect.
-    Lovelace plugins and themes are active immediately.
+    Lovelace plugins and themes are active immediately. Installs files
+    from the repository onto disk - review an unfamiliar repository before
+    installing it, the same as you would before installing anything else
+    from a third party.
+
+    Returns: {installed: true, repository_id, version}. A failed call
+    because HACS is not installed returns {error: hacs_not_available,
+    detail: ...}, same as every other HACS tool in this file.
     """
     msg: dict = {"type": "hacs/repository/download", "repository": repository_id}
     if version:
@@ -197,6 +204,14 @@ def remove_hacs_repo(repository_id: str) -> dict:
     Note: this removes the custom component / plugin files. A HA restart may be needed
     to fully remove the integration. To only remove the repository from the HACS list
     without deleting files, this is not the right tool.
+
+    ⚠️ This is irreversible: the files are deleted from disk. Any config
+    entry or entity depending on this integration stops working until it
+    is reinstalled.
+
+    Returns: {removed: true, repository_id}. A failed call because HACS is
+    not installed returns {error: hacs_not_available, detail: ...}, same
+    as every other HACS tool in this file.
     """
     result = _ws({"type": "hacs/repository/remove", "repository": repository_id})
     err = _hacs_check(result)
@@ -216,6 +231,10 @@ def add_hacs_custom_repo(repository: str, category: str) -> dict:
                 'appdaemon', 'python_script', 'template'
 
     After adding, use search_hacs() to find the repo ID and install_hacs_repo() to install it.
+
+    Returns: {added: true, repository, category}. A failed call because
+    HACS is not installed returns {error: hacs_not_available, detail:
+    ...}, same as every other HACS tool in this file.
     """
     result = _ws({"type": "hacs/repositories/add", "repository": repository, "category": category})
     err = _hacs_check(result)

@@ -1,7 +1,8 @@
 import httpx
 
 from tools._base import (
-    mcp, HA_URL, HEADERS, _slug, _ws, envelope, error, observe_actuation, wait_for_entity, ws_error,
+    mcp, HA_URL, HEADERS, _slug, _ws, confirm_entity_exists, envelope, error,
+    observe_actuation, wait_for_entity, ws_error,
 )
 
 
@@ -239,6 +240,12 @@ def delete_automation(entity_id: str) -> dict:
     400 ("Resource not found"), not a 404: this endpoint answers 400 both
     for "no such config id" and for "this automation cannot be deleted
     here", so the two are reported the same way below.
+
+    ⚠️ This is irreversible.
+
+    Returns: {deleted: entity_id, status: <HTTP status code>} on success,
+    or an error() envelope ("entity_not_found" or "not_deletable") on
+    failure.
     """
     with httpx.Client() as client:
         state_r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
@@ -271,7 +278,17 @@ def delete_automation(entity_id: str) -> dict:
 
 @mcp.tool()
 def trigger_automation(entity_id: str) -> dict:
-    """Manually trigger an automation regardless of its trigger conditions."""
+    """Manually trigger an automation regardless of its trigger conditions.
+
+    Returns: {entity_id, accepted: true, verified: null, detail} once Home
+    Assistant accepts the call, or {error: "entity_not_found", ...} when
+    entity_id has no state at all. What the automation's action sequence
+    actually does has no single state here to confirm it happened - check
+    the entities it acts on, or get_automation_trace() for its own record
+    of the run.
+    """
+    if missing := confirm_entity_exists(entity_id):
+        return missing
     with httpx.Client() as client:
         r = client.post(
             f"{HA_URL}/api/services/automation/trigger",
@@ -280,12 +297,27 @@ def trigger_automation(entity_id: str) -> dict:
             timeout=10,
         )
         r.raise_for_status()
-        return {"triggered": entity_id}
+    return {
+        "entity_id": entity_id,
+        "accepted": True,
+        "verified": None,
+        "detail": "Home Assistant accepted the trigger; what the "
+                  "automation's actions do has no single state here to "
+                  "confirm - check get_automation_trace() or the entities "
+                  "it acts on.",
+    }
 
 
 @mcp.tool()
 def toggle_automation(entity_id: str) -> dict:
-    """Enable or disable an automation."""
+    """Enable or disable an automation.
+
+    Returns: {entity_id, new_state} once the entity's state is read back
+    after the toggle - "on" (armed) or "off" (disabled) - or
+    {entity_id, new_state: null, detail} when the entity has no state yet
+    (it may not exist, or may still be registering; see create_automation()'s
+    docstring for the registration race this can surface).
+    """
     with httpx.Client() as client:
         r = client.post(
             f"{HA_URL}/api/services/automation/toggle",
@@ -427,6 +459,13 @@ def create_automation_from_blueprint(
 
     Home Assistant has no WebSocket command for saving an automation config -
     only a REST endpoint, the same one create_automation() uses.
+
+    Returns: {automation_id, entity_id, alias, blueprint, result} once Home
+    Assistant accepts the config. Unlike create_automation(), this does not
+    wait for the entity to register or read its state back - a blueprint
+    automation is armed the instant it registers, the same way any new
+    automation is; check get_states_by_domain('automation') afterward if
+    you need to confirm it exists.
     """
     automation_id = _slug(alias)
     payload = {

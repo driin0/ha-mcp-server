@@ -1308,12 +1308,46 @@ def test_send_tts_accepts_a_real_target(fake_ha):
 
     fake_ha.states = [
         {"entity_id": "media_player.kitchen", "state": "idle", "attributes": {}},
+        {"entity_id": "tts.google_translate", "state": "idle", "attributes": {}},
     ]
 
     result = send_tts("media_player.kitchen", "hello")
 
     assert result["accepted"] is True
     assert result["verified"] is None
+
+
+def test_send_tts_reports_a_missing_engine_instead_of_accepted_true(fake_ha):
+    """Same gap package E fixed in broadcast_tts (see the tests below): HA
+    answers tts/speak 200 [] for a nonexistent engine exactly like a real
+    announcement queued, so a 2xx response alone cannot tell them apart."""
+    from tools.media_players import send_tts
+
+    fake_ha.states = [
+        {"entity_id": "media_player.kitchen", "state": "idle", "attributes": {}},
+    ]
+
+    result = send_tts("media_player.kitchen", "hello", engine="tts.does_not_exist")
+
+    assert result["error"] == "entity_not_found"
+    assert result["entity_id"] == "tts.does_not_exist"
+    # tts/speak must never have been called once the engine was known missing.
+    assert not any(c.url.path == "/api/services/tts/speak" for c in fake_ha.rest_calls)
+
+
+def test_send_tts_skips_engine_check_for_alexa_players(fake_ha):
+    """Alexa players go through notify.alexa_media_*, not the TTS engine -
+    a missing tts.* entity must not block them (mirrors broadcast_tts)."""
+    from tools.media_players import send_tts
+
+    fake_ha.states = [
+        {"entity_id": "media_player.echo_kitchen", "state": "idle", "attributes": {}},
+    ]
+
+    result = send_tts("media_player.echo_kitchen", "hello", engine="tts.does_not_exist")
+
+    assert result["method"] == "alexa_announce"
+    assert result["accepted"] is True
 
 
 def test_media_player_control_reports_a_nonexistent_target(fake_ha):

@@ -139,6 +139,12 @@ def create_backup(name: str = "", agent_ids: list = None) -> dict:
                list_backups() afterward to confirm the backup landed —
                creation is asynchronous, so this call returns as soon as
                the job is queued, not when it finishes.
+
+    Returns: {backup_job_id, agent_ids} once Home Assistant accepts the
+    job, or an error() envelope ("no_backup_agents" when none is
+    configured, or Home Assistant's own error otherwise) on failure. A
+    returned backup_job_id confirms only that the job was queued, not that
+    it completed — use list_backups() to confirm.
     """
     if not agent_ids:
         agents_result = _ws({"type": "backup/agents/info"})
@@ -166,9 +172,16 @@ def reload_integration(entry_id: str) -> dict:
     """
     Reload a config entry (integration) without restarting Home Assistant.
     entry_id: use list_config_entries() to find the entry_id.
+
+    Returns: {entry_id, reloaded: true} once Home Assistant confirms the
+    reload, or an error() envelope with Home Assistant's actual error
+    code/message on failure — `reloaded: true` is only ever returned once
+    that has actually been confirmed, never asserted alongside a failure.
     """
     result = _ws({"type": "config_entries/reload", "entry_id": entry_id})
-    return {"entry_id": entry_id, "reloaded": result.get("result", False), "success": result.get("success", False)}
+    if err := ws_error(result):
+        return err
+    return {"entry_id": entry_id, "reloaded": bool(result["result"])}
 
 
 @mcp.tool()
@@ -313,6 +326,10 @@ def dismiss_config_flow(flow_id: str) -> dict:
     flow_id: use list_config_flows() to find the flow_id.
     This removes the flow without completing the integration setup.
     Useful for dismissing unwanted auto-discovered integrations.
+
+    Returns: {dismissed: flow_id, success: true}. A discovery flow can
+    reappear on its own next time Home Assistant rediscovers the same
+    device/service — dismissing it here does not block future discovery.
     """
     with httpx.Client() as client:
         r = client.delete(

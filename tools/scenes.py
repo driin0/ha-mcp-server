@@ -1,6 +1,6 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _slug, envelope
+from tools._base import mcp, HA_URL, HEADERS, _slug, confirm_entity_exists, envelope
 
 
 @mcp.tool()
@@ -30,7 +30,17 @@ def list_scenes() -> dict:
 
 @mcp.tool()
 def activate_scene(entity_id: str) -> dict:
-    """Activate a scene by entity_id (e.g. 'scene.movie_night')."""
+    """Activate a scene by entity_id (e.g. 'scene.movie_night').
+
+    Returns: {entity_id, accepted: true, verified: null, detail} once Home
+    Assistant accepts the call, or {error: "entity_not_found", ...} when
+    entity_id has no state at all. A scene's own state is only the
+    timestamp it was last activated, not evidence of what changed - check
+    the individual entities the scene was defined over (list_scenes()
+    shows them) to confirm the effect.
+    """
+    if missing := confirm_entity_exists(entity_id):
+        return missing
     with httpx.Client() as client:
         r = client.post(
             f"{HA_URL}/api/services/scene/turn_on",
@@ -39,7 +49,15 @@ def activate_scene(entity_id: str) -> dict:
             timeout=10,
         )
         r.raise_for_status()
-        return {"activated": entity_id}
+    return {
+        "entity_id": entity_id,
+        "accepted": True,
+        "verified": None,
+        "detail": "Home Assistant accepted the call; a scene's own state "
+                  "is only a last-activated timestamp, not evidence of "
+                  "what changed - check the individual entities it was "
+                  "defined over.",
+    }
 
 
 @mcp.tool()
@@ -55,6 +73,15 @@ def create_scene(name: str, entities: dict) -> dict:
         "light.living_room": {"state": "on", "brightness": 30},
         "switch.living_room_night_light": {"state": "on"}
       }
+
+    ⚠️ This silently overwrites an existing scene with the same name -
+    Home Assistant's config/scene/config/{id} endpoint has no separate
+    create-vs-update mode, so a name that slugs the same as an existing
+    scene replaces its definition with no confirmation step.
+
+    Returns: {scene_id, entity_id, result} - `result` is Home Assistant's
+    own JSON response from the config write, passed through unexamined
+    (a non-2xx response raises rather than returning a value).
     """
     scene_id = _slug(name)
     payload = {
@@ -74,7 +101,14 @@ def create_scene(name: str, entities: dict) -> dict:
 
 @mcp.tool()
 def delete_scene(entity_id: str) -> dict:
-    """Delete a scene by entity_id (e.g. 'scene.cinema')."""
+    """Delete a scene by entity_id (e.g. 'scene.cinema').
+
+    ⚠️ This is irreversible.
+
+    Returns: {deleted: entity_id, status: <HTTP status code>}. A non-2xx
+    response raises rather than returning a value, like every other REST
+    config write in this codebase.
+    """
     scene_id = entity_id.removeprefix("scene.")
     with httpx.Client() as client:
         r = client.delete(

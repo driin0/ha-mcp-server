@@ -84,6 +84,59 @@ saved conversations assume a bare list, they need updating — see below.
 - A pytest suite (156 tests) and a GitHub Actions CI workflow
   (`.github/workflows/test.yml`). The repository previously had no tests.
 
+### Changed — write tools (package F)
+
+The read half of this sweep gave every list-returning tool one shape
+(`envelope()`, above). The write half — the ~100 tools that create, update,
+delete or actuate something — went through the same process and is now
+documented in `tools/_base.py`'s module docstring: an actuation result
+(`verified`/`state`, or `accepted`/`verified: null` when there is nothing to
+read back), a `ws_error()`-gated registry write, a bulk result, or an
+`error()` — never a bare bool, string, or None. A new test enforces the
+scalar half mechanically; the existing `.get("success", True)` test now also
+bans `.get("success", False)`, the same fault in the other direction.
+
+- `areas.py`'s 11 write tools built their response from `r.get("success",
+  False)` without checking `ws_error()` first, which could return
+  self-contradicting payloads — `disable_entity()` returned `{"disabled":
+  true, "success": false}`, asserting the effect while denying it happened,
+  with Home Assistant's actual error code discarded. All 11 now gate on
+  `ws_error()`; `reload_integration()` (`system.py`) had the same fault and
+  the same fix.
+- `send_tts` gains the engine-existence check package E already added to
+  `broadcast_tts`: `tts.speak` answers a nonexistent engine the same 200 `[]`
+  as a real announcement queued, so a missing `engine` used to report
+  `accepted: true` regardless.
+- `trigger_webhook` no longer reports `triggered: true` — Home Assistant
+  answers a registered and an unregistered webhook_id with an identical 2xx,
+  so that field asserted something HTTP cannot establish. Replaced with
+  `accepted` (the same computation, an honest name) and a `detail` explaining
+  the limit.
+- `bulk_set_entity_labels` sends every command before reading any reply; a
+  batch over 200 entities now returns `error("too_many_entities", ...)`
+  instead of risking an overflow mid-write.
+- `activate_scene` and `run_script` now check the target exists first and
+  return the `accepted`/`verified: null` shape used everywhere else in this
+  codebase for an effect with nothing to read back, instead of an ad-hoc
+  single-key dict with no existence check.
+- Every write tool now documents its return shape (`Returns:` in its
+  docstring), and every `delete_*`/`remove_*` tool but `delete_user` — which
+  already had one — now says plainly that the action cannot be undone.
+
+### Added — registration gate (package F)
+
+`create_user`, `update_user` and `delete_user` — the tools that manage Home
+Assistant login accounts, a different risk tier from controlling entities —
+are no longer registered unless `MCP_ENABLE_USER_MANAGEMENT=true` is set.
+Nothing server-side can make an MCP client confirm before calling a tool;
+not registering it at all is the one guardrail this server can actually
+enforce. Every other tool, including every other destructive one, keeps its
+v1.1.0 default of being registered — upgrading must not make capabilities
+disappear with no error. The always-registered `list_disabled_tools()` tool
+reports which groups are gated and why. `call_service`, `fire_event` and
+`call_addon_api` are explicitly *not* covered by this or any gate: see the
+README section on this for why a name-based filter cannot reach them.
+
 ## 1.1.0
 
 The project moves into its own repository: **github.com/driin0/ha-mcp-server**,

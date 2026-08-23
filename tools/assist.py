@@ -69,6 +69,9 @@ def create_assist_pipeline(
     tts_voice:            voice ID for TTS (engine-specific)
 
     Use list_assist_pipelines() to see examples from existing pipelines.
+
+    Returns the created pipeline object from Home Assistant, or an error()
+    envelope on failure.
     """
     language = language or default_language()
     conversation_language = conversation_language or language
@@ -113,6 +116,10 @@ def update_assist_pipeline(
     The update command validates the whole pipeline, not the changed fields, so
     the current values are read first and the changes merged onto them: sending
     a partial message fails with "required key not provided".
+
+    Returns the updated pipeline object from Home Assistant, or an error()
+    envelope ("not_found" when pipeline_id does not exist, or Home
+    Assistant's own error otherwise) on failure.
     """
     current = {}
     listed = _ws({"type": "assist_pipeline/pipeline/list"})
@@ -154,6 +161,12 @@ def delete_assist_pipeline(pipeline_id: str) -> dict:
 
     pipeline_id: pipeline ID (use list_assist_pipelines() to find it).
     Note: the preferred (default) pipeline cannot be deleted.
+
+    ⚠️ This is irreversible.
+
+    Returns: {deleted: pipeline_id, success: true} on success, or an
+    error() envelope with Home Assistant's actual error code/message on
+    failure.
     """
     result = _ws({"type": "assist_pipeline/pipeline/delete", "pipeline_id": pipeline_id})
     if err := ws_error(result):
@@ -167,6 +180,10 @@ def set_preferred_assist_pipeline(pipeline_id: str) -> dict:
     Set the default (preferred) Assist pipeline.
 
     pipeline_id: pipeline ID to set as default (use list_assist_pipelines() to find it).
+
+    Returns: {preferred_pipeline: pipeline_id, success: true} on success,
+    or an error() envelope with Home Assistant's actual error code/message
+    on failure.
     """
     result = _ws({"type": "assist_pipeline/pipeline/set_preferred", "pipeline_id": pipeline_id})
     if err := ws_error(result):

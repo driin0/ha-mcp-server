@@ -201,7 +201,16 @@ def process_conversation(text: str, language: str = "") -> dict:
     text: natural language command, e.g. "turn on the living room lights"
     language: language code; defaults to the language configured in Home Assistant
 
-    The response contains the agent's reply and any actions taken.
+    ⚠️ This can execute anything Home Assistant's conversation agent
+    understands as a command - "turn off the lights" and "unlock the front
+    door" are both plausible `text` values, and this tool has no
+    confirmation step of its own between accepting `text` and acting on it.
+
+    Returns: {speech, response_type, language} - the agent's spoken reply
+    and what kind of response it was ("action_done", "query_answer",
+    "error", ...), not a structured list of what changed. Check the
+    affected entities' own state afterward to confirm what actually
+    happened, the same way any call_service()-shaped action is verified.
     """
     language = language or default_language()
     with httpx.Client() as client:
@@ -230,7 +239,16 @@ def trigger_webhook(webhook_id: str, data: dict = None, method: str = "post") ->
     data: optional JSON payload to send with the webhook
     method: 'post' (default) or 'get'
 
-    Note: the webhook must be configured in HA to allow external access.
+    Returns: {webhook_id, status_code, accepted, detail}. Home Assistant
+    answers a registered and an unregistered webhook_id with an identical
+    2xx response — measured live, a nonexistent webhook_id gets the same
+    200 as a real one — so `accepted` (status_code < 300) confirms only
+    that the HTTP request reached Home Assistant, never that this
+    webhook_id exists or that anything it triggers actually ran. This tool
+    used to report a `triggered: true` field computed the same way, which
+    claimed exactly the thing a 2xx here cannot establish; check the
+    webhook's actual effect (an automation's last_triggered, a script's
+    state) to confirm it fired.
     """
     with httpx.Client() as client:
         url = f"{HA_URL}/api/webhook/{webhook_id}"
@@ -238,8 +256,15 @@ def trigger_webhook(webhook_id: str, data: dict = None, method: str = "post") ->
             r = client.get(url, headers=HEADERS, params=data or {}, timeout=10)
         else:
             r = client.post(url, headers=HEADERS, json=data or {}, timeout=10)
-        # Webhooks return 200 with empty body or 200 with JSON — both are valid
-        return {"webhook_id": webhook_id, "status_code": r.status_code, "triggered": r.status_code < 300}
+        return {
+            "webhook_id": webhook_id,
+            "status_code": r.status_code,
+            "accepted": r.status_code < 300,
+            "detail": "Home Assistant returns an identical response for a "
+                      "registered and an unregistered webhook_id, so this "
+                      "confirms only that the request was accepted - not "
+                      "that the webhook exists or that anything happened.",
+        }
 
 
 @mcp.tool()
@@ -276,6 +301,16 @@ def fire_event(event_type: str, event_data: dict = None) -> dict:
 
     Useful for triggering automations that listen on custom events, or for testing
     event-based automations.
+
+    ⚠️ Any automation listening on `event_type` runs whatever it is
+    configured to do - this tool has no way to know what that is, and
+    firing a system event Home Assistant itself relies on (rather than a
+    custom one) can trigger built-in behaviour, not just user automations.
+
+    Returns: {fired: true, event_type, event_data}. Confirms only that
+    Home Assistant accepted the event onto its bus, not that any listener
+    ran or what it did - check the affected entities/automations
+    afterward, the same way any call_service()-shaped action is verified.
     """
     with httpx.Client() as client:
         r = client.post(
@@ -748,6 +783,17 @@ def call_service(domain: str, service: str, entity_id: str = "", service_data: d
     - Set brightness:  domain='light', service='turn_on', entity_id='light.living_room',
                        service_data={'brightness_pct': 80}
     - Reload config:   domain='homeassistant', service='reload_config_entry'
+
+    ⚠️ This reaches every service Home Assistant exposes, including every
+    one of the named, safety-warned tools elsewhere in this codebase -
+    domain='lock', service='unlock' is exactly lock_control(entity_id,
+    'unlock'), reached directly and without lock_control's own read-back
+    verification. The env-gated registration filter documented in
+    tools/_base.py (list_disabled_tools()) does not and cannot cover this
+    tool for that reason: gating a named tool while leaving call_service
+    enabled would not remove the capability, only the friendlier name for
+    it. Treat this tool as carrying the safety weight of whatever service
+    it is pointed at, not the weight of "call a service".
 
     Returns: {result: ...} - the service's own JSON response, passed through
     unexamined. Home Assistant services do not share one response shape (most

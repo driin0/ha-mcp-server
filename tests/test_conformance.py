@@ -44,6 +44,28 @@ def _return_type(node) -> str:
     return ast.unparse(node.returns) if node.returns else "(none)"
 
 
+def _direct_returns(node):
+    """Yield every ast.Return belonging to `node` itself - not one nested
+    inside a helper function or lambda `node` defines internally.
+
+    Plain ast.walk(node) descends into everything, including a nested
+    `def matches(s): ...; return False` a tool builds to hand to
+    observe_actuation() (see e.g. tools/climate.py's set_climate or
+    tools/groups.py's update_group) - a `return False` picking the
+    predicate's own answer, not the tool's. Skipping into every
+    FunctionDef/AsyncFunctionDef/Lambda a tool's body contains keeps a
+    source-level sweep looking at what the tool itself hands back to its
+    caller, not at some closure's local control flow that happens to share
+    the keyword `return`.
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(child, ast.Return):
+            yield child
+        yield from _direct_returns(child)
+
+
 def test_the_tool_census_does_not_silently_shrink():
     """A guard on the guard. A floor, not an equality: plans 2 and 3 add
     tools, and a test that has to be edited to stay true gets edited without
@@ -71,12 +93,46 @@ def test_no_tool_returns_a_bare_list_literal():
     for fname, node in _tools():
         if node.name in NOT_YET_CONVERTED:
             continue
-        for inner in ast.walk(node):
-            if isinstance(inner, ast.Return) and isinstance(inner.value, ast.List):
+        for inner in _direct_returns(node):
+            if isinstance(inner.value, ast.List):
                 offenders.append(f"{fname}:{inner.lineno} in {node.name}")
     assert not offenders, (
         "Return envelope(...) or error(...), not a list literal:\n"
         + "\n".join(offenders)
+    )
+
+
+def test_no_tool_returns_a_bare_scalar_literal():
+    """The write half of the convention documented in tools/_base.py's module
+    docstring: "never a bare bool, a bare string, or None." A dict return
+    gives a caller (a language model reading raw JSON with no schema) field
+    names to hang a question on; `return True` or `return None` gives it
+    nothing to ask about, and `return "ok"` looks identical in shape to an
+    error message with no "error" key to tell the two apart.
+
+    A literal `return True`/`False`/`None`/a bare string parses to
+    ast.Return(value=ast.Constant(...)) — this walks every tool's own
+    returns (see _direct_returns()) the same way
+    test_no_tool_returns_a_bare_list_literal does for `ast.List`, so a tool
+    that switched from "returns a list" to "returns a scalar" instead of
+    "returns a dict" would still be caught. The three tools that
+    legitimately return a string (their output IS the payload, not an
+    acknowledgement of one) are exempted, same as everywhere else in this
+    file that draws that distinction.
+    """
+    offenders = []
+    for fname, node in _tools():
+        if node.name in STRING_TOOLS or node.name in NOT_YET_CONVERTED:
+            continue
+        for inner in _direct_returns(node):
+            if isinstance(inner.value, ast.Constant):
+                offenders.append(
+                    f"{fname}:{inner.lineno} in {node.name} -> "
+                    f"{inner.value.value!r}"
+                )
+    assert not offenders, (
+        "Return envelope(...) or error(...), or a dict literal with named "
+        "fields - not a bare scalar:\n" + "\n".join(offenders)
     )
 
 
@@ -198,8 +254,9 @@ def test_every_zero_arg_tool_actually_returns_a_dict_at_runtime(fake_ha):
     )
 
 
-def _success_defaulted_to_true_sites():
-    """Every `<expr>.get("success", True)` call anywhere in tools/*.py.
+def _success_defaulted_with_literal_sites():
+    """Every `<expr>.get("success", <literal>)` call anywhere in tools/*.py,
+    for any literal default — True, False, or otherwise.
 
     AST-based, not a grep, for two reasons: it must not trip on the prose in
     tools/hacs.py's docstring that explains this very bug (a docstring is an
@@ -208,6 +265,18 @@ def _success_defaulted_to_true_sites():
     with single quotes, `.get('success', True)`, which a text grep tuned to
     double quotes would miss but which parses to the identical ast.Constant
     value "success".
+
+    True and False are both banned, not just True, even though only the
+    True direction can turn a failure into a false positive. A literal
+    False default is the areas.py bug (see the docstring below): it never
+    lies about `success` itself, but it silently discards Home Assistant's
+    actual error code and message in favour of a bare False, and it is
+    routinely paired with an unrelated field elsewhere in the same dict
+    that is NOT conditioned on that success check — the exact shape of
+    {"disabled": true, "success": false}, an effect asserted unconditionally
+    while success denies it happened. ws_error() is the one path that both
+    reports the real failure and lets the rest of the function only build
+    that "effect" dict once success is actually confirmed.
     """
     sites = []
     for path in sorted(TOOLS_DIR.glob("*.py")):
@@ -223,12 +292,12 @@ def _success_defaulted_to_true_sites():
             key, default = node.args[0], node.args[1]
             if not (isinstance(key, ast.Constant) and key.value == "success"):
                 continue
-            if isinstance(default, ast.Constant) and default.value is True:
+            if isinstance(default, ast.Constant):
                 sites.append(f"{path.name}:{node.lineno}")
     return sites
 
 
-def test_no_ws_result_defaults_a_missing_success_key_to_true():
+def test_no_ws_result_reads_success_with_a_literal_default():
     """`.get("success", True)` treats a dict with no "success" key at all as
     a success — but that is exactly the shape `_ws()` returns when the
     connection or the authentication fails: {"error": "Auth failed: ..."},
@@ -237,16 +306,28 @@ def test_no_ws_result_defaults_a_missing_success_key_to_true():
     which is how delete_user(), create_user() and 22 other call sites used
     to report success for a write that never reached Home Assistant.
 
+    `.get("success", False)` does not make that particular mistake — but it
+    is the areas.py bug this codebase's audit found: discarding HA's actual
+    error code/message in favour of a bare False, usually alongside an
+    "effect" field elsewhere in the same dict that is not itself
+    conditioned on that check (`{"disabled": true, "success": r.get(
+    "success", False)}` asserts `disabled: true` even when `success` comes
+    back false). See _success_defaulted_with_literal_sites() for the full
+    reasoning on why both directions are banned, not just the historically
+    first one found.
+
     The fix is `if err := ws_error(result): return err` (tools/_base.py),
     which treats a missing "success" key as a failure to be reported, not
-    as a default to fall back on. This test is the net that keeps the fix
-    from being undone by the next tool written by copying a neighbour.
+    as a default to fall back on, and surfaces HA's real error code/message
+    instead of discarding it. This test is the net that keeps the fix from
+    being undone by the next tool written by copying a neighbour.
     """
-    offenders = _success_defaulted_to_true_sites()
+    offenders = _success_defaulted_with_literal_sites()
     assert not offenders, (
-        "these sites default a missing \"success\" key to True, which "
-        "silently turns a _ws() transport failure into a false success "
-        "instead of an error — replace with "
-        "`if err := ws_error(result): return err`:\n"
+        "these sites read a WS result's \"success\" key with a literal "
+        "default, which either turns a _ws() transport failure into a "
+        "false success (a True default) or silently discards Home "
+        "Assistant's actual error code/message (any default) — replace "
+        "with `if err := ws_error(result): return err`:\n"
         + "\n".join(offenders)
     )

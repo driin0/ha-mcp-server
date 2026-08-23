@@ -278,6 +278,12 @@ def create_helper(
 
     config may only contain the keys legitimate for `domain` (see above) -
     anything else, including "type" or "name", is refused rather than sent.
+
+    Returns: {helper_id, entity_id, result} once the helper is created and
+    its entity_id is confirmed to exist, or an error() envelope -
+    "unsupported_domain"/"invalid_config_keys" before any call is made, or
+    "no_id_in_response"/"entity_not_found" if Home Assistant's own response
+    is incomplete or the entity never registered.
     """
     if domain not in _HELPER_CREATE_FIELDS:
         return error("unsupported_domain", f"Unsupported domain: {domain}",
@@ -332,6 +338,14 @@ def delete_helper(entity_id: str) -> dict:
     Delete a helper entity by entity_id.
     Supported: input_boolean, input_number, input_text, input_select,
                input_datetime, counter, timer, input_button.
+
+    ⚠️ This is irreversible. The helper and its stored value are gone;
+    anything (an automation, a dashboard card) that referenced it starts
+    referencing a nonexistent entity.
+
+    Returns: {deleted: entity_id, success: true} on success, or an error()
+    envelope ("unsupported_domain" for a non-helper domain, or Home
+    Assistant's actual error code/message) on failure.
     """
     domain = entity_id.split(".")[0]
     supported = {
@@ -339,14 +353,14 @@ def delete_helper(entity_id: str) -> dict:
         "input_datetime", "counter", "timer", "input_button",
     }
     if domain not in supported:
-        return {"error": f"Cannot delete domain: {domain}"}
+        return error("unsupported_domain", f"Cannot delete domain: {domain}",
+                     entity_id=entity_id)
     helper_id = entity_id.split(".", 1)[1]
     # Storage-collection delete also goes over the WebSocket API.
     res = _ws({"type": f"{domain}/delete", f"{domain}_id": helper_id})
-    if not res.get("success"):
-        return {"error": "WebSocket delete failed", "entity_id": entity_id,
-                "detail": res.get("error")}
-    return {"deleted": entity_id, "ok": True}
+    if err := ws_error(res):
+        return err
+    return {"deleted": entity_id, "success": True}
 
 
 @mcp.tool()
@@ -374,6 +388,15 @@ def create_template_sensor(
 
       Current temperature from a sensor:
         state_template: "{{ states('sensor.living_room_temperature') }}"
+
+    Returns: {entry_id, name, result, icon_set?, icon_error?} once Home
+    Assistant accepts the config flow submission, or {error: "400 on form
+    submit", schema, payload_sent} when it rejects the payload.
+    `icon_set`/`icon_error` only appear when `icon` was given: setting it
+    is a second, separate WebSocket call after the sensor itself is
+    created, so it can fail (and is reported failing, with the real error)
+    independently of the sensor's own creation, which by then already
+    succeeded.
     """
     with httpx.Client() as client:
         # Step 1: start the template config flow
@@ -430,10 +453,13 @@ def create_template_sensor(
                     "entity_id": entity_id,
                     "icon": icon,
                 })
-                response["icon_set"] = ws_result.get("success", False)
-                if not ws_result.get("success"):
-                    response["icon_error"] = ws_result
+                if icon_err := ws_error(ws_result):
+                    response["icon_set"] = False
+                    response["icon_error"] = icon_err
+                else:
+                    response["icon_set"] = True
             except Exception as exc:
+                response["icon_set"] = False
                 response["icon_error"] = str(exc)
         return response
 
@@ -443,6 +469,12 @@ def delete_template_sensor(entry_id: str) -> dict:
     """
     Delete a template sensor config entry by entry_id.
     Use the entry_id returned by create_template_sensor.
+
+    ⚠️ This is irreversible. The sensor and its history are gone.
+
+    Returns: {deleted: entry_id, status: <HTTP status code>}. A non-2xx
+    response raises rather than returning a value, like every other REST
+    config write in this codebase.
     """
     with httpx.Client() as client:
         r = client.delete(

@@ -1,7 +1,7 @@
 # HA MCP Server
 
 An [MCP](https://modelcontextprotocol.io/) server that exposes Home Assistant's
-REST and WebSocket APIs as **182 tools**, so an MCP client — Claude Code among
+REST and WebSocket APIs as **183 tools**, so an MCP client — Claude Code among
 others — can drive an instance directly.
 
 Lights, climate, covers, media, alarm and cameras; automations, scripts, scenes,
@@ -13,7 +13,11 @@ A status dashboard shows what the server sees and which tools have been called.
 
 > **It can also delete things** — automations, dashboards, helpers, users. Every
 > tool was exercised against a live instance before release, but treat it as
-> what it is: a broad, powerful interface to your home.
+> what it is: a broad, powerful interface to your home. `create_user`,
+> `update_user` and `delete_user` — the tools that manage Home Assistant login
+> accounts, not entities — are **disabled by default**; see
+> [`MCP_ENABLE_USER_MANAGEMENT`](#the-user-management-tools-are-off-by-default)
+> below to turn them on.
 
 ![The status dashboard](docs/img/dashboard.png)
 
@@ -61,6 +65,41 @@ The image (`ghcr.io/driin0/ha-mcp-server`) is published multi-architecture
 | `HA_DEFAULT_LANGUAGE` | empty | language for conversation tools |
 | `HA_ALEXA_KEYWORDS` | `echo,alexa` | media players treated as Alexa devices |
 | `HA_REMOTE_PREFIXES` | empty | entity prefixes routed as remotes |
+| `MCP_ENABLE_USER_MANAGEMENT` | `false` | registers `create_user`/`update_user`/`delete_user` (see below) |
+
+### The user-management tools are off by default
+
+Nothing server-side can make an MCP client ask for confirmation before
+calling a tool — the one guardrail this server *can* enforce is not
+registering a tool at all, so it never appears in the client's menu.
+`create_user`, `update_user` and `delete_user` manage Home Assistant **login
+accounts**, a different risk tier from turning off a light or even deleting a
+scene: a request that sounds routine ("add a account for the cleaner") is a
+privileged, account-creating action, and almost nobody needs a language model
+to have that capability. They are not registered unless
+`MCP_ENABLE_USER_MANAGEMENT=true` is set.
+
+Every other tool that existed in earlier releases — every `delete_*`,
+`lock_control`, `restart_homeassistant`, `apply_update` — stays registered by
+default: upgrading must not make capabilities disappear with no error, only
+absence.
+
+If a tool you expect is missing, call `list_disabled_tools()` — it is always
+registered, and reports which groups are gated, whether each is currently on,
+and the env var that controls it.
+
+`call_service`, `fire_event` and `call_addon_api` are **not** covered by this
+or any gate: `call_service` can invoke any Home Assistant service (including
+`lock.unlock`, exactly what `lock_control` wraps), `fire_event` can trigger
+anything listening on the event bus, and `call_addon_api` proxies to whatever
+HTTP API an installed add-on exposes. Disabling a named tool while leaving
+these enabled would not remove the underlying capability, only its friendlier
+name — so treat them as carrying the safety weight of whatever they are
+pointed at, not the weight of their own name. (Home Assistant's user and
+person registries are WebSocket-only config commands, not services, so
+`call_service` specifically cannot reach `create_user`/`update_user`/
+`delete_user`'s equivalents — but this reasoning does not extend to future
+gates on tools call_service *can* reach.)
 
 ## Connecting a client
 

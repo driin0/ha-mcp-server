@@ -34,6 +34,15 @@ import tools.tags
 import tools.alerts
 import tools.prompts
 
+from tools._base import apply_registration_gate
+
+# Every tools.* module above has now run its @mcp.tool() decorators, so every
+# tool that exists at all is registered - only now can a gated one actually
+# be found and removed. See apply_registration_gate()'s docstring
+# (tools/_base.py) for why this happens here, after the fact, rather than by
+# changing how any individual tool is declared.
+DISABLED_TOOLS = apply_registration_gate()
+
 if __name__ == "__main__":
     import hmac
     import time

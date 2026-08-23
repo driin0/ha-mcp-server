@@ -45,6 +45,9 @@ def create_person(
                      (use list_users via WS or leave empty for persons without accounts)
     device_trackers: list of device_tracker entity_ids to track this person's location,
                      e.g. ['device_tracker.jane_phone', 'device_tracker.jane_tablet']
+
+    Returns the created person object from Home Assistant, or an error()
+    envelope on failure.
     """
     msg: dict = {"type": "person/create", "name": name}
     if user_id:
@@ -72,6 +75,9 @@ def update_person(
     name:            new display name (leave empty to keep current)
     user_id:         HA user ID to link (pass empty string to unlink)
     device_trackers: new list of device_tracker entity_ids (replaces current list)
+
+    Returns the updated person object from Home Assistant, or an error()
+    envelope on failure.
     """
     msg: dict = {"type": "person/update", "person_id": person_id}
     if name:
@@ -95,6 +101,13 @@ def delete_person(person_id: str) -> dict:
                Use list_persons() to find entity_ids, then strip 'person.' prefix.
 
     Note: only persons created via the UI (not imported from HA user accounts) can be deleted.
+
+    ⚠️ This is irreversible. Any zone/presence automation keyed on this
+    person stops matching it.
+
+    Returns: {deleted: person_id, success: true} on success, or an
+    error() envelope with Home Assistant's actual error code/message on
+    failure.
     """
     result = _ws({"type": "person/delete", "person_id": person_id})
     if err := ws_error(result):

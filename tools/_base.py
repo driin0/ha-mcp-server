@@ -1,3 +1,81 @@
+"""Shared plumbing for every tool in tools/*.py, plus the write-result convention.
+
+## The write-result convention
+
+A read tool wraps a collection in envelope() and a single object in a plain
+dict; the read half of this file has always been unambiguous about shape. The
+write half was not — an audit of 97 write tools across an earlier revision of
+this codebase found 21 different acknowledgement keys, 17 tools that returned
+Home Assistant's raw object with no marker of any kind, and one bug
+(areas.py, since fixed) that could return {"disabled": true, "success":
+false} in the same dict — an unconditional claim of the effect alongside a
+denial that it happened, with Home Assistant's actual error code discarded
+in favour of a bare False. The convention below is what replaced that: every
+write tool in this codebase now returns exactly one of the following.
+
+1. error(code, detail, **extra) — the call failed, or the target does not
+   exist. Never returned inside a list: a failure must not be reachable by
+   iterating results as if it were a record.
+
+2. An **actuation** result, for a service call that changes an entity's own
+   state: observe_actuation() reads the entity back after the call and
+   reports {..., "verified": bool, "state": <observed>} — never the service
+   call's own response body, which Home Assistant answers with 200 and an
+   empty list for both a successful idempotent call and a call aimed at an
+   entity that does not exist (see confirm_entity_exists()'s docstring).
+   When the entity has nothing to read back (press_button, a notification,
+   an alert acknowledgement), confirm_entity_exists() is called first, and
+   the result is {..., "accepted": True, "verified": None, "detail": "..."}
+   — "verified: None" here is a claim of ignorance, not of success; the
+   detail says what could and could not be confirmed.
+
+3. A **registry write** result, for a config/registry command (create,
+   update, delete an area, tag, person, helper, dashboard, pipeline...):
+   gated by ws_error() (or an HTTP status check, for the handful of REST
+   config endpoints) BEFORE anything is built from it — a dict returned
+   from a write tool with no "error" key is therefore unambiguously a
+   success, by construction, not by a "success" flag that could disagree
+   with the rest of the dict. Past that gate:
+     - create/update returns the object Home Assistant handed back. That
+       object is its own acknowledgement — it carries the very fields that
+       just changed — so nothing is layered on top of it; a redundant
+       "success": true is exactly the kind of field that went stale in the
+       areas.py bug.
+     - delete, or any write with no natural content payload, returns a
+       small dict naming what was done, e.g. {"deleted": id}. A literal
+       "success": True here is not contradictable the way it used to be:
+       the line that builds it is only reached once ws_error() has already
+       confirmed there is nothing to contradict it with.
+
+4. A **bulk** result: {"total", "succeeded", "failed": [...]} — one entry
+   per item, since a batch tolerates partial failure a single call cannot.
+
+Never a bare bool, a bare string, or None: a caller — nearly always a
+language model with no access to this source — is reading a JSON value with
+no schema, and a bare scalar carries no field names to hang a question on
+("did true mean the light is on, or that the call was accepted?"). The three
+tools that legitimately return a plain string (get_addon_logs, get_error_log,
+render_template) return a string because their output IS the payload — a log,
+a template render — not an acknowledgement of anything.
+
+tests/test_conformance.py enforces the mechanically-checkable parts of this:
+every tool returns dict (except the three string tools above); no tool
+returns a bare list literal, a bare scalar literal, or defaults a missing WS
+"success" key with .get("success", <literal>) — that pattern is exactly what
+let a transport failure or a real HA error pass through as a false success,
+or (in the other direction) let a real failure's detail get discarded in
+favour of a bare False. Route both around ws_error() instead.
+
+## The registration gate
+
+A confirmation protocol cannot be enforced from inside this server: nothing
+here can make a calling model ask the user before acting. The one guardrail
+that server-side code CAN enforce is not registering a tool at all, so it
+never appears in the model's menu in the first place. See
+GATED_TOOL_GROUPS/disabled_tool_names()/apply_registration_gate() below, and
+list_disabled_tools() for how that absence stays discoverable rather than a
+silent capability gap.
+"""
 import asyncio
 import json
 import os
@@ -448,3 +526,131 @@ def observe_actuation(entity_id: str, satisfied, *, retries: int = 1, delay: flo
         if satisfied(state):
             return {"exists": True, "verified": True, "state": state}
     return {"exists": True, "verified": False, "state": state}
+
+
+# ---------------------------------------------------------------------------
+# Registration gate
+# ---------------------------------------------------------------------------
+# Each group maps an env var to the tool names it controls and the default
+# when that env var is unset. Every group defaults to *enabled* except
+# "user_management": creating, editing or deleting a Home Assistant login
+# account is a different risk tier from moving a cover or deleting a scene —
+# it is the exact shape of a disguised-privileged-action problem (a
+# plausible-sounding request that is actually an account takeover vector),
+# almost nobody needs a language model to have that capability, and it is
+# rare enough in ordinary use that disabling it by default costs little.
+# Every other destructive or actuating tool — every delete_*, lock_control,
+# restart_homeassistant, apply_update — stays enabled by default: someone
+# upgrading from v1.1.0 must not find capabilities gone with no error, only
+# absence. See list_disabled_tools() below for how the absence that DOES
+# happen (user_management, until explicitly enabled) stays discoverable.
+GATED_TOOL_GROUPS: dict[str, dict] = {
+    "user_management": {
+        "tools": {"create_user", "update_user", "delete_user"},
+        "env": "MCP_ENABLE_USER_MANAGEMENT",
+        "default": False,
+        "reason": (
+            "creates, edits or deletes Home Assistant login accounts — a "
+            "different risk tier from controlling entities, and the tier "
+            "where a disguised request (\"add a maintenance user\") is "
+            "really a privileged account-management action."
+        ),
+    },
+}
+
+
+def _group_enabled(spec: dict) -> bool:
+    flag = os.getenv(spec["env"], "").strip().lower()
+    if flag:
+        return flag in ("1", "true", "yes")
+    return spec["default"]
+
+
+def disabled_tool_names() -> set[str]:
+    """The tool names GATED_TOOL_GROUPS says should not be registered, given
+    the environment right now.
+
+    A pure function of os.environ - no side effect on the tool registry
+    itself - so it can be called freely (by apply_registration_gate() below,
+    by list_disabled_tools(), by a test) without touching global state.
+    """
+    disabled = set()
+    for spec in GATED_TOOL_GROUPS.values():
+        if not _group_enabled(spec):
+            disabled |= spec["tools"]
+    return disabled
+
+
+def apply_registration_gate() -> set[str]:
+    """Deregister every tool disabled_tool_names() names, and return them.
+
+    Every tools/*.py module still declares its tools with the same bare
+    @mcp.tool() every conformance sweep in tests/test_conformance.py scans
+    for by source - gating happens here, after the fact, by removing an
+    already-registered tool from mcp._tool_manager, not by changing how or
+    whether a module decorates its functions. That keeps a gated tool fully
+    visible to every static check (it still returns dict, still has no bare
+    list/scalar return, still carries its Returns: docstring) while making
+    it invisible to an MCP client's tools/list - the actual guardrail, since
+    nothing server-side can make a calling model ask before acting; not
+    registering the tool is the one thing this server CAN enforce.
+
+    Call once, after every tools.* module has imported (server.py does this
+    right after its import block) - a tool has to be registered before it
+    can be removed, so calling this before all modules have imported would
+    silently do nothing for whichever ones import later.
+    """
+    removed = set()
+    for name in disabled_tool_names():
+        if mcp._tool_manager.get_tool(name) is not None:
+            mcp._tool_manager.remove_tool(name)
+            removed.add(name)
+    return removed
+
+
+@mcp.tool()
+def list_disabled_tools() -> dict:
+    """List which tool groups are gated behind an env var, and their current
+    on/off state on this running instance.
+
+    Always registered, regardless of what it reports - the one fixed point
+    a caller can use to discover that a tool it expected (create_user,
+    update_user, delete_user, by default) is not a bug or a version
+    mismatch, but a deliberate opt-in gate, and how to turn it on.
+
+    Returns: {total, returned, offset, note?, groups: [{group, enabled,
+    tools, env, reason}]}. `enabled` re-reads the env var on every call
+    rather than caching what apply_registration_gate() saw at startup - in
+    the ordinary case (the env var is fixed for the process's lifetime,
+    normal for a container) the two always agree. They can only disagree if
+    something changes the env var after this process already started
+    without restarting it, in which case this tool reports the live value
+    while the actual registration - decided once, at startup - has not
+    moved: restart the server for a changed flag to take effect.
+
+    call_service, fire_event and call_addon_api are deliberately absent
+    from every group and from this list: they are generic passthroughs
+    (any HA service, any event, any add-on's own HTTP API) that a
+    named-tool gate cannot cover without also restricting them specifically
+    - gating create_user while leaving call_service enabled would be
+    decorative if call_service could reach the same WebSocket command, so
+    this was checked directly rather than assumed: Home Assistant's user
+    and person registries (config/auth/*, person/*) are WebSocket-only
+    config commands, not services, and call_service only proxies POST
+    /api/services/{domain}/{service} - there is no domain/service that
+    creates, edits or deletes a login account or a person for it to reach.
+    fire_event and call_addon_api touch neither registry. A future group
+    gating something call_service CAN reach (e.g. lock_control, which
+    lock.unlock duplicates exactly) would need to restrict call_service
+    too, or it would be exactly that decorative gate.
+    """
+    groups = []
+    for group, spec in sorted(GATED_TOOL_GROUPS.items()):
+        groups.append({
+            "group": group,
+            "enabled": _group_enabled(spec),
+            "tools": sorted(spec["tools"]),
+            "env": spec["env"],
+            "reason": spec["reason"],
+        })
+    return envelope(groups, key="groups")
