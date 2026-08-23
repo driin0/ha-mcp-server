@@ -1,6 +1,27 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, HELPER_DOMAINS, _slug, _ws, envelope
+from tools._base import mcp, HA_URL, HEADERS, HELPER_DOMAINS, _slug, _ws, envelope, error, ws_error
+
+# Per-domain whitelist of the config keys {domain}/create legitimately
+# accepts, mirroring each helper integration's own STORAGE_FIELDS schema
+# (homeassistant/components/<domain>/__init__.py, checked against a running
+# 2026.8 instance). "name" and "type" are deliberately absent from every
+# set: "type" selects which WebSocket command actually runs and must never
+# be a caller-controlled value - it decided which command ran even when
+# reserved keys were spread before config, since a whitelist rejects an
+# unknown key outright rather than merely losing a key-collision fight -
+# and "name" is already this tool's own required parameter, so a same-named
+# key inside config could only shadow or duplicate it.
+_HELPER_CREATE_FIELDS = {
+    "input_boolean": {"initial", "icon"},
+    "input_number": {"min", "max", "initial", "step", "unit_of_measurement", "icon", "mode"},
+    "input_text": {"min", "max", "initial", "icon", "unit_of_measurement", "pattern", "mode"},
+    "input_select": {"options", "initial", "icon"},
+    "input_datetime": {"has_date", "has_time", "icon", "initial"},
+    "counter": {"initial", "step", "minimum", "maximum", "icon", "restore"},
+    "timer": {"duration", "restore", "icon"},
+    "input_button": {"icon"},
+}
 
 
 @mcp.tool()
@@ -123,23 +144,55 @@ def create_helper(
 
     input_button:
       {}  (no extra config needed)
+
+    config may only contain the keys legitimate for `domain` (see above) -
+    anything else, including "type" or "name", is refused rather than sent.
     """
-    supported = {
-        "input_boolean", "input_number", "input_text", "input_select",
-        "input_datetime", "counter", "timer", "input_button",
-    }
-    if domain not in supported:
-        return {"error": f"Unsupported domain: {domain}. Use one of: {sorted(supported)}"}
+    if domain not in _HELPER_CREATE_FIELDS:
+        return error("unsupported_domain", f"Unsupported domain: {domain}",
+                     allowed=sorted(_HELPER_CREATE_FIELDS))
+
+    config = config or {}
+    allowed = _HELPER_CREATE_FIELDS[domain]
+    offending = sorted(set(config) - allowed)
+    if offending:
+        return error(
+            "invalid_config_keys",
+            f"config for domain '{domain}' accepts only {sorted(allowed)}; "
+            f"reject unexpected key(s): {offending}",
+            domain=domain, offending_keys=offending, allowed_keys=sorted(allowed),
+        )
+
     # Helper "storage" collections are created over the WebSocket API
     # ({domain}/create) — exactly like the GUI helper editor. There is no REST
     # config endpoint for these, so an httpx POST returns 404.
-    res = _ws({"type": f"{domain}/create", "name": name, **(config or {})})
-    if not res.get("success"):
-        return {"error": "WebSocket create failed", "domain": domain,
-                "name": name, "detail": res.get("error")}
-    item = res.get("result") or {}
-    helper_id = item.get("id", _slug(name))
-    return {"helper_id": helper_id, "entity_id": f"{domain}.{helper_id}", "result": item}
+    res = _ws({"type": f"{domain}/create", "name": name, **config})
+    if err := ws_error(res):
+        return err
+
+    item = res["result"]
+    helper_id = item.get("id")
+    if not helper_id:
+        return error("no_id_in_response",
+                     "Home Assistant did not return an id for the created helper",
+                     domain=domain, name=name, result=item)
+    entity_id = f"{domain}.{helper_id}"
+
+    # The create response never carries entity_id, only the storage item's
+    # own id - verify the entity actually exists rather than trusting one
+    # constructed locally (the old fallback invented an id from the name
+    # via _slug() whenever the response carried none, and reported an
+    # entity_id that could point at nothing).
+    with httpx.Client() as client:
+        r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
+    if r.status_code != 200:
+        return error(
+            "entity_not_found",
+            f"Helper storage item was created (id={helper_id!r}) but entity "
+            f"{entity_id} does not exist",
+            domain=domain, name=name, helper_id=helper_id, entity_id=entity_id,
+        )
+    return {"helper_id": helper_id, "entity_id": entity_id, "result": item}
 
 
 @mcp.tool()

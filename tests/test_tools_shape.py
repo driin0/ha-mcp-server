@@ -432,6 +432,66 @@ def test_backups_reports_a_ws_failure_as_an_error(fake_ha):
     assert "backups" not in result
 
 
+def test_create_backup_defaults_to_every_available_agent(fake_ha):
+    """backup/generate now requires agent_ids - the tool used to send none
+    at all, so every call failed with invalid_format. When the caller
+    passes none, default to every agent backup/agents/info reports."""
+    from tools.system import create_backup
+
+    fake_ha.ws_result("backup/agents/info", {"agents": [
+        {"agent_id": "backup.local", "name": "local"},
+    ]})
+    fake_ha.ws_result("backup/generate", {"backup_job_id": "abc123"})
+
+    result = create_backup(name="Nightly")
+
+    assert result["backup_job_id"] == "abc123"
+    assert result["agent_ids"] == ["backup.local"]
+    generate_call = [c for c in fake_ha.ws_calls if c["type"] == "backup/generate"][0]
+    assert generate_call["agent_ids"] == ["backup.local"]
+    assert generate_call["name"] == "Nightly"
+
+
+def test_create_backup_uses_caller_supplied_agent_ids(fake_ha):
+    from tools.system import create_backup
+
+    fake_ha.ws_result("backup/generate", {"backup_job_id": "xyz789"})
+
+    result = create_backup(agent_ids=["backup.local", "backup.other"])
+
+    assert result["backup_job_id"] == "xyz789"
+    # No agents/info lookup needed - the caller already said which agents.
+    assert not any(c["type"] == "backup/agents/info" for c in fake_ha.ws_calls)
+    generate_call = [c for c in fake_ha.ws_calls if c["type"] == "backup/generate"][0]
+    assert generate_call["agent_ids"] == ["backup.local", "backup.other"]
+
+
+def test_create_backup_reports_no_agents_instead_of_failing_silently(fake_ha):
+    from tools.system import create_backup
+
+    fake_ha.ws_result("backup/agents/info", {"agents": []})
+
+    result = create_backup()
+
+    assert result["error"] == "no_backup_agents"
+
+
+def test_create_backup_surfaces_a_ws_failure_as_an_error_not_a_raw_frame(fake_ha):
+    """create_backup used to return `result.get("result") or result` -
+    on failure `result` has no "result" key, so the raw
+    {"success": False, "error": {...}} frame was returned as-is, two levels
+    removed from an actual error() envelope, and nobody read it."""
+    from tools.system import create_backup
+
+    fake_ha.fail_ws("backup/generate", code="unknown_error", message="agent unavailable")
+
+    result = create_backup(agent_ids=["backup.local"])
+
+    assert result["error"] == "unknown_error"
+    assert "success" not in result
+    assert "backup_job_id" not in result
+
+
 def test_updates_wraps_a_success(fake_ha):
     from tools.system import list_updates
 
@@ -1373,6 +1433,86 @@ def test_list_lovelace_resources_failure_is_an_error_not_a_record(fake_ha):
     assert "resources" not in result
 
 
+def test_update_dashboard_resolves_url_path_and_succeeds(fake_ha):
+    from tools.dashboards import update_dashboard
+
+    fake_ha.ws_result("lovelace/dashboards/list", [
+        {"url_path": "energia", "id": "energia_id", "title": "Energia"},
+    ])
+    fake_ha.ws_result("lovelace/dashboards/update", {"id": "energia_id", "title": "Energy"})
+
+    result = update_dashboard("energia", title="Energy")
+
+    assert "error" not in result
+    update_call = [c for c in fake_ha.ws_calls if c["type"] == "lovelace/dashboards/update"][0]
+    assert update_call["dashboard_id"] == "energia_id"
+
+
+def test_update_dashboard_says_not_found_for_a_genuinely_absent_url_path(fake_ha):
+    from tools.dashboards import update_dashboard
+
+    fake_ha.ws_result("lovelace/dashboards/list", [
+        {"url_path": "energia", "id": "energia_id", "title": "Energia"},
+    ])
+
+    result = update_dashboard("does-not-exist", title="X")
+
+    assert result["error"] == "not_found"
+
+
+def test_update_dashboard_reports_a_registry_read_failure_not_not_found(fake_ha):
+    """_dashboard_id used to fold a failed lovelace/dashboards/list read into
+    an empty list via `result.get("result") or []`, so update_dashboard told
+    the caller the dashboard did not exist when the registry read itself had
+    failed - wrong error, wrong recovery advice."""
+    from tools.dashboards import update_dashboard
+
+    fake_ha.fail_ws("lovelace/dashboards/list", code="unauthorized", message="Admin required")
+
+    result = update_dashboard("energia", title="X")
+
+    assert result["error"] == "unauthorized"
+    assert result["error"] != "not_found"
+
+
+def test_delete_dashboard_resolves_url_path_and_succeeds(fake_ha):
+    from tools.dashboards import delete_dashboard
+
+    fake_ha.ws_result("lovelace/dashboards/list", [
+        {"url_path": "energia", "id": "energia_id", "title": "Energia"},
+    ])
+    fake_ha.ws_result("lovelace/dashboards/delete", {})
+
+    result = delete_dashboard("energia")
+
+    assert result["deleted"] == "energia"
+    delete_call = [c for c in fake_ha.ws_calls if c["type"] == "lovelace/dashboards/delete"][0]
+    assert delete_call["dashboard_id"] == "energia_id"
+
+
+def test_delete_dashboard_says_not_found_for_a_genuinely_absent_url_path(fake_ha):
+    from tools.dashboards import delete_dashboard
+
+    fake_ha.ws_result("lovelace/dashboards/list", [
+        {"url_path": "energia", "id": "energia_id", "title": "Energia"},
+    ])
+
+    result = delete_dashboard("does-not-exist")
+
+    assert result["error"] == "not_found"
+
+
+def test_delete_dashboard_reports_a_registry_read_failure_not_not_found(fake_ha):
+    from tools.dashboards import delete_dashboard
+
+    fake_ha.fail_ws("lovelace/dashboards/list", code="unauthorized", message="Admin required")
+
+    result = delete_dashboard("energia")
+
+    assert result["error"] == "unauthorized"
+    assert result["error"] != "not_found"
+
+
 # ---- tools/hacs.py ---------------------------------------------------------
 
 def test_hacs_check_reports_a_transport_failure_instead_of_a_false_success(fake_ha):
@@ -2049,6 +2189,109 @@ def test_list_helpers_filters_by_domain(fake_ha):
     assert result["total"] == 1
     assert result["helpers"][0]["entity_id"] == "input_boolean.guest_mode"
     assert result["helpers"][0]["domain"] == "input_boolean"
+
+
+def test_create_helper_normal_creation_succeeds_for_each_domain(fake_ha):
+    from tools.helpers import create_helper
+
+    cases = [
+        ("input_boolean", "Guest Mode", {"initial": True}, "input_boolean.guest_mode"),
+        ("input_number", "Timer Minutes", {"min": 0, "max": 60, "step": 1}, "input_number.timer_minutes"),
+        ("input_text", "Message", {"max": 100}, "input_text.message"),
+        ("input_select", "Scene", {"options": ["Day", "Night"]}, "input_select.scene"),
+        ("input_datetime", "Wake Up", {"has_time": True}, "input_datetime.wake_up"),
+        ("counter", "Visitors", {"initial": 0}, "counter.visitors"),
+        ("timer", "Pizza", {"duration": "00:20:00"}, "timer.pizza"),
+        ("input_button", "Doorbell", {}, "input_button.doorbell"),
+    ]
+    for domain, name, config, entity_id in cases:
+        helper_id = entity_id.split(".", 1)[1]
+        fake_ha.ws_result(f"{domain}/create", {"id": helper_id, "name": name})
+        fake_ha.states.append({"entity_id": entity_id, "state": "off", "attributes": {}})
+
+        result = create_helper(domain=domain, name=name, config=config)
+
+        assert "error" not in result, (domain, result)
+        assert result["helper_id"] == helper_id, (domain, result)
+        assert result["entity_id"] == entity_id, (domain, result)
+
+
+def test_create_helper_refuses_a_config_that_tries_to_overwrite_type(fake_ha):
+    """The exact hijack this fix closes: a config carrying "type" used to be
+    spread after the reserved keys in the WS message, so it silently
+    replaced input_boolean/create with an arbitrary command - here,
+    config/auth/create, which would have created a system-admin user while
+    the caller believed it was creating an inert boolean helper."""
+    from tools.helpers import create_helper
+
+    result = create_helper(
+        domain="input_boolean",
+        name="PortaSulRetro",
+        config={"type": "config/auth/create", "name": "PortaSulRetro",
+                "group_ids": ["system-admin"]},
+    )
+
+    assert result["error"] == "invalid_config_keys"
+    assert "type" in result["offending_keys"]
+    assert not fake_ha.ws_calls  # refused before ever reaching the WS layer
+
+
+def test_create_helper_refuses_an_unexpected_config_key(fake_ha):
+    from tools.helpers import create_helper
+
+    result = create_helper(domain="input_boolean", name="Guest Mode",
+                            config={"not_a_real_field": 1})
+
+    assert result["error"] == "invalid_config_keys"
+    assert result["offending_keys"] == ["not_a_real_field"]
+    assert not fake_ha.ws_calls
+
+
+def test_create_helper_rejects_an_unsupported_domain(fake_ha):
+    from tools.helpers import create_helper
+
+    result = create_helper(domain="climate", name="Nope")
+
+    assert result["error"] == "unsupported_domain"
+    assert not fake_ha.ws_calls
+
+
+def test_create_helper_reports_a_ws_failure_as_an_error(fake_ha):
+    from tools.helpers import create_helper
+
+    fake_ha.fail_ws("input_boolean/create", code="invalid_format", message="bad name")
+
+    result = create_helper(domain="input_boolean", name="")
+
+    assert result["error"] == "invalid_format"
+
+
+def test_create_helper_verifies_the_entity_actually_exists(fake_ha):
+    """{domain}/create's response only ever carries a storage item id, never
+    entity_id - the tool used to construct f"{domain}.{helper_id}" (or,
+    lacking even an id, f"{domain}.{_slug(name)}") and report it unverified.
+    Here the storage item id is real but no matching entity was ever
+    created, which must surface as an error rather than a claimed
+    entity_id."""
+    from tools.helpers import create_helper
+
+    fake_ha.ws_result("input_boolean/create", {"id": "guest_mode", "name": "Guest Mode"})
+    # Deliberately do NOT add input_boolean.guest_mode to fake_ha.states.
+
+    result = create_helper(domain="input_boolean", name="Guest Mode")
+
+    assert result["error"] == "entity_not_found"
+    assert result["entity_id"] == "input_boolean.guest_mode"
+
+
+def test_create_helper_reports_no_id_in_response_instead_of_inventing_one(fake_ha):
+    from tools.helpers import create_helper
+
+    fake_ha.ws_result("input_boolean/create", {"name": "Guest Mode"})  # no "id"
+
+    result = create_helper(domain="input_boolean", name="Guest Mode")
+
+    assert result["error"] == "no_id_in_response"
 
 
 def test_list_locks_wraps_a_success(fake_ha):

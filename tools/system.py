@@ -113,17 +113,38 @@ def list_backups() -> dict:
 
 
 @mcp.tool()
-def create_backup(name: str = "") -> dict:
+def create_backup(name: str = "", agent_ids: list = None) -> dict:
     """
     Create a new full backup of Home Assistant.
+
     name: optional backup name (defaults to HA's auto-generated name)
-    Note: backup creation is asynchronous — it may take several minutes to complete.
+    agent_ids: optional list of backup agent ids to store the backup with
+               (e.g. ['backup.local']). Home Assistant now requires at
+               least one agent_id on backup/generate; when omitted, every
+               agent reported by the backup integration is used. Use
+               list_backups() afterward to confirm the backup landed —
+               creation is asynchronous, so this call returns as soon as
+               the job is queued, not when it finishes.
     """
-    msg: dict = {"type": "backup/generate"}
+    if not agent_ids:
+        agents_result = _ws({"type": "backup/agents/info"})
+        if err := ws_error(agents_result):
+            return err
+        agent_ids = [a["agent_id"] for a in agents_result["result"].get("agents", [])]
+        if not agent_ids:
+            return error(
+                "no_backup_agents",
+                "No backup agents are configured on this Home Assistant "
+                "instance - backup/generate requires at least one agent_id, "
+                "and none is available to default to.",
+            )
+    msg: dict = {"type": "backup/generate", "agent_ids": agent_ids}
     if name:
         msg["name"] = name
     result = _ws(msg)
-    return result.get("result") or result
+    if err := ws_error(result):
+        return err
+    return {"backup_job_id": result["result"].get("backup_job_id"), "agent_ids": agent_ids}
 
 
 @mcp.tool()

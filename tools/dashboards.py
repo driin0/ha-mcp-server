@@ -1,18 +1,28 @@
 from tools._base import mcp, _ws, envelope, ws_error
 
 
-def _dashboard_id(url_path: str) -> str:
+def _dashboard_id(url_path: str) -> tuple[str, dict | None]:
     """Resolve a dashboard url_path to the id the WebSocket API expects.
 
     The lovelace/dashboards/update and /delete commands are keyed by
     dashboard_id and reject url_path outright, while url_path is what a user
     sees and what list_dashboards() reports — so it is translated here.
+
+    Returns (dashboard_id, error_envelope_or_None). `result.get("result") or
+    []` used to fold a failed lovelace/dashboards/list read into an empty
+    list, so a dead connection looked exactly like "no dashboard has that
+    url_path" to both callers (update_dashboard, delete_dashboard) — they
+    reported not_found for a registry they never actually got to check.
+    Routing the read through ws_error() lets a genuine absence stay
+    not_found while a failure surfaces as itself.
     """
     result = _ws({"type": "lovelace/dashboards/list"})
-    for d in result.get("result") or []:
+    if err := ws_error(result):
+        return "", err
+    for d in result["result"]:
         if d.get("url_path") == url_path:
-            return d.get("id", "")
-    return ""
+            return d.get("id", ""), None
+    return "", None
 
 
 @mcp.tool()
@@ -115,7 +125,9 @@ def update_dashboard(
 
     To update the actual views and cards content, use update_dashboard_config() instead.
     """
-    dashboard_id = _dashboard_id(url_path)
+    dashboard_id, err = _dashboard_id(url_path)
+    if err:
+        return err
     if not dashboard_id:
         return {"error": "not_found", "url_path": url_path,
                 "detail": "No dashboard with that url_path. Use list_dashboards()."}
@@ -177,7 +189,9 @@ def delete_dashboard(url_path: str) -> dict:
     url_path: dashboard URL path (use list_dashboards() to find url_paths).
     Note: the default dashboard cannot be deleted.
     """
-    dashboard_id = _dashboard_id(url_path)
+    dashboard_id, err = _dashboard_id(url_path)
+    if err:
+        return err
     if not dashboard_id:
         return {"error": "not_found", "url_path": url_path,
                 "detail": "No dashboard with that url_path. Use list_dashboards()."}
