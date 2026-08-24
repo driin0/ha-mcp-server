@@ -670,6 +670,53 @@ def test_recurses_into_a_parallel_branch_wrapped_in_its_own_sequence():
     assert waits[0]["wait_where"] == "action.0.parallel.0.sequence.0"
 
 
+def test_recurses_into_a_parallel_branch_that_is_a_bare_single_action():
+    """A parallel branch has THREE valid shapes in Home Assistant's own
+    schema, not two: a bare list, a {"sequence": [...]} wrapper, and - via
+    SCRIPT_SCHEMA's own ensure_list coercion (homeassistant/helpers/
+    config_validation.py) - a single action with neither. Home Assistant's
+    config-write endpoint persists exactly what was submitted, not the
+    schema's own normalised form, so this third shape reaches a stored
+    config verbatim - confirmed live: {"parallel": [{"service": ...}]}
+    is accepted and stored as-is. Missing this shape was a real, silent
+    gap: a destructive action written this way was invisible to this
+    module entirely."""
+    config = {"action": [
+        {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
+        {"parallel": [
+            {"service": "switch.turn_off", "target": {"entity_id": "switch.a"}},
+        ]},
+    ]}
+
+    waits = find_fail_open_waits(config)
+
+    assert len(waits) == 1
+    assert waits[0]["wait_where"] == "action.0"
+    assert waits[0]["action_where"] == "action.1.parallel.0.0"
+    assert waits[0]["service"] == "switch.turn_off"
+
+
+def test_recurses_into_a_bare_single_action_parallel_branch_nested_in_repeat():
+    """Same shape, one level deeper - repeat.sequence containing a
+    parallel step whose own branch is a bare single action. Confirms the
+    fix threads through nested calls the same way every other nested
+    sequence shape already does (see _scan_sequence()'s own docstring)."""
+    config = {"action": [
+        {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
+        {"repeat": {"count": 1, "sequence": [
+            {"parallel": [
+                {"service": "switch.turn_off", "target": {"entity_id": "switch.a"}},
+            ]},
+        ]}},
+    ]}
+
+    waits = find_fail_open_waits(config)
+
+    assert len(waits) == 1
+    assert waits[0]["wait_where"] == "action.0"
+    assert waits[0]["action_where"] == "action.1.repeat.sequence.0.parallel.0.0"
+
+
 def test_a_destructive_action_in_a_different_branch_is_not_reported():
     """'Follows it in the same sequence' means the same flat list — a
     fail-open wait in one choose branch is not blamed for a destructive

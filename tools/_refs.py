@@ -362,8 +362,32 @@ def _nested_sequences(step: dict, step_path: str):
     """Yield (steps, path) for every nested sequence of steps reachable
     from one step, however Home Assistant wraps it - if/then, if/else,
     choose's own branches and its default, repeat's own sequence, and
-    parallel's own branches (each of which is itself either a bare list
-    of steps or a further {"sequence": [...]} wrapper)."""
+    parallel's own branches.
+
+    Every one of those is validated by Home Assistant's own schema
+    (homeassistant/helpers/config_validation.py) as SCRIPT_SCHEMA =
+    vol.All(ensure_list, [script_action]) - a list of actions, coerced
+    from a single bare action if that is what was written. A parallel
+    branch is the one place that coercion is visible in a STORED config,
+    not just at validation time: Home Assistant's own config-write
+    endpoint (homeassistant/components/config/view.py) persists the
+    request body exactly as submitted ("we just validate, we don't store
+    that data") - never the schema's own validated/coerced object - so a
+    parallel branch written as a single action with no `sequence:` key
+    and no list wrapper at all is exactly as valid, and exactly as
+    reachable at run time, as the same action inside a list or a
+    `{"sequence": [...]}` block. Confirmed live: Home Assistant accepts
+    and persists `{"parallel": [{"service": "switch.turn_off", ...}]}`
+    verbatim - no normalisation - and a destructive action written that
+    way used to be invisible to this module entirely.
+
+    A single-action branch is yielded as a synthetic one-element list -
+    the same shape ensure_list itself would produce - so its own path
+    gets a trailing `.0` from _scan_sequence()'s normal list-indexing
+    logic (e.g. `...parallel.2.0`), matching how Home Assistant's own
+    schema represents "this branch's first (only) action" rather than
+    inventing a different path shape for one case.
+    """
     for key in _DIRECT_SEQUENCE_KEYS:
         value = step.get(key)
         if isinstance(value, list):
@@ -386,6 +410,13 @@ def _nested_sequences(step: dict, step_path: str):
                 yield branch, f"{step_path}.parallel.{i}"
             elif isinstance(branch, dict) and isinstance(branch.get("sequence"), list):
                 yield branch["sequence"], f"{step_path}.parallel.{i}.sequence"
+            elif isinstance(branch, dict):
+                # Home Assistant's own shorthand for a one-action branch -
+                # no "sequence" key, not a list - see this function's own
+                # docstring for why this shape reaches this module at all
+                # (it is not a fallback for malformed config; it is a
+                # third, equally valid, equally reachable shape).
+                yield [branch], f"{step_path}.parallel.{i}"
 
 
 def _scan_sequence(steps, path: str, results: list, pending: dict | None = None) -> None:
