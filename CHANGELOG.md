@@ -3,8 +3,8 @@
 ## Unreleased
 
 Released as 2.0.0 when it ships. The entries below cover the result-envelope
-sweep on this branch only — plans 2 and 3 (automation-editing and
-validation work) are not included.
+sweep and the automation-editing work (plan 2) on this branch — plan 3
+(validation work) is not included.
 
 Every list-returning tool changes shape. If your client code, prompts, or
 saved conversations assume a bare list, they need updating — see below.
@@ -374,6 +374,149 @@ shape of bug):
   treatment defensively, for real locks that pass through `"locking"`/
   `"unlocking"` (not reproduced on this project's own test lock, which
   settles instantly).
+
+### Added — automation editing (plan 2)
+
+Editing an automation used to mean creating a second one under a new name,
+since `create_automation()`'s id is derived from the name it is given — on
+an automation that cuts mains power, the duplicate is the incident this
+project exists because of.
+
+- **`update_automation(entity_id, name="", triggers=None, conditions=None,
+  actions=None, mode="", description=None, enabled=None)`** — read-modify-
+  write against the automation's real stored config: only the fields
+  actually passed are replaced, everything else (a device trigger, a
+  nested `if/then`, a branch marked `enabled: false`) survives untouched
+  because it is never parsed. The automation's config id never changes, so
+  labels, dashboards and cross-references stay attached. `enabled` is
+  verified the way `create_automation()` verifies it — wait for the
+  entity, toggle, read the state back — never a bare success.
+- **`patch_automation(entity_id, path, value)`** — changes exactly one
+  value inside a stored config by dotted path
+  (`conditions.0.value_template`, `actions.2.target.entity_id`), without
+  restating anything around it. A path that does not resolve is refused
+  before anything is written, naming what IS present at the point
+  resolution failed — never a silent creation of a new branch.
+- **`get_automation`'s shape changed**: it now returns `{automation_id,
+  entity_id, name, mode?, stored_format, config}` instead of the raw
+  config dict, and resolves a UI-created automation's id (a numeric
+  timestamp unrelated to its name) the same way `delete_automation()`
+  already did. `config` is normalised to the modern vocabulary
+  (`triggers`/`conditions`/`actions`, `trigger:`/`action:` steps) at the
+  level the vocabulary actually applies - root keys, and the direct
+  trigger/action list items - the same level `update_automation()`/
+  `patch_automation()` write at; a step nested inside `choose`/`if`/
+  `repeat`/`parallel` is carried through in whichever vocabulary it was
+  last stored in, not forced modern. `stored_format` (`"legacy"` or
+  `"modern"`) names what the root vocabulary actually was on disk at read
+  time. `mode` is read from the entity's own state attribute first,
+  falling back to the config's own root key, and omitted entirely when
+  neither has it - not `config.get("mode", "single")`, which invented
+  `"single"` for a blueprint automation (mode comes from the blueprint,
+  not a root key in the automation's own config) and reported it as fact.
+- **Two vocabularies, and who actually controls which one survives.** Home
+  Assistant accepts two spellings for the same automation structure — root
+  (`trigger`/`condition`/`action` vs. `triggers`/`conditions`/`actions`),
+  trigger step (`platform:` vs. `trigger:`) and action step (`service:`
+  vs. `action:`) — and a real instance commonly has both, depending on
+  when each automation was last saved. `update_automation()` and
+  `patch_automation()` read a config, normalise it, and send it back in
+  whatever vocabulary it came in. But measured live, posting a fully
+  legacy config through Home Assistant's own REST config-write endpoint
+  and reading it straight back: the root keys and the action step's
+  `service:` are renamed on *every* save, whatever is posted; only the
+  trigger step's `platform:` survives as sent. That renaming is Home
+  Assistant's own config-write endpoint doing it — to any client,
+  including its own UI editor — not something either edit tool does or
+  can prevent through this API. A legacy automation edited through either
+  tool will therefore come back with plural root keys and `action:`
+  instead of `service:` on its next read; `stored_format` reports what was
+  read and what the tool sent back, not a promise about what Home
+  Assistant leaves on disk afterward.
+- `create_automation()`'s pre-create collision check now reports a failure
+  to check as `error("collision_check_failed", ...)` instead of silently
+  proceeding as if there were no collision: previously, any non-2xx
+  response reading the existing config other than a plain 404 — a
+  transient 500, a revoked token — fell through the same way a genuine "no
+  such id" does, so a check meant to stop a lossy slug from silently
+  replacing someone else's automation could itself fail open.
+  `overwrite=True` still skips the check entirely, unchanged.
+- `create_automation()` now exposes `mode` (default `"single"`, matching
+  its previous hardcoded behaviour), so `restart`/`queued`/`parallel`
+  automations no longer require a follow-up `update_automation()` call
+  just to set it.
+
+### Fixed — automation editing, final review
+
+- `create_automation(enabled=True)` (the default) no longer sends an
+  active `automation.turn_on` - it only waits for the entity and observes
+  whatever state is already there. The shared verification helper this
+  tool and `update_automation()` both call
+  (`_set_and_verify_enabled()`) had briefly, during extraction, started
+  sending the toggle unconditionally for both True and False - which
+  meant re-running `create_automation()` (`overwrite=True`, same name)
+  over an automation a person had deliberately turned off silently
+  re-armed it, `enabled` never having been touched, purely because it
+  defaults to True with no way to tell "explicitly requested" apart from
+  "just the default". Measured live before this fix: exactly that
+  sequence returned `{"enabled": true, "verified": true, "state": "on"}`.
+  `update_automation()`'s own `enabled` has no such default (`None` means
+  "not passed"), so an explicit `enabled=True` there still actively arms,
+  unchanged - the new `arm_when_enabling` parameter on
+  `_set_and_verify_enabled()` is what lets the two callers disagree
+  safely instead of drifting back into two separate implementations.
+
+### Fixed — the lost-update gap the final review missed
+
+`update_automation()` and `patch_automation()` are read-modify-write with
+no conditional write: fetch the stored config, change a field, POST the
+whole object back. Two calls racing each other on the same automation -
+two `patch_automation()` calls from one model correcting two different
+fields, issued in parallel, or either tool racing a person editing the
+same automation in the Home Assistant UI - could both report success
+while the second silently discarded the first's change. Verified live
+against a throwaway instance, and from Home Assistant's own source
+(`homeassistant/components/config/view.py`'s config-write endpoint,
+`homeassistant/components/automation/__init__.py`): the config-write GET
+carries no `ETag`/`Last-Modified`; a POST sent with `If-Match` or
+`If-Unmodified-Since` is silently ignored, not honoured or rejected; and
+the only WebSocket command registered for automation config
+(`automation/config`) is read-only, with no write counterpart at all.
+Home Assistant offers nothing to build a real compare-and-swap on.
+
+- Both edit tools now re-read the config immediately before their own
+  write and refuse with `error("concurrent_modification", ...)` if it no
+  longer matches what was read at the start of the call - nothing is
+  written in that case. This is a compare-and-swap *approximation*, not a
+  guarantee: it shrinks the unguarded window from "however long the
+  caller's own modify step takes" down to one HTTP round trip immediately
+  before the POST. Measured live, that residual window is on the order of
+  10ms.
+- After a successful write, both tools read the result back and refuse
+  with `error("config_write_unverified", ...)` if it does not match what
+  was intended, comparing both sides through `to_modern()` - a byte
+  comparison would always differ, since Home Assistant's own config-write
+  endpoint renames the root keys and an action step's `service:` on every
+  save regardless of what was posted (see the vocabulary paragraph
+  above). Unlike every other `error()` in this module, the write DID
+  happen in this case - the detail text says so explicitly, since a
+  caller cannot be told "safe" when this can only ever detect, not
+  prevent, the residual race.
+- `create_automation()`'s own pre-create collision check (`overwrite=False`)
+  has the identical read-then-write shape, though the invariant it
+  protects is different: not preserving a partial edit, but refusing to
+  silently replace something that appeared under the same lossy slug
+  between the check and the write. It now runs the same check again
+  immediately before the POST, for the same reason and with the same
+  "shrunk, not closed" caveat. `overwrite=True` is unaffected - that path
+  never promised collision protection to begin with.
+
+Proven live against a throwaway instance with an actual interleaving (not
+just a unit test against the fake): Writer A reads, Writer B writes a
+different field, Writer A's write lands - before this fix, both calls
+reported success and Writer B's change was silently gone; after it,
+Writer A's call is refused with `concurrent_modification` and nothing is
+written.
 
 ## 1.1.0
 

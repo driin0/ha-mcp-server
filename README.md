@@ -1,7 +1,7 @@
 # HA MCP Server
 
 An [MCP](https://modelcontextprotocol.io/) server that exposes Home Assistant's
-REST and WebSocket APIs as **183 tools** (179 registered by default — four are
+REST and WebSocket APIs as **185 tools** (181 registered by default — four are
 off until explicitly enabled, see [the registration
 gate](#the-registration-gate-three-groups-two-defaults) below), so an MCP
 client — Claude Code among others — can drive an instance directly.

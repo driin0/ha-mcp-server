@@ -4,9 +4,42 @@ Tools reach Home Assistant two ways: httpx for the REST API and `_ws` for the
 WebSocket API. This module answers both from the same in-memory dataset, so a
 test can say "the registry contains X" once and have every tool see it.
 """
+import copy
 import json
 
 import httpx
+
+# /api/config/automation/config/<id>, seeded for automation.nas_shutdown
+# (id "1684270733500" in DEFAULT_STATES below) - the incident automation
+# the automation-editing plan exists because of: a legacy-vocabulary config
+# (trigger/condition/action, platform/service) whose condition template
+# references an entity that had been renamed, button.nas_shutdown, and
+# whose actions press that button, wait for it to confirm, then cut power
+# at the switch. Real enough to exercise get_automation()'s normalisation
+# against, not a synthetic minimal shape.
+DEFAULT_AUTOMATION_CONFIGS = {
+    "1684270733500": {
+        "alias": "NAS shutdown",
+        "description": "",
+        "trigger": [
+            {"platform": "state", "entity_id": "input_boolean.nas_shutdown_request",
+             "to": "on"},
+        ],
+        "condition": [
+            {"condition": "template",
+             "value_template": "{{ is_state('button.nas_shutdown', 'unavailable') }}"},
+        ],
+        "action": [
+            {"service": "button.press", "target": {"entity_id": "button.nas_shutdown"}},
+            {"wait_for_trigger": [
+                {"platform": "state", "entity_id": "button.nas_shutdown",
+                 "to": "unavailable"},
+            ], "timeout": "00:00:30", "continue_on_timeout": True},
+            {"service": "switch.turn_off", "target": {"entity_id": "switch.nas_power"}},
+        ],
+        "mode": "single",
+    },
+}
 
 DEFAULT_STATES = [
     {"entity_id": "light.kitchen", "state": "on",
@@ -108,9 +141,14 @@ class FakeHA:
         # Assistant's own config-storage API. A POST here also creates or
         # updates a matching row in self.states, the way a real create
         # immediately registers an entity (verified live) - automations
-        # default to "on" (armed) and scripts to "off" (idle), Home
-        # Assistant's own defaults for a freshly created one.
-        self.automation_configs = {}
+        # default to "on" (armed) and scripts to "off" (idle) ONLY for an
+        # id not already in the store; re-POSTing an existing id (an
+        # update) preserves whatever state it already had instead (also
+        # verified live - see the POST handler below for the reasoning).
+        # Seeded with DEFAULT_AUTOMATION_CONFIGS above, matching the id
+        # already on automation.nas_shutdown in DEFAULT_STATES;
+        # script_configs has no such default seed.
+        self.automation_configs = copy.deepcopy(DEFAULT_AUTOMATION_CONFIGS)
         self.script_configs = {}
         # Everything the tools sent, for assertions.
         self.rest_calls = []
@@ -153,8 +191,39 @@ class FakeHA:
                 entity_id = f"{domain}.{item_id}"
                 if request.method == "POST":
                     body = json.loads(request.content or b"{}")
+                    is_new = item_id not in store
+                    existing = next(
+                        (s for s in self.states if s["entity_id"] == entity_id), None)
+                    # Stored verbatim, whatever vocabulary `body` is
+                    # actually in - deliberately NOT a model of the real
+                    # config-write endpoint's own rename-on-save (root
+                    # keys and an action step's service: get renamed to
+                    # the modern spelling on every save, regardless of
+                    # what was posted; only a trigger step's platform:
+                    # survives as sent - see tools/_aliases.py's module
+                    # docstring for the live measurement this describes).
+                    # No test in this suite exercises that renaming; it
+                    # was verified separately against a live instance, and
+                    # get_automation()/update_automation()/
+                    # patch_automation()'s own docstrings say so - a fake
+                    # that silently re-normalised on every write would
+                    # make `stored_format` untestable as "what was
+                    # actually read", since every POST would immediately
+                    # make the next GET look modern again.
                     store[item_id] = body
-                    row = {"entity_id": entity_id, "state": default_state,
+                    # A genuinely new automation registers armed
+                    # (default_state) - measured live for creation. But
+                    # re-POSTing an EXISTING one (an update) does not reset
+                    # its armed/disarmed state: measured live, an
+                    # automation turned off, then updated with an
+                    # unrelated field change (alias only, enabled
+                    # untouched), read back "off" afterward, not reset to
+                    # "on". update_automation() relies on this: an edit
+                    # must not silently re-arm what was deliberately
+                    # disabled.
+                    state = (existing["state"] if existing and not is_new
+                            else default_state)
+                    row = {"entity_id": entity_id, "state": state,
                            "attributes": {"friendly_name": body.get("alias", item_id),
                                          "id": item_id}}
                     for i, s in enumerate(self.states):

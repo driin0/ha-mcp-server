@@ -1916,6 +1916,74 @@ def test_create_automation_enabled_reports_the_observed_state(fake_ha):
     assert result["state"] == "on"
 
 
+def test_create_automation_enabled_true_never_actively_arms(fake_ha):
+    """enabled=True is create_automation()'s default, not necessarily an
+    explicit request - so it must never send an active turn_on, only
+    observe. This is what re-running create_automation() (overwrite=True,
+    same name) over an automation a person had deliberately disabled must
+    NOT silently re-arm: with no active turn_on, the state fakeha's
+    config-POST route preserves (see its own comment) is the state
+    actually observed, and Home Assistant's real config-write endpoint
+    behaves the same way - measured live."""
+    from tools.automations import create_automation
+
+    create_automation("Morning lights", trigger=[], action=[])
+    # A person disables it - not through this tool, so automation_configs
+    # is untouched, only the entity's own registered state changes.
+    for s in fake_ha.states:
+        if s["entity_id"] == "automation.morning_lights":
+            s["state"] = "off"
+
+    result = create_automation("Morning lights", trigger=["updated"], action=[],
+                               overwrite=True)
+
+    assert result["error"] == "automation_state_unverified"
+    assert result["state"] == "off"
+    assert result["enabled"] is False
+    assert not any(c.url.path == "/api/services/automation/turn_on"
+                  for c in fake_ha.rest_calls)
+
+
+def test_create_automation_reports_home_assistants_write_time_rejection(fake_ha):
+    """Same class of bug already fixed on update_automation()'s and
+    patch_automation()'s own config-write POSTs: a bare r.raise_for_status()
+    discarded Home Assistant's own validation message (e.g. "Invalid
+    trigger 'nope_not_a_platform' specified") as an uncaught
+    httpx.HTTPStatusError instead of the named error() every other
+    refusal in create_automation() already returns. Nothing is created,
+    and _set_and_verify_enabled() must never be reached - the enabled
+    path this fix sits right above must stay untouched."""
+    import httpx
+
+    from tools.automations import create_automation
+
+    real_handle = fake_ha.handle
+
+    def handle_post_rejected(request):
+        if (request.method == "POST"
+                and request.url.path == "/api/config/automation/config/bad_trigger_probe"):
+            return httpx.Response(400, text="Invalid trigger 'nope_not_a_platform' specified")
+        return real_handle(request)
+
+    fake_ha.handle = handle_post_rejected
+
+    result = create_automation(
+        "Bad trigger probe",
+        trigger=[{"platform": "nope_not_a_platform"}],
+        action=[],
+    )
+
+    assert result["error"] == "home_assistant_error"
+    assert result["status"] == 400
+    assert "nope_not_a_platform" in result["detail"]
+    assert result["automation_id"] == "bad_trigger_probe"
+    assert result["entity_id"] == "automation.bad_trigger_probe"
+    assert "bad_trigger_probe" not in fake_ha.automation_configs
+    # The enabled-verification path must never run against a rejected config.
+    assert not any(c.url.path.startswith("/api/services/automation/")
+                  for c in fake_ha.rest_calls)
+
+
 # ---- tools/helpers.py: create_template_sensor -------------------------------------
 
 def test_create_template_sensor_reports_a_rejected_flow_start_as_an_error_not_a_crash(fake_ha):

@@ -205,21 +205,28 @@ def test_create_automation_from_blueprint_posts_to_the_rest_config_endpoint(fake
     assert result["entity_id"] == "automation.hallway_motion"
 
 
-def test_create_automation_from_blueprint_raises_on_a_failed_call(fake_ha):
-    import httpx
-    import pytest
-
+def test_create_automation_from_blueprint_reports_home_assistants_rejection(fake_ha):
+    """Posts to the same config-write endpoint create_automation() does,
+    and is rejected by Home Assistant the same way on a malformed config -
+    a bare r.raise_for_status() used to discard HA's own explanation as an
+    uncaught httpx.HTTPStatusError; rest_error() reports it instead, the
+    same fix already applied to create_automation()'s identical POST."""
     from tools.automations import create_automation_from_blueprint
 
     fake_ha.fail_rest("/api/config/automation/config/", status=400,
                       message="Message malformed: not a file")
 
-    with pytest.raises(httpx.HTTPStatusError):
-        create_automation_from_blueprint(
-            blueprint_path="homeassistant/motion_trigger.yaml",
-            alias="Hallway motion",
-            input_values={},
-        )
+    result = create_automation_from_blueprint(
+        blueprint_path="homeassistant/motion_trigger.yaml",
+        alias="Hallway motion",
+        input_values={},
+    )
+
+    assert result["error"] == "home_assistant_error"
+    assert result["status"] == 400
+    assert "not a file" in result["detail"]
+    assert result["entity_id"] == "automation.hallway_motion"
+    assert "hallway_motion" not in fake_ha.automation_configs
 
 
 # ---- tools/automations.py & tools/scripts.py: _slug() id collisions (D2) ----------
@@ -256,6 +263,137 @@ def test_create_automation_calling_again_with_the_same_name_is_not_a_collision(f
 
     assert "error" not in result
     assert fake_ha.automation_configs["morning_lights"]["trigger"] == ["updated"]
+
+
+def test_create_automation_collision_check_sends_exactly_two_requests_when_absent(fake_ha):
+    """_fetch_config()'s slug-fallback is a no-op on each individual check:
+    create_automation() passes automation_id as both its own id and its own
+    slug, so a 404 on either GET must never trigger a second, identical one
+    of its own - see _fetch_config()'s own `if automation_id != slug` guard.
+
+    Exactly two GETs overall, not one: create_automation() (overwrite=False)
+    runs _check_collision() twice by design - once up front, and again
+    immediately before the write - to shrink the window in which something
+    else could create an automation under this same id between the two (see
+    _check_collision()'s own docstring, and this module's lost-update fix).
+    Neither of those two calls triggers its own extra slug-fallback request,
+    which is what this test actually guards - two, not four."""
+    from tools.automations import create_automation
+
+    create_automation("Morning lights", trigger=[], action=[])
+
+    config_gets = [
+        c for c in fake_ha.rest_calls
+        if c.method == "GET"
+        and c.url.path == "/api/config/automation/config/morning_lights"
+    ]
+    assert len(config_gets) == 2
+
+
+def test_create_automation_refuses_a_collision_created_between_check_and_write(fake_ha):
+    """The race the second _check_collision() call exists for: nothing
+    occupies this id at the time of the up-front check, but something else
+    (another create_automation() call for the exact same name, issued in
+    parallel; another MCP client; a person in the HA UI) creates one under
+    the same slug before this call's own write lands. The pre-write
+    recheck must catch that and refuse - the id_collision it reports is
+    exactly as real as one caught by the up-front check, just discovered
+    one round trip later. Without this second check, this call's write
+    would have silently replaced the racer's automation instead."""
+    import httpx
+
+    from tools.automations import create_automation
+
+    real_handle = fake_ha.handle
+    config_gets = {"count": 0}
+
+    def handle_with_race(request):
+        if (request.method == "GET"
+                and request.url.path == "/api/config/automation/config/morning_lights"):
+            config_gets["count"] += 1
+            if config_gets["count"] == 2:
+                # Something else creates a DIFFERENTLY-named automation
+                # under this exact slug between the two checks.
+                fake_ha.automation_configs["morning_lights"] = {
+                    "alias": "Raced by someone else", "trigger": [], "action": []}
+                return httpx.Response(200, json={
+                    "id": "morning_lights",
+                    **fake_ha.automation_configs["morning_lights"]})
+        return real_handle(request)
+
+    fake_ha.handle = handle_with_race
+
+    result = create_automation("Morning lights", trigger=[], action=[])
+
+    assert result["error"] == "id_collision"
+    assert result["existing_alias"] == "Raced by someone else"
+    assert result["requested_name"] == "Morning lights"
+    assert config_gets["count"] == 2
+    # Nothing was written by this call - the racer's automation stands.
+    assert not any(c.method == "POST" for c in fake_ha.rest_calls)
+    assert fake_ha.automation_configs["morning_lights"]["alias"] == "Raced by someone else"
+
+
+def test_create_automation_reports_a_failed_collision_check_instead_of_raising(fake_ha):
+    """A transient failure reading the existing config (a 500, an
+    unauthorized 401) used to fall through as "no collision", silently
+    re-enabling the exact lossy-slug replacement this check exists to
+    prevent. It must now refuse - named, not a bare HTTPStatusError - and
+    create nothing."""
+    from tools.automations import create_automation
+
+    fake_ha.fail_rest("/api/config/automation/config/", status=500,
+                      message="Internal Server Error")
+
+    result = create_automation("Morning lights", trigger=[], action=[])
+
+    assert result["error"] == "collision_check_failed"
+    assert result["status"] == 500
+    assert "morning_lights" not in fake_ha.automation_configs
+
+
+def test_create_automation_overwrite_proceeds_despite_a_failed_collision_check(fake_ha):
+    """overwrite=True skips the collision check entirely - a broken GET on
+    that same config endpoint must not stop a create that never attempts
+    to read it. Only the collision-check GET is broken here (not the
+    create POST that follows, to the same path), which fail_rest() cannot
+    express on its own since it is not method-aware."""
+    import httpx
+
+    from tools.automations import create_automation
+
+    real_handle = fake_ha.handle
+
+    def handle_get_fails(request):
+        if (request.method == "GET"
+                and request.url.path == "/api/config/automation/config/morning_lights"):
+            return httpx.Response(500, json={"message": "Internal Server Error"})
+        return real_handle(request)
+
+    fake_ha.handle = handle_get_fails
+
+    result = create_automation("Morning lights", trigger=[], action=[], overwrite=True)
+
+    assert "error" not in result
+    assert fake_ha.automation_configs["morning_lights"]["alias"] == "Morning lights"
+
+
+def test_create_automation_mode_defaults_to_single(fake_ha):
+    from tools.automations import create_automation
+
+    create_automation("Morning lights", trigger=[], action=[])
+
+    assert fake_ha.automation_configs["morning_lights"]["mode"] == "single"
+
+
+def test_create_automation_mode_is_passed_through(fake_ha):
+    """mode used to be hardcoded to "single" - create_automation() now
+    exposes it, matching update_automation()."""
+    from tools.automations import create_automation
+
+    create_automation("Morning lights", trigger=[], action=[], mode="restart")
+
+    assert fake_ha.automation_configs["morning_lights"]["mode"] == "restart"
 
 
 def test_create_script_refuses_a_colliding_name_by_default(fake_ha):
@@ -325,6 +463,24 @@ def test_delete_automation_reports_a_nonexistent_entity(fake_ha):
     result = delete_automation("automation.ghost")
 
     assert result["error"] == "entity_not_found"
+
+
+def test_delete_automation_reports_a_failed_read_instead_of_raising(fake_ha):
+    """Resolving the config id reads the entity's own state first - a
+    transient failure doing that (a 500, a revoked token) is not the same
+    as the entity not existing and must not raise an uncaught
+    httpx.HTTPStatusError - the same guarantee get_automation()/
+    update_automation()/patch_automation() get from _resolve_and_fetch()."""
+    from tools.automations import delete_automation
+
+    fake_ha.fail_rest("/api/states/automation.nas_shutdown", status=500,
+                      message="Internal Server Error")
+
+    result = delete_automation("automation.nas_shutdown")
+
+    assert result["error"] == "config_read_failed"
+    assert result["status"] == 500
+    assert not any(c.method == "DELETE" for c in fake_ha.rest_calls)
 
 
 def test_schedules_wraps_a_success(fake_ha):
