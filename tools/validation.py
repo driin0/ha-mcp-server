@@ -513,8 +513,40 @@ def validate_automation(entity_id: str) -> dict:
     )
 
 
+# Ranks the `severity` every issue carries, so a caller can ask for a floor
+# rather than having to know which outcomes are which tier. Ordered, not a
+# set: "at least this serious" is the question callers actually have.
+_SEVERITY_RANK = {"info": 1, "warning": 2, "error": 3}
+
+
+def _worth_listing(result: dict, only_issues: bool, floor: int) -> bool:
+    """Whether one checked automation belongs in the listing.
+
+    Never consulted for the counts — see validate_all_automations(), which
+    computes `summary` before this runs.
+
+    A read error always lists. It is not a mild finding: it means this
+    automation was never checked at all, so grading it by a severity it
+    never got would report silence as a clean bill. A fail-open wait
+    always lists too — it carries no severity of its own, and it is half
+    of the incident this module exists for.
+    """
+    if "read_error" in result:
+        return True
+    if result.get("fail_open_waits"):
+        return True
+    if not only_issues:
+        return True
+    return any(
+        _SEVERITY_RANK.get(issue.get("severity"), 0) >= floor
+        for issue in result.get("issues", ())
+    )
+
+
 @mcp.tool()
-def validate_all_automations(only_issues: bool = True, limit: int = 0, offset: int = 0) -> dict:
+def validate_all_automations(only_issues: bool = True,
+                            min_severity: str = "error",
+                            limit: int = 0, offset: int = 0) -> dict:
     """
     Run validate_automation()'s own checks over every automation on this
     instance (or a page of them — see limit/offset).
@@ -537,9 +569,29 @@ def validate_all_automations(only_issues: bool = True, limit: int = 0, offset: i
       and no fail-open waits is left out of `results` entirely — only
       the abnormal ones are worth a reader's attention on an instance
       where most automations are fine. `summary.checked` still counts
-      every automation this call actually read and validated, whether
-      or not it ended up in `results` — see `summary` below for why that
-      is NOT the same number as `total`.
+      every automation this call READ, whether or not it ended up in
+      `results` — including the ones whose config could not be read at
+      all, which are counted again under `read_errors`: those were not
+      validated, so `checked - read_errors` is how many were. See
+      `summary` below for why `checked` is NOT the same number as
+      `total`.
+    min_severity: the floor an issue must reach to be LISTED - "error"
+      (the default), "warning" or "info". It filters `results` and NOTHING
+      else: `summary` always counts the whole checked population, so a
+      caller reading "unavailable: 91" next to an empty listing is being
+      told the truth twice, not once. A guard that reported "nothing
+      found" because it had stopped counting is the exact fault this
+      module exists to remove, so the counts are deliberately outside the
+      filter's reach.
+
+      "error" is the default because it is the tier this tool exists for:
+      a dead reference, or an entity whose integration is not loaded. The
+      milder tiers describe a device that is offline or resting RIGHT NOW
+      - a real signal, but addressed to whoever maintains the integration
+      rather than to whoever wrote the automation, and the detail text of
+      those outcomes says so itself. On a real 137-automation instance
+      they were 106 findings out of 106, and zero of them were of this
+      tool's own class.
     limit, offset: which page of list_automations()'s own ordering to
       check (0 = no limit, matching list_automations()'s own default).
 
@@ -571,6 +623,19 @@ def validate_all_automations(only_issues: bool = True, limit: int = 0, offset: i
     instead, and counted under `summary.read_errors` rather than under
     the outcome counts (which describe a config that WAS read).
     """
+    floor = _SEVERITY_RANK.get(min_severity)
+    if floor is None:
+        return error(
+            "bad_min_severity",
+            f"min_severity={min_severity!r} is not a severity this tool "
+            "assigns. Use one of: "
+            + ", ".join(sorted(_SEVERITY_RANK, key=_SEVERITY_RANK.get, reverse=True))
+            + ". Refused before reading anything rather than falling back "
+            "to a default, because a caller who asked for a floor and "
+            "silently got a different one cannot tell that from a clean "
+            "instance.",
+        )
+
     listing = list_automations(limit=limit, offset=offset)
     if "error" in listing:
         return listing
@@ -632,23 +697,14 @@ def validate_all_automations(only_issues: bool = True, limit: int = 0, offset: i
             resolved_id, entity_id, config.get("alias", row["name"]),
             config, states, entity_registry, device_registry,
         )
-        if only_issues and not outcome["issues"] and not outcome["fail_open_waits"]:
-            continue
         results.append(outcome)
 
-    # total=len(results) tells envelope() `results` is already the page
-    # (list_automations(limit=limit, offset=offset) above already applied
-    # both) - without it, envelope()'s own default slicing would apply
-    # `offset` to `results` a SECOND time on top of the one list_automations()
-    # already did. offset=offset (this function's own parameter, not the
-    # 0 default) is passed through purely for the response's own {offset}
-    # metadata field, not for slicing - a caller paginating with offset=50
-    # used to always see {"offset": 0} back regardless of what it asked
-    # for, with nothing to tell it whether the call had actually honoured
-    # its own argument.
-    out = envelope(results, key="results", total=len(results), offset=offset,
-                   offset_paginated=True)
-    out["summary"] = {
+    # The summary is computed over `results` while it still holds EVERY
+    # automation this call read - before either filter below touches it.
+    # Filtering first and counting afterwards would make the counts shrink
+    # with the listing, which is how a checker comes to report "nothing
+    # found" about a population it stopped looking at.
+    summary = {
         "checked": checked,
         "with_issues": sum(
             1 for r in results
@@ -668,6 +724,33 @@ def validate_all_automations(only_issues: bool = True, limit: int = 0, offset: i
         "fail_open_wait_count": sum(
             r["summary"]["fail_open_wait_count"] for r in results if "summary" in r),
     }
+
+    listed = [r for r in results if _worth_listing(r, only_issues, floor)]
+    hidden = len(results) - len(listed)
+
+    note = ""
+    if hidden and only_issues:
+        note = (
+            f"{hidden} checked automation(s) are not listed: they had no "
+            f"issue reaching min_severity={min_severity!r}. The counts in "
+            "`summary` cover every automation checked, listed or not - read "
+            "them before concluding this instance is clean, and lower "
+            "min_severity to see the milder findings themselves."
+        )
+
+    # total=len(listed) tells envelope() `results` is already the page
+    # (list_automations(limit=limit, offset=offset) above already applied
+    # both) - without it, envelope()'s own default slicing would apply
+    # `offset` to `results` a SECOND time on top of the one list_automations()
+    # already did. offset=offset (this function's own parameter, not the
+    # 0 default) is passed through purely for the response's own {offset}
+    # metadata field, not for slicing - a caller paginating with offset=50
+    # used to always see {"offset": 0} back regardless of what it asked
+    # for, with nothing to tell it whether the call had actually honoured
+    # its own argument.
+    out = envelope(listed, key="results", total=len(listed), offset=offset,
+                   offset_paginated=True, note=note)
+    out["summary"] = summary
     return out
 
 
@@ -858,7 +941,8 @@ def find_entity_usages(entity_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_orphan_entities() -> dict:
+def list_orphan_entities(include_disabled: bool = False, limit: int = 100,
+                         offset: int = 0) -> dict:
     """
     Every entity in the entity registry that has no current state — the
     registry still holds it (its platform, its area, its device link,
@@ -882,12 +966,24 @@ def list_orphan_entities() -> dict:
     A disabled entity (`disabled_by` is not null — turned off by a person,
     an integration, or Home Assistant itself) legitimately has no state:
     that is a different, expected situation from an enabled entity that is
-    silently orphaned. Both are returned here, since knowing WHICH is
-    which is the actual point — filter `disabled_by is None` client-side
-    for only the unexpected kind.
+    silently orphaned. Only the unexpected kind is listed by default.
 
-    Returns: {total, returned, offset, note?, orphans: [{entity_id,
-    platform, area_id, device_id, disabled_by}]}, sorted by entity_id.
+    include_disabled: when True, the deliberately-disabled entities are
+      listed alongside the abandoned ones. Off by default because the
+      expected kind dominates: on a real instance 3249 of 3249 orphans
+      were disabled on purpose, so the count that mattered — zero
+      abandoned — arrived buried under 678 KB of rows that were all
+      working as configured, and past what an MCP client would accept in
+      one response. `excluded_disabled` always reports how many were left
+      out, so the population is never silently smaller than it looks.
+    limit, offset: page over the filtered, sorted list. This population is
+      thousands of rows on a real instance, which is why it is bounded by
+      default like every other collection here.
+
+    Returns: {total, returned, offset, note?, excluded_disabled, orphans:
+    [{entity_id, platform, area_id, device_id, disabled_by}]}, sorted by
+    entity_id. `total` counts what matched the filter, not the whole
+    registry.
     `platform` names the integration the registry says owns this entity —
     the first thing to check when deciding why it has no state (not
     loaded, its config entry removed, an add-on backing it stopped).
@@ -928,4 +1024,21 @@ def list_orphan_entities() -> dict:
         ),
         key=lambda o: o["entity_id"],
     )
-    return envelope(orphans, key="orphans")
+
+    if include_disabled:
+        kept, excluded = orphans, 0
+    else:
+        kept = [o for o in orphans if o["disabled_by"] is None]
+        excluded = len(orphans) - len(kept)
+
+    note = ""
+    if excluded:
+        note = (
+            f"{excluded} orphan(s) are not listed because they are disabled "
+            "on purpose (disabled_by is set), which is a legitimate reason "
+            "to have no state. Pass include_disabled=True to list them too."
+        )
+
+    out = envelope(kept, key="orphans", limit=limit, offset=offset, note=note)
+    out["excluded_disabled"] = excluded
+    return out

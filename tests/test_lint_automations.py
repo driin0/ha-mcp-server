@@ -97,3 +97,29 @@ def test_a_dead_reference_exits_1(fake_ha, capsys):
     out = capsys.readouterr().out
     assert exit_code == 1
     assert "FAIL:" in out
+
+
+def test_the_default_severity_floor_does_not_disarm_the_linter(fake_ha):
+    """The linter calls validate_all_automations() without min_severity, so
+    it inherits whatever the default is. If a future default ever filtered
+    a dead reference out of `results`, this script would print a clean
+    report and exit 0 on a broken instance - a checker that reports all
+    clear because it stopped looking, which is the fault the whole module
+    exists to remove. Pinned here rather than trusted to stay true."""
+    from tools.validation import validate_all_automations
+    from scripts.lint_automations import _print_report
+
+    fake_ha.states.append({
+        "entity_id": "automation.broken", "state": "on",
+        "attributes": {"id": "broken", "friendly_name": "broken"},
+    })
+    fake_ha.automation_configs["broken"] = {
+        "id": "broken", "alias": "broken",
+        "triggers": [{"trigger": "state", "entity_id": "light.kitchen"}],
+        "actions": [{"action": "light.turn_on",
+                     "target": {"entity_id": "light.does_not_exist_at_all"}}],
+    }
+
+    result = validate_all_automations(only_issues=True)
+
+    assert _print_report(result) >= 1, "a dead reference must still block"

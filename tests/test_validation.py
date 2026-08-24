@@ -648,7 +648,12 @@ def test_list_orphan_entities_excludes_entities_with_a_live_state(fake_ha):
 def test_list_orphan_entities_reports_disabled_by_for_a_deliberately_disabled_entity(fake_ha):
     """A disabled entity legitimately has no state - a different situation
     from a silently orphaned one, distinguished by disabled_by rather than
-    conflated with it."""
+    conflated with it.
+
+    Asks for include_disabled=True because that is where this kind lives
+    now: it is excluded from the default listing (it dominated the real
+    population 3249 to 0), but when asked for it must still arrive
+    labelled with WHAT disabled it, not merely present."""
     from tools.validation import list_orphan_entities
 
     fake_ha.registry.append({
@@ -657,7 +662,7 @@ def test_list_orphan_entities_reports_disabled_by_for_a_deliberately_disabled_en
         "disabled_by": "user",
     })
 
-    result = list_orphan_entities()
+    result = list_orphan_entities(include_disabled=True)
 
     entry = next(o for o in result["orphans"] if o["entity_id"] == "sensor.disabled_by_user")
     assert entry["disabled_by"] == "user"
@@ -719,3 +724,190 @@ def test_live_snapshot_reports_an_error_instead_of_raising_when_unreachable(fake
 
     assert err["error"] == "connection_failed"
     assert states == {} and entity_registry == {} and device_registry == {}
+
+
+# ---------------------------------------------------------------------------
+# min_severity: the listing is filtered, the counts never are
+# ---------------------------------------------------------------------------
+
+def _reg(fake_ha, entity_id, *, platform="hue", disabled_by=None):
+    fake_ha.registry.append({
+        "entity_id": entity_id, "area_id": None, "device_id": None,
+        "labels": [], "platform": platform, "disabled_by": disabled_by,
+    })
+
+
+def _seed_mixed_severities(fake_ha):
+    """An instance holding one automation per severity tier.
+
+    error   -> a dead reference (an entity in no registry at all)
+    warning -> a reference whose entity is registered but "unavailable"
+    info    -> a reference whose entity is registered but "unknown"
+    """
+    fake_ha.states.append({"entity_id": "light.offline", "state": "unavailable",
+                           "attributes": {}})
+    fake_ha.states.append({"entity_id": "button.never_pressed", "state": "unknown",
+                           "attributes": {}})
+    _reg(fake_ha, "light.offline")
+    _reg(fake_ha, "button.never_pressed")
+    for name, target in (
+        ("dead", "light.does_not_exist_anywhere"),
+        ("offline", "light.offline"),
+        ("resting", "button.never_pressed"),
+    ):
+        fake_ha.states.append({
+            "entity_id": f"automation.{name}", "state": "on",
+            "attributes": {"id": name, "friendly_name": name},
+        })
+        fake_ha.automation_configs[name] = {
+            "id": name, "alias": name,
+            "triggers": [{"trigger": "state", "entity_id": "light.kitchen"}],
+            "actions": [{"action": "light.turn_on",
+                         "target": {"entity_id": target}}],
+        }
+
+
+def test_min_severity_defaults_to_error_and_hides_the_milder_tiers(fake_ha):
+    """Run bare, the tool reports the class it exists for and nothing else.
+
+    91 of 106 issues on a real instance were "this device is offline right
+    now" - a real signal, but addressed to whoever maintains the
+    integration, not to whoever wrote the automation. Reporting them by
+    default buried zero dead references under 99 KB of them.
+    """
+    from tools.validation import validate_all_automations
+    _seed_mixed_severities(fake_ha)
+
+    result = validate_all_automations()
+
+    reported = {r["entity_id"] for r in result["results"] if "summary" in r}
+    assert "automation.dead" in reported
+    assert "automation.offline" not in reported
+    assert "automation.resting" not in reported
+
+
+def test_the_counts_cover_everything_checked_even_when_the_listing_does_not(fake_ha):
+    """The filter must reach the listing and stop there.
+
+    A guard that reports "nothing found" because it stopped counting is
+    the exact fault this project exists to remove. `summary` is what a
+    caller reads to decide whether to look further, so it counts the whole
+    checked population regardless of what `results` shows.
+    """
+    from tools.validation import validate_all_automations
+    _seed_mixed_severities(fake_ha)
+
+    filtered = validate_all_automations()
+    unfiltered = validate_all_automations(min_severity="info")
+
+    assert filtered["summary"] == unfiltered["summary"], (
+        "the same instance, the same sweep: only the listing may differ"
+    )
+    assert filtered["total"] < unfiltered["total"], "the listing did shrink"
+    assert filtered["summary"]["unavailable"] >= 1, "a filtered-out warning still counts"
+    assert filtered["summary"]["unknown"] >= 1, "a filtered-out info still counts"
+
+
+def test_a_filtered_listing_says_so(fake_ha):
+    """Silence about what was left out reads as 'there was nothing else'."""
+    from tools.validation import validate_all_automations
+    _seed_mixed_severities(fake_ha)
+
+    result = validate_all_automations()
+
+    assert "min_severity" in result.get("note", "")
+
+
+def test_min_severity_info_reports_every_tier(fake_ha):
+    from tools.validation import validate_all_automations
+    _seed_mixed_severities(fake_ha)
+
+    result = validate_all_automations(min_severity="info")
+
+    reported = {r["entity_id"] for r in result["results"] if "summary" in r}
+    assert reported >= {"automation.dead", "automation.offline", "automation.resting"}
+
+
+def test_an_unreadable_automation_is_never_filtered_out(fake_ha):
+    """A read error is not a mild finding: it means this automation was not
+    checked at all, so it cannot be graded by a severity it never got."""
+    from tools.validation import validate_all_automations
+    fake_ha.states.append({"entity_id": "automation.remote_only", "state": "on",
+                           "attributes": {"id": "9999",
+                                          "friendly_name": "remote only"}})
+
+    result = validate_all_automations()
+
+    unreadable = {r["entity_id"] for r in result["results"] if "read_error" in r}
+    assert "automation.remote_only" in unreadable
+    assert result["summary"]["read_errors"] == len(unreadable)
+
+
+def test_an_unknown_min_severity_is_refused(fake_ha):
+    from tools.validation import validate_all_automations
+    result = validate_all_automations(min_severity="critical")
+    assert result["error"] == "bad_min_severity"
+    assert "error" in result["detail"] and "warning" in result["detail"]
+    assert "results" not in result
+
+
+# ---------------------------------------------------------------------------
+# list_orphan_entities(): the unexpected kind by default
+# ---------------------------------------------------------------------------
+
+def test_orphans_exclude_deliberately_disabled_entities_by_default(fake_ha):
+    """3249 of 3249 orphans on a real instance were disabled on purpose.
+
+    A disabled entity legitimately has no state. Returning it alongside the
+    silently-abandoned kind buried the count that mattered - zero - under
+    678 KB of rows that were all working as configured.
+    """
+    from tools.validation import list_orphan_entities
+    _reg(fake_ha, "light.abandoned")
+    _reg(fake_ha, "light.turned_off", disabled_by="user")
+
+    result = list_orphan_entities()
+
+    ids = {o["entity_id"] for o in result["orphans"]}
+    assert "light.abandoned" in ids
+    assert "light.turned_off" not in ids
+
+
+def test_the_excluded_disabled_entities_are_counted_not_hidden(fake_ha):
+    from tools.validation import list_orphan_entities
+    _reg(fake_ha, "light.abandoned")
+    _reg(fake_ha, "light.turned_off", disabled_by="user")
+
+    result = list_orphan_entities()
+
+    assert result["excluded_disabled"] == 1
+
+
+def test_include_disabled_returns_both_kinds(fake_ha):
+    from tools.validation import list_orphan_entities
+    _reg(fake_ha, "light.abandoned")
+    _reg(fake_ha, "light.turned_off", disabled_by="user")
+
+    result = list_orphan_entities(include_disabled=True)
+
+    ids = {o["entity_id"] for o in result["orphans"]}
+    assert ids >= {"light.abandoned", "light.turned_off"}
+    assert result["excluded_disabled"] == 0
+
+
+def test_orphans_paginate(fake_ha):
+    """The population is thousands of rows on a real instance; every other
+    collection tool in this codebase bounds itself and this one did not."""
+    from tools.validation import list_orphan_entities
+    fake_ha.registry[:] = [e for e in fake_ha.registry
+                           if e["entity_id"] in
+                           {s["entity_id"] for s in fake_ha.states}]
+    for i in range(5):
+        _reg(fake_ha, f"light.gone_{i}")
+
+    page = list_orphan_entities(limit=2, offset=1)
+
+    assert page["total"] == 5
+    assert page["returned"] == 2
+    assert page["offset"] == 1
+    assert [o["entity_id"] for o in page["orphans"]] == ["light.gone_1", "light.gone_2"]
