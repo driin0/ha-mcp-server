@@ -115,7 +115,8 @@ def _resolve_and_fetch(entity_id: str, slug: str) -> tuple[str, str | None, dict
     return automation_id, resolved_id, raw, None
 
 
-def _set_and_verify_enabled(entity_id: str, enabled: bool) -> dict:
+def _set_and_verify_enabled(entity_id: str, enabled: bool, *,
+                            arm_when_enabling: bool = True) -> dict:
     """Send automation.turn_on/turn_off and confirm the entity's state
     actually reflects `enabled` afterward, the way create_automation()'s own
     docstring measured necessary live: ten automations created with
@@ -130,6 +131,27 @@ def _set_and_verify_enabled(entity_id: str, enabled: bool) -> dict:
     silently drift apart. An automation that reports itself disabled while
     still armed is this project's founding bug; every caller that can
     change `enabled` gets the same treatment.
+
+    arm_when_enabling: whether an enabled=True request actively sends
+      automation.turn_on before verifying, or only waits for the entity
+      and observes whatever state is already there. True (the default) is
+      right for a caller whose `enabled` is only ever an explicit ask -
+      update_automation()'s `enabled` parameter defaults to None ("leave
+      it alone"), so a caller passing True here always deliberately asked
+      to (re-)arm it, and the toggle is the honest way to do that. False
+      is right for create_automation(), whose `enabled` parameter defaults
+      to True with no sentinel to tell "the caller explicitly wants it
+      armed" apart from "the caller did not say anything" - and Home
+      Assistant already arms every genuinely new automation by construction,
+      so no active toggle is ever needed for that case anyway. What False
+      prevents: re-running create_automation() (overwrite=True) over an
+      automation a person had deliberately turned off must not silently
+      re-arm it just because `enabled` defaulted to True - measured live,
+      before this parameter existed, it did exactly that. A disable
+      (`enabled=False`) is always actively sent regardless of this flag -
+      turning something off on request has no equivalent "maybe the caller
+      did not mean it" ambiguity, and is the direction this project's
+      founding bug is actually about.
 
     Returns one of:
       error("automation_not_registered", ...) - entity_id never registered
@@ -165,14 +187,15 @@ def _set_and_verify_enabled(entity_id: str, enabled: bool) -> dict:
             "could not be changed or confirmed - it may still be in its "
             "previous state. Check manually before relying on it.",
         )
-    with httpx.Client() as client:
-        client.post(
-            f"{HA_URL}/api/services/automation/"
-            f"{'turn_on' if enabled else 'turn_off'}",
-            headers=HEADERS,
-            json={"entity_id": entity_id},
-            timeout=10,
-        )
+    if not enabled or arm_when_enabling:
+        with httpx.Client() as client:
+            client.post(
+                f"{HA_URL}/api/services/automation/"
+                f"{'turn_on' if enabled else 'turn_off'}",
+                headers=HEADERS,
+                json={"entity_id": entity_id},
+                timeout=10,
+            )
 
     expected = "on" if enabled else "off"
     obs = observe_actuation(entity_id, lambda s: s["state"] == expected)
@@ -323,6 +346,22 @@ def create_automation(
     must be checked by its actual state, not assumed from the request - so
     a state that cannot be confirmed is an error() return, never a bare
     success.
+
+    enabled=True (the default) never actively arms anything - it only
+    waits for the entity to register and then observes whatever state is
+    already there, the same way `enabled` had no default to distinguish
+    "explicitly requested" from "just the default" before this parameter
+    existed at all. This matters specifically for `overwrite=True`: Home
+    Assistant does not reset an existing automation's armed state on a
+    config-only update (see tests/fakeha.py's POST handler for the
+    live-measured behaviour this models), so re-running create_automation()
+    over an automation a person had deliberately turned off, without
+    touching `enabled`, correctly reports it still off -
+    error("automation_state_unverified") - rather than silently re-arming
+    it because the parameter defaulted to True. Only enabled=False is ever
+    actively sent as a service call; a genuinely new automation is armed
+    by Home Assistant's own construction the instant it registers, so no
+    active turn_on is ever needed for that case either.
     """
     automation_id = _slug(name)
     entity_id = f"automation.{automation_id}"
@@ -399,7 +438,17 @@ def create_automation(
     # _set_and_verify_enabled() waits for the entity to register before
     # sending turn_on/turn_off - see its own docstring for the race this
     # closes, measured live against exactly this call site.
-    outcome = _set_and_verify_enabled(entity_id, enabled)
+    #
+    # arm_when_enabling=False: `enabled` defaults to True here with no way
+    # to tell "the caller explicitly wants it armed" apart from "the
+    # caller did not say anything" - and Home Assistant already arms a
+    # genuinely new automation by construction. Sending an active turn_on
+    # regardless (the previous behaviour) meant re-running this over an
+    # automation a person had deliberately turned off - overwrite=True,
+    # same name - silently re-armed it; see this function's own
+    # docstring for the measurement. Observing without asserting is what
+    # this parameter buys back.
+    outcome = _set_and_verify_enabled(entity_id, enabled, arm_when_enabling=False)
     if "error" in outcome:
         outcome["automation_id"] = automation_id
         outcome["entity_id"] = entity_id
@@ -803,6 +852,13 @@ def update_automation(
     }
 
     if enabled is not None:
+        # arm_when_enabling defaults to True here (unlike
+        # create_automation()'s own call site) - `enabled` has no default
+        # of its own on this tool (None means "not passed"), so reaching
+        # this branch at all means the caller explicitly asked for True or
+        # False. An explicit "enable this" is the actual ask, not a
+        # parameter default nobody set - see _set_and_verify_enabled()'s
+        # own docstring for the distinction this flag exists to draw.
         outcome = _set_and_verify_enabled(entity_id, enabled)
         if "error" in outcome:
             outcome["automation_id"] = resolved_id

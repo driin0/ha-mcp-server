@@ -437,6 +437,26 @@ project exists because of.
   automations no longer require a follow-up `update_automation()` call
   just to set it.
 
+### Fixed — automation editing, final review
+
+- `create_automation(enabled=True)` (the default) no longer sends an
+  active `automation.turn_on` - it only waits for the entity and observes
+  whatever state is already there. The shared verification helper this
+  tool and `update_automation()` both call
+  (`_set_and_verify_enabled()`) had briefly, during extraction, started
+  sending the toggle unconditionally for both True and False - which
+  meant re-running `create_automation()` (`overwrite=True`, same name)
+  over an automation a person had deliberately turned off silently
+  re-armed it, `enabled` never having been touched, purely because it
+  defaults to True with no way to tell "explicitly requested" apart from
+  "just the default". Measured live before this fix: exactly that
+  sequence returned `{"enabled": true, "verified": true, "state": "on"}`.
+  `update_automation()`'s own `enabled` has no such default (`None` means
+  "not passed"), so an explicit `enabled=True` there still actively arms,
+  unchanged - the new `arm_when_enabling` parameter on
+  `_set_and_verify_enabled()` is what lets the two callers disagree
+  safely instead of drifting back into two separate implementations.
+
 ## 1.1.0
 
 The project moves into its own repository: **github.com/driin0/ha-mcp-server**,

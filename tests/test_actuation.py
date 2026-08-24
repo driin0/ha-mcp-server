@@ -1916,6 +1916,34 @@ def test_create_automation_enabled_reports_the_observed_state(fake_ha):
     assert result["state"] == "on"
 
 
+def test_create_automation_enabled_true_never_actively_arms(fake_ha):
+    """enabled=True is create_automation()'s default, not necessarily an
+    explicit request - so it must never send an active turn_on, only
+    observe. This is what re-running create_automation() (overwrite=True,
+    same name) over an automation a person had deliberately disabled must
+    NOT silently re-arm: with no active turn_on, the state fakeha's
+    config-POST route preserves (see its own comment) is the state
+    actually observed, and Home Assistant's real config-write endpoint
+    behaves the same way - measured live."""
+    from tools.automations import create_automation
+
+    create_automation("Morning lights", trigger=[], action=[])
+    # A person disables it - not through this tool, so automation_configs
+    # is untouched, only the entity's own registered state changes.
+    for s in fake_ha.states:
+        if s["entity_id"] == "automation.morning_lights":
+            s["state"] = "off"
+
+    result = create_automation("Morning lights", trigger=["updated"], action=[],
+                               overwrite=True)
+
+    assert result["error"] == "automation_state_unverified"
+    assert result["state"] == "off"
+    assert result["enabled"] is False
+    assert not any(c.url.path == "/api/services/automation/turn_on"
+                  for c in fake_ha.rest_calls)
+
+
 # ---- tools/helpers.py: create_template_sensor -------------------------------------
 
 def test_create_template_sensor_reports_a_rejected_flow_start_as_an_error_not_a_crash(fake_ha):
