@@ -537,8 +537,12 @@ both, before either did damage.
   automation references against this instance's live entity/device
   registries and current state machine, and separately report any
   `wait_for_trigger` that can silently carry a timeout into a destructive
-  action (`*.turn_off`, `switch.*`, `homeassistant.stop`/`restart`,
-  `hassio.host_*`). A reference resolves to one of three outcomes:
+  action — scoped to what is actually irreversible or destructive
+  unattended (`switch.turn_off`, `homeassistant.stop`/`restart`,
+  `hassio.host_*`, `lock.*`, `alarm_control_panel.alarm_arm_*`/
+  `alarm_disarm`), not every domain's `turn_off` or every switch service:
+  turning a light off after a timeout is what automations are for. A
+  reference resolves to one of three outcomes:
   `dead_reference` (absent from both the registry and the state machine —
   fix the automation), `restored` (in the registry but has no state — its
   integration is not loaded, fix that instead), or `unavailable` (has a

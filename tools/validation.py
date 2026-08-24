@@ -333,8 +333,12 @@ def validate_automation(entity_id: str) -> dict:
     Each `fail_open_waits` entry is exactly find_fail_open_waits()'s
     (tools/_refs.py) own shape: {wait_where, timeout, action_where,
     service} — a wait_for_trigger with a timeout and no
-    continue_on_timeout: false ahead of a destructive action (*.turn_off,
-    switch.*, homeassistant.stop/restart, hassio.host_*) in the same
+    continue_on_timeout: false ahead of a destructive action
+    (switch.turn_off, homeassistant.stop/restart, hassio.host_*, lock.*,
+    alarm_control_panel.alarm_arm_*/alarm_disarm — see
+    _destructive_service()'s own docstring, tools/_refs.py, for why this
+    is scoped to what is actually irreversible or destructive rather
+    than every domain's turn_off or every switch service) in the same
     sequence. Unrelated to whether any entity exists at all — the second,
     independent half of the incident this tool exists for.
     """

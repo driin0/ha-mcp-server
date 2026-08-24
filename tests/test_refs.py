@@ -389,22 +389,84 @@ def test_a_non_destructive_action_after_the_wait_is_not_reported():
     assert find_fail_open_waits(config) == []
 
 
-def test_turn_off_on_any_domain_is_destructive():
+def test_switch_turn_off_is_destructive():
+    """The incident's own call, verbatim: switch.turn_off cuts power."""
     config = {"action": [
         {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
-        {"service": "light.turn_off", "target": {"entity_id": "light.a"}},
+        {"service": "switch.turn_off", "target": {"entity_id": "switch.a"}},
     ]}
 
     assert len(find_fail_open_waits(config)) == 1
 
 
-def test_any_switch_service_is_destructive_not_only_turn_off():
+def test_ordinary_turn_off_on_other_domains_is_not_destructive():
+    """Turning a light, media player, climate device or fan off after a
+    timeout is what automations are FOR - only switch.turn_off (cutting
+    power) is flagged, not '*.turn_off' for every domain. Measured
+    against the old rule: "wait for sunrise, then turn the lights off" -
+    a textbook correct automation - used to be reported as a fault."""
+    for service in ("light.turn_off", "media_player.turn_off",
+                    "climate.turn_off", "fan.turn_off"):
+        config = {"action": [
+            {"wait_for_trigger": [{"platform": "state"}], "timeout": "08:00:00"},
+            {"service": service, "target": {"entity_id": "x.a"}},
+        ]}
+        assert find_fail_open_waits(config) == [], service
+
+
+def test_switch_turn_on_is_not_destructive():
+    """switch.turn_on cannot cut power on its own terms - unlike the old
+    rule, which flagged every switch.* service (citing that switch.toggle
+    can cut power, which is not a reason to flag turn_on too)."""
     config = {"action": [
         {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
         {"service": "switch.turn_on", "target": {"entity_id": "switch.a"}},
     ]}
 
-    assert len(find_fail_open_waits(config)) == 1
+    assert find_fail_open_waits(config) == []
+
+
+def test_switch_toggle_is_not_destructive():
+    config = {"action": [
+        {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
+        {"service": "switch.toggle", "target": {"entity_id": "switch.a"}},
+    ]}
+
+    assert find_fail_open_waits(config) == []
+
+
+def test_lock_and_unlock_are_both_destructive():
+    """Neither direction is safe to exempt: unlocking unattended is a
+    security event, locking unattended can trap someone inside."""
+    for service in ("lock.lock", "lock.unlock", "lock.open"):
+        config = {"action": [
+            {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
+            {"service": service, "target": {"entity_id": "lock.front_door"}},
+        ]}
+        assert len(find_fail_open_waits(config)) == 1, service
+
+
+def test_alarm_arm_and_disarm_are_destructive():
+    for service in ("alarm_control_panel.alarm_arm_away",
+                     "alarm_control_panel.alarm_arm_home",
+                     "alarm_control_panel.alarm_disarm"):
+        config = {"action": [
+            {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
+            {"service": service, "target": {"entity_id": "alarm_control_panel.house"}},
+        ]}
+        assert len(find_fail_open_waits(config)) == 1, service
+
+
+def test_alarm_trigger_is_not_destructive():
+    """Only arming/disarming is in scope - not every alarm_control_panel
+    service."""
+    config = {"action": [
+        {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
+        {"service": "alarm_control_panel.alarm_trigger",
+         "target": {"entity_id": "alarm_control_panel.house"}},
+    ]}
+
+    assert find_fail_open_waits(config) == []
 
 
 def test_homeassistant_stop_is_destructive():
@@ -516,7 +578,7 @@ def test_recurses_into_if_then_and_else():
             {"service": "switch.turn_off", "target": {"entity_id": "switch.a"}},
         ], "else": [
             {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
-            {"service": "switch.turn_on", "target": {"entity_id": "switch.b"}},
+            {"service": "lock.unlock", "target": {"entity_id": "lock.b"}},
         ]},
     ]}
 
@@ -655,7 +717,7 @@ def test_every_destructive_action_after_a_fail_open_wait_is_reported():
     config = {"action": [
         {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
         {"service": "switch.turn_off", "target": {"entity_id": "switch.a"}},
-        {"service": "light.turn_off", "target": {"entity_id": "light.b"}},
+        {"service": "lock.lock", "target": {"entity_id": "lock.b"}},
     ]}
 
     waits = find_fail_open_waits(config)

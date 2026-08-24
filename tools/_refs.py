@@ -210,21 +210,60 @@ _DIRECT_SEQUENCE_KEYS = ("then", "else", "default", "sequence")
 
 def _destructive_service(service: str) -> bool:
     """Whether calling `service` is the kind of action a fail-open wait
-    must not be allowed to silently carry execution into: *.turn_off (any
-    domain - a light, a climate device, a media player, a switch),
-    switch.* (any switch service, not only turn_off - toggling a switch
-    can cut power exactly the way turn_off can), homeassistant.stop or
-    .restart, and hassio.host_* (host_shutdown, host_reboot, ...)."""
+    must not be allowed to silently carry execution into.
+
+    Scoped to services whose OWN unintended, unattended execution is
+    destructive or irreversible - the way the incident's own
+    switch.turn_off against a NAS still writing to disk was - not to
+    "any domain's turn_off" or "any switch service":
+
+    - switch.turn_off       - cutting power. This is the incident's own
+                               call, verbatim.
+    - homeassistant.stop,
+      homeassistant.restart - stopping or restarting Home Assistant
+                               itself.
+    - hassio.host_*         - host-level operations (host_shutdown,
+                               host_reboot, ...).
+    - lock.*                - locking or unlocking a door has no "safe"
+                               direction to exempt: unlocking unattended
+                               is a security event, locking unattended
+                               can trap someone inside. Unlike switch,
+                               there is no lock service comparable to
+                               switch.turn_on that is inherently
+                               harmless, so the whole domain is in scope,
+                               not just lock/unlock by name.
+    - alarm_control_panel.alarm_arm_* /
+      .alarm_disarm          - arming or disarming a security system
+                               unattended.
+
+    Deliberately NOT *.turn_off for every domain, and NOT switch.* for
+    every switch service (switch.turn_on, switch.toggle): turning a
+    light, a media player, a climate device or a fan off after a timeout
+    is what automations are FOR - measured live, "wait for sunrise, then
+    turn the lights off" is a correct, ordinary automation, and the old
+    *.turn_off/switch.* rule reported it (and switch.turn_on,
+    media_player.turn_off, climate.turn_off, fan.turn_off) as a fault.
+    switch.turn_on is indefensible on its own terms - turning a switch ON
+    cannot cut power - and switch.toggle was already the deliberate,
+    correct name for "toggle a switch" the old docstring cited to justify
+    flagging the whole switch.* domain; toggling is not a reason to flag
+    turn_on too. A validator that cries wolf on correct automations is
+    what teaches people to stop reading it - see this module's own
+    docstring for why that is worse than not checking at all."""
     if not isinstance(service, str) or "." not in service:
         return False
     domain, _, action = service.partition(".")
-    if action == "turn_off":
-        return True
-    if domain == "switch":
+    if domain == "switch" and action == "turn_off":
         return True
     if domain == "homeassistant" and action in ("stop", "restart"):
         return True
     if domain == "hassio" and action.startswith("host_"):
+        return True
+    if domain == "lock":
+        return True
+    if domain == "alarm_control_panel" and (
+        action == "alarm_disarm" or action.startswith("alarm_arm")
+    ):
         return True
     return False
 
