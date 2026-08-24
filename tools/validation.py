@@ -69,6 +69,27 @@ how many references the config holds. `validate_all_automations()` shares
 ONE such snapshot across every automation it checks and reads each
 automation's own config once — see its own docstring for why that,
 not the snapshot, is the cost that scales with the size of the instance.
+
+## find_entity_usages() and list_orphan_entities()
+
+The two tools above answer "what is currently wrong" — after the fact.
+find_entity_usages() answers a different question, asked at a different
+moment: "if I rename or remove this entity, what breaks?" — the question
+that was needed at the exact moment the NAS shutdown button got renamed,
+not weeks later when validate_automation() finally caught the stale
+template reference it left behind. It runs extract_refs() (tools/_refs.py)
+against every automation's and every script's own stored config — the
+identical extraction _validate_config() runs above, not a second walker
+that could silently drift from it — and reports every field or template
+reference matching the id asked about. See its own docstring for exactly
+what it does and does not search.
+
+list_orphan_entities() answers the other half of the same incident from
+the opposite direction: not "what points at this id" but "which ids in
+the registry have nothing pointing back at them from Home Assistant's own
+state machine at all" — precisely what a reconfigured integration leaves
+behind, and the population validate_automation()'s own "restored" outcome
+draws a single row from when an automation happens to reference one.
 """
 import httpx
 
@@ -76,6 +97,7 @@ from tools._aliases import to_modern
 from tools._base import HA_URL, HEADERS, _ws_multi, envelope, error, mcp, ws_error
 from tools._refs import extract_refs, find_fail_open_waits
 from tools.automations import _fetch_config, get_automation, list_automations
+from tools.scripts import get_script, list_scripts
 
 
 def _live_snapshot() -> tuple[dict, dict, dict, dict | None]:
@@ -459,3 +481,239 @@ def validate_all_automations(only_issues: bool = True, limit: int = 0, offset: i
             r["summary"]["fail_open_waits"] for r in results if "summary" in r),
     }
     return out
+
+
+# ---------------------------------------------------------------------------
+# find_entity_usages()
+# ---------------------------------------------------------------------------
+
+def _automation_entries() -> tuple[list[dict], dict | None, int]:
+    """Every automation's own (entity_id, name, config), read the same way
+    get_automation() (tools/automations.py) already reads one — reused
+    rather than reimplemented, so config-id resolution and vocabulary
+    normalisation stay in the one place that already gets both right,
+    instead of a second, independently-maintained copy of that logic here.
+
+    Returns (entries, error_envelope_or_None, skipped).
+
+    `error_envelope` is non-None only when list_automations() itself
+    failed outright — a caller returns it immediately, the same as every
+    other listing failure in this codebase; `entries`/`skipped` are then
+    meaningless.
+
+    `skipped` counts automations whose own config could not be read at all
+    (a YAML-defined automation, which get_automation() reports as
+    "not_found"; a transient "config_read_failed") — these are excluded
+    from `entries` rather than silently counted as "does not reference
+    anything", and the count is handed back so a caller can say the sweep
+    was not total rather than staying quiet about it.
+    """
+    listing = list_automations(limit=0)
+    if "error" in listing:
+        return [], listing, 0
+    entries = []
+    skipped = 0
+    for row in listing["automations"]:
+        result = get_automation(row["entity_id"])
+        if "error" in result:
+            skipped += 1
+            continue
+        entries.append({
+            "source_kind": "automation",
+            "entity_id": result["entity_id"],
+            "name": result["name"],
+            "config": result["config"],
+        })
+    return entries, None, skipped
+
+
+def _script_entries() -> tuple[list[dict], dict | None, int]:
+    """Same contract as _automation_entries(), for scripts — reusing
+    get_script() (tools/scripts.py) per script the same way, over
+    list_scripts()'s own listing. A script's stored config has no
+    equivalent to an automation's legacy/modern vocabulary split (it is
+    just `sequence`, `mode`, `alias`), so unlike _automation_entries()
+    there is no normalisation step here to reuse — get_script()'s raw
+    result is handed to extract_refs() exactly as read, which is safe
+    because extract_refs() reads entity_id/device_id/template strings by
+    name, not by which root vocabulary they sit under (see tools/_refs.py's
+    own module docstring)."""
+    listing = list_scripts()
+    if "error" in listing:
+        return [], listing, 0
+    entries = []
+    skipped = 0
+    for row in listing["scripts"]:
+        config = get_script(row["entity_id"])
+        if "error" in config:
+            skipped += 1
+            continue
+        entries.append({
+            "source_kind": "script",
+            "entity_id": row["entity_id"],
+            "name": row["name"],
+            "config": config,
+        })
+    return entries, None, skipped
+
+
+@mcp.tool()
+def find_entity_usages(entity_id: str) -> dict:
+    """
+    Every automation and script that references entity_id — by a plain
+    entity_id field, or by name inside a template — so a caller can answer
+    "if I rename or remove this, what breaks?" BEFORE acting, not after.
+
+    This is the tool the NAS shutdown incident needed at the moment
+    button.nas_shutdown was renamed to button.nas_shut_down, not weeks
+    later when validate_automation() (this module) finally caught the
+    stale template reference the rename left behind — see this module's
+    own docstring, and tools/_refs.py's, for the full incident.
+    validate_automation() answers "is this automation currently broken";
+    this tool answers the question that, asked first, would have meant
+    nothing broke at all.
+
+    Reuses extract_refs() (tools/_refs.py) against every automation's and
+    every script's own stored config — the exact same extraction
+    validate_automation() runs above, not a second, independently
+    maintained walker that could silently drift from it and miss a shape
+    the other one catches.
+
+    ⚠️ SEARCHED: automations and scripts, including inside their template
+    strings — a value_template naming entity_id via is_state(), states(),
+    state_attr(), expand(), has_value(), or the states.<domain>.<id>
+    attribute form counts as a usage exactly like a plain entity_id: field
+    reference does (see extract_refs()'s own docstring for the full list).
+
+    NOT SEARCHED: dashboards (Lovelace card configs), template entities
+    (e.g. a template sensor helper's own template, defined outside any
+    automation or script), and helpers. This tool's `note` says so on
+    EVERY call, not only when something turns up in one of the searched
+    sources — a caller who renames entity_id after seeing an empty or
+    short `usages` list here has not been told nothing else references
+    it, only that no automation or script does. Silence about the rest
+    would read as full coverage; it is not, and staying quiet about that
+    is the exact shape of the failure this whole module exists to fix.
+
+    Returns: {total, returned, offset, note, usages: [...]}. Each `usages`
+    entry: {source_kind: "automation" | "script", entity_id, name, where,
+    source} — `entity_id`/`name` identify which automation or script the
+    reference was found in (not the entity being searched for, which is
+    this tool's own `entity_id` argument); `where` and `source` are
+    extract_refs()'s own dotted config path and "field"/"template" tag,
+    unchanged. Two usages sharing a `where` never happen (extract_refs()
+    reports at most one ref per template match), but the same entity_id
+    routinely shows up more than once across different sources or paths —
+    every usages entry is reported, not deduplicated, since each is a
+    separate place a rename would have to be applied.
+
+    `note` always explains the SEARCHED/NOT SEARCHED split above, and also
+    names how many automations/scripts were skipped because their own
+    config could not be read at all (a YAML-defined automation, a
+    transient read failure) — skipped, not silently treated as "does not
+    reference entity_id".
+
+    Returns an error() envelope only when listing automations or scripts
+    outright fails (a WebSocket or transport failure) — never for
+    entity_id not being referenced anywhere, which is simply `usages: []`.
+    """
+    automations, err, auto_skipped = _automation_entries()
+    if err:
+        return err
+    scripts, err, script_skipped = _script_entries()
+    if err:
+        return err
+
+    usages = []
+    for entry in automations + scripts:
+        for ref in extract_refs(entry["config"]):
+            if ref["kind"] == "entity" and ref["id"] == entity_id:
+                usages.append({
+                    "source_kind": entry["source_kind"],
+                    "entity_id": entry["entity_id"],
+                    "name": entry["name"],
+                    "where": ref["where"],
+                    "source": ref["source"],
+                })
+
+    note = (
+        "Searched automations and scripts, including inside their "
+        "templates. Dashboards, template entities and helpers were NOT "
+        "searched — a rename could still break one of those with nothing "
+        "here to say so."
+    )
+    skipped = auto_skipped + script_skipped
+    if skipped:
+        note += (
+            f" {skipped} automation(s)/script(s) could not be read and "
+            "were skipped, not counted as not referencing this entity."
+        )
+    return envelope(usages, key="usages", note=note)
+
+
+# ---------------------------------------------------------------------------
+# list_orphan_entities()
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def list_orphan_entities() -> dict:
+    """
+    Every entity in the entity registry that has no current state — the
+    registry still holds it (its platform, its area, its device link,
+    whether it is disabled), but Home Assistant's state machine has
+    nothing for it right now.
+
+    This is precisely what a reconfigured integration leaves behind: an
+    entity gets recreated under a new id (see this module's own docstring
+    for the incident that mechanism caused elsewhere), and the OLD
+    entity_id stays in the registry, orphaned, indefinitely — Home
+    Assistant does not garbage-collect a registry entry just because
+    nothing currently reports a state for it. This is the exact same
+    population validate_automation()'s "restored" outcome draws a single
+    row from, when some automation happens to reference one; this tool
+    lists the whole population directly, with no automation involved at
+    all — the state an incident's own instance was left in for weeks, with
+    nothing surfacing it.
+
+    A disabled entity (`disabled_by` is not null — turned off by a person,
+    an integration, or Home Assistant itself) legitimately has no state:
+    that is a different, expected situation from an enabled entity that is
+    silently orphaned. Both are returned here, since knowing WHICH is
+    which is the actual point — filter `disabled_by is None` client-side
+    for only the unexpected kind.
+
+    Returns: {total, returned, offset, note?, orphans: [{entity_id,
+    platform, area_id, device_id, disabled_by}]}, sorted by entity_id.
+    `platform` names the integration the registry says owns this entity —
+    the first thing to check when deciding why it has no state (not
+    loaded, its config entry removed, an add-on backing it stopped).
+
+    Returns an error() envelope when the entity registry itself could not
+    be read (a WebSocket failure) — never for finding zero orphans, which
+    is simply `orphans: []`.
+    """
+    ws_results = _ws_multi([{"type": "config/entity_registry/list"}])
+    if err := ws_error(ws_results[0]):
+        return err
+    registry = ws_results[0]["result"]
+
+    with httpx.Client() as client:
+        r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    live_ids = {s["entity_id"] for s in r.json()}
+
+    orphans = sorted(
+        (
+            {
+                "entity_id": e["entity_id"],
+                "platform": e.get("platform"),
+                "area_id": e.get("area_id"),
+                "device_id": e.get("device_id"),
+                "disabled_by": e.get("disabled_by"),
+            }
+            for e in registry
+            if e["entity_id"] not in live_ids
+        ),
+        key=lambda o: o["entity_id"],
+    )
+    return envelope(orphans, key="orphans")

@@ -421,3 +421,181 @@ def test_validate_all_automations_shares_one_snapshot_not_one_per_automation(fak
     # automations including fakeha's own default).
     assert len(registry_list_calls) <= 2
     assert len(device_list_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# find_entity_usages()
+# ---------------------------------------------------------------------------
+
+def _minimal_script(fake_ha, script_id, entity_id, sequence, name="Probe script"):
+    """The smallest possible script whose config is `sequence`, seeded the
+    way create_script() would leave it: a state row (list_scripts() reads
+    scripts from self.states, like list_automations() does for
+    automations) plus a script_configs entry get_script() reads back."""
+    fake_ha.states.append({
+        "entity_id": entity_id, "state": "off",
+        "attributes": {"friendly_name": name},
+    })
+    fake_ha.script_configs[script_id] = {
+        "alias": name, "sequence": sequence, "mode": "single",
+    }
+
+
+def test_find_entity_usages_reports_a_field_reference_in_an_automation(fake_ha):
+    from tools.validation import find_entity_usages
+
+    fake_ha.automation_configs = {}
+    _minimal_automation(fake_ha, "u1", "automation.u1", "light.target")
+
+    result = find_entity_usages("light.target")
+
+    assert result["usages"] == [{
+        "source_kind": "automation", "entity_id": "automation.u1",
+        "name": "Probe", "where": "actions.0.target.entity_id",
+        "source": "field",
+    }]
+
+
+def test_find_entity_usages_reports_a_template_reference_in_a_script(fake_ha):
+    from tools.validation import find_entity_usages
+
+    fake_ha.automation_configs = {}
+    _minimal_script(fake_ha, "guard", "script.guard", [
+        {"condition": "template",
+         "value_template": "{{ is_state('light.target', 'on') }}"},
+    ])
+
+    result = find_entity_usages("light.target")
+
+    assert result["usages"] == [{
+        "source_kind": "script", "entity_id": "script.guard",
+        "name": "Probe script", "where": "sequence.0.value_template",
+        "source": "template",
+    }]
+
+
+def test_find_entity_usages_reports_both_an_automation_and_a_script_together(fake_ha):
+    """The scenario this tool exists for: the same entity referenced from
+    more than one place, both of which must be found - not just the first
+    match - since a rename has to update every one of them."""
+    from tools.validation import find_entity_usages
+
+    fake_ha.automation_configs = {}
+    _minimal_automation(fake_ha, "u2", "automation.u2", "light.shared")
+    _minimal_script(fake_ha, "shared_user", "script.shared_user", [
+        {"service": "light.turn_off", "target": {"entity_id": "light.shared"}},
+    ])
+
+    result = find_entity_usages("light.shared")
+
+    kinds = {(u["source_kind"], u["entity_id"]) for u in result["usages"]}
+    assert kinds == {("automation", "automation.u2"), ("script", "script.shared_user")}
+
+
+def test_find_entity_usages_returns_empty_but_still_notes_the_scope(fake_ha):
+    """No automation or script references the id at all - `usages` is
+    empty, but `note` still explains what was and was not searched, since
+    silence would read as a promise of full coverage."""
+    from tools.validation import find_entity_usages
+
+    fake_ha.automation_configs = {}
+    result = find_entity_usages("light.nobody_references_this")
+
+    assert result["usages"] == []
+    assert "dashboard" in result["note"].lower()
+    assert "helper" in result["note"].lower()
+    assert "template entit" in result["note"].lower()
+
+
+def test_find_entity_usages_note_always_present_even_with_results(fake_ha):
+    """The scope disclaimer is not conditioned on finding nothing - a
+    caller who DID get a hit must still be told the sweep was partial."""
+    from tools.validation import find_entity_usages
+
+    fake_ha.automation_configs = {}
+    _minimal_automation(fake_ha, "u3", "automation.u3", "light.found")
+
+    result = find_entity_usages("light.found")
+
+    assert result["usages"]
+    assert "note" in result
+    assert "dashboard" in result["note"].lower()
+
+
+def test_find_entity_usages_ignores_a_different_entity(fake_ha):
+    from tools.validation import find_entity_usages
+
+    fake_ha.automation_configs = {}
+    _minimal_automation(fake_ha, "u4", "automation.u4", "light.a")
+
+    result = find_entity_usages("light.b")
+
+    assert result["usages"] == []
+
+
+def test_find_entity_usages_counts_and_reports_unreadable_configs(fake_ha):
+    """automation.morning (a fakeha default) has a registered state but no
+    entry in automation_configs at all, so get_automation() reports
+    not_found for it - that must be skipped, not silently treated as "does
+    not reference light.target", and the skip must be visible in `note`."""
+    from tools.validation import find_entity_usages
+
+    fake_ha.automation_configs = {}
+
+    result = find_entity_usages("light.target")
+
+    assert result["usages"] == []
+    assert "skipped" in result["note"].lower() or "could not be read" in result["note"].lower()
+
+
+# ---------------------------------------------------------------------------
+# list_orphan_entities()
+# ---------------------------------------------------------------------------
+
+def test_list_orphan_entities_finds_a_registered_entity_with_no_state(fake_ha):
+    from tools.validation import list_orphan_entities
+
+    fake_ha.registry.append({
+        "entity_id": "light.reconfigured", "area_id": "kitchen",
+        "device_id": None, "labels": [], "platform": "hue",
+        "disabled_by": None,
+    })
+
+    result = list_orphan_entities()
+
+    orphan_ids = {o["entity_id"] for o in result["orphans"]}
+    assert "light.reconfigured" in orphan_ids
+    entry = next(o for o in result["orphans"] if o["entity_id"] == "light.reconfigured")
+    assert entry["platform"] == "hue"
+    assert entry["area_id"] == "kitchen"
+    assert entry["disabled_by"] is None
+
+
+def test_list_orphan_entities_excludes_entities_with_a_live_state(fake_ha):
+    """light.kitchen is one of fakeha's own DEFAULT_STATES AND
+    DEFAULT_REGISTRY entries - registered and live, so it must not be
+    reported as an orphan."""
+    from tools.validation import list_orphan_entities
+
+    result = list_orphan_entities()
+
+    orphan_ids = {o["entity_id"] for o in result["orphans"]}
+    assert "light.kitchen" not in orphan_ids
+
+
+def test_list_orphan_entities_reports_disabled_by_for_a_deliberately_disabled_entity(fake_ha):
+    """A disabled entity legitimately has no state - a different situation
+    from a silently orphaned one, distinguished by disabled_by rather than
+    conflated with it."""
+    from tools.validation import list_orphan_entities
+
+    fake_ha.registry.append({
+        "entity_id": "sensor.disabled_by_user", "area_id": None,
+        "device_id": None, "labels": [], "platform": "mqtt",
+        "disabled_by": "user",
+    })
+
+    result = list_orphan_entities()
+
+    entry = next(o for o in result["orphans"] if o["entity_id"] == "sensor.disabled_by_user")
+    assert entry["disabled_by"] == "user"
