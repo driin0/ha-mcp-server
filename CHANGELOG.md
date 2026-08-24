@@ -466,6 +466,58 @@ project exists because of.
   `_set_and_verify_enabled()` is what lets the two callers disagree
   safely instead of drifting back into two separate implementations.
 
+### Fixed — the lost-update gap the final review missed
+
+`update_automation()` and `patch_automation()` are read-modify-write with
+no conditional write: fetch the stored config, change a field, POST the
+whole object back. Two calls racing each other on the same automation -
+two `patch_automation()` calls from one model correcting two different
+fields, issued in parallel, or either tool racing a person editing the
+same automation in the Home Assistant UI - could both report success
+while the second silently discarded the first's change. Verified live
+against a throwaway instance, and from Home Assistant's own source
+(`homeassistant/components/config/view.py`'s config-write endpoint,
+`homeassistant/components/automation/__init__.py`): the config-write GET
+carries no `ETag`/`Last-Modified`; a POST sent with `If-Match` or
+`If-Unmodified-Since` is silently ignored, not honoured or rejected; and
+the only WebSocket command registered for automation config
+(`automation/config`) is read-only, with no write counterpart at all.
+Home Assistant offers nothing to build a real compare-and-swap on.
+
+- Both edit tools now re-read the config immediately before their own
+  write and refuse with `error("concurrent_modification", ...)` if it no
+  longer matches what was read at the start of the call - nothing is
+  written in that case. This is a compare-and-swap *approximation*, not a
+  guarantee: it shrinks the unguarded window from "however long the
+  caller's own modify step takes" down to one HTTP round trip immediately
+  before the POST. Measured live, that residual window is on the order of
+  10ms.
+- After a successful write, both tools read the result back and refuse
+  with `error("config_write_unverified", ...)` if it does not match what
+  was intended, comparing both sides through `to_modern()` - a byte
+  comparison would always differ, since Home Assistant's own config-write
+  endpoint renames the root keys and an action step's `service:` on every
+  save regardless of what was posted (see the vocabulary paragraph
+  above). Unlike every other `error()` in this module, the write DID
+  happen in this case - the detail text says so explicitly, since a
+  caller cannot be told "safe" when this can only ever detect, not
+  prevent, the residual race.
+- `create_automation()`'s own pre-create collision check (`overwrite=False`)
+  has the identical read-then-write shape, though the invariant it
+  protects is different: not preserving a partial edit, but refusing to
+  silently replace something that appeared under the same lossy slug
+  between the check and the write. It now runs the same check again
+  immediately before the POST, for the same reason and with the same
+  "shrunk, not closed" caveat. `overwrite=True` is unaffected - that path
+  never promised collision protection to begin with.
+
+Proven live against a throwaway instance with an actual interleaving (not
+just a unit test against the fake): Writer A reads, Writer B writes a
+different field, Writer A's write lands - before this fix, both calls
+reported success and Writer B's change was silently gone; after it,
+Writer A's call is refused with `concurrent_modification` and nothing is
+written.
+
 ## 1.1.0
 
 The project moves into its own repository: **github.com/driin0/ha-mcp-server**,
