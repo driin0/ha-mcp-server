@@ -3,8 +3,8 @@
 ## Unreleased
 
 Released as 2.0.0 when it ships. The entries below cover the result-envelope
-sweep and the automation-editing work (plan 2) on this branch — plan 3
-(validation work) is not included.
+sweep, the automation-editing work (plan 2), and the reference-validation
+work (plan 3) on this branch.
 
 Every list-returning tool changes shape. If your client code, prompts, or
 saved conversations assume a bare list, they need updating — see below.
@@ -517,6 +517,75 @@ different field, Writer A's write lands - before this fix, both calls
 reported success and Writer B's change was silently gone; after it,
 Writer A's call is refused with `concurrent_modification` and nothing is
 written.
+
+### Added — reference validation (plan 3)
+
+A Home Assistant automation cut mains power to a running NAS mid-write and
+corrupted 245 GB. The guard was `{{ not is_state("button.nas_shutdown",
+"unavailable") }}`, and the entity had been renamed weeks earlier: in Home
+Assistant the state of an entity that does not exist is `None`, never the
+string `"unavailable"`, so `is_state()` returned `False` and the guard
+silently began passing instead of blocking — no error, no log line, no
+repair issue. A second, independent fault stacked on the same automation: a
+`wait_for_trigger` with a timeout and no `continue_on_timeout: false`
+carried execution past the guard into `switch.turn_off` against a machine
+still writing to disk. This release adds the tooling that would have caught
+both, before either did damage.
+
+- **`validate_automation(entity_id)`** and **`validate_all_automations(
+  only_issues=True, limit=0, offset=0)`** — check every entity/device an
+  automation references against this instance's live entity/device
+  registries and current state machine, and separately report any
+  `wait_for_trigger` that can silently carry a timeout into a destructive
+  action (`*.turn_off`, `switch.*`, `homeassistant.stop`/`restart`,
+  `hassio.host_*`). A reference resolves to one of three outcomes:
+  `dead_reference` (absent from both the registry and the state machine —
+  fix the automation), `restored` (in the registry but has no state — its
+  integration is not loaded, fix that instead), or `unavailable` (has a
+  state, but it is currently `"unavailable"`/`"unknown"` — also an
+  integration problem, not the automation's). A dead reference found inside
+  a template explains the exact failure mechanism above in its own `detail`
+  text, not just the bare fact that the id is missing. Findings come back
+  as **two separate lists** — `issues` (reference problems) and
+  `fail_open_waits` (control-flow hazards) — both counted in `summary`; a
+  caller reading only one of the two undercounts, since the incident this
+  tool exists for needed both faults on the *same* automation to cause
+  damage.
+- **`find_entity_usages(entity_id)`** — "if I rename or remove this entity,
+  what breaks?", answered before acting instead of after. Searches every
+  automation's and script's stored config, including inside templates.
+  Deliberately does **not** search dashboards, template entities, or
+  helpers — its `note` says so on every call, so an empty result is never
+  mistaken for "nothing else references this."
+- **`list_orphan_entities()`** — every entity-registry entry with no current
+  state: exactly what a reconfigured integration leaves behind, and the
+  same population `validate_automation()`'s `restored` outcome draws a
+  single row from when an automation happens to reference one.
+- **`tools/_refs.py`** — the pure, dependency-free extraction the four tools
+  above and the script below all share, so the definition of "what this
+  config references" lives in exactly one place. `extract_refs(config)`
+  walks an automation or script config for every `entity_id`/`device_id`
+  field and every template reference (`is_state`, `is_state_attr`,
+  `states`, `state_attr`, `expand`, `has_value`, and the bare
+  `states.<domain>.<id>` attribute form, both quote styles);
+  `find_fail_open_waits(config)` finds the wait-then-destructive-action
+  shape directly, with no reference resolution involved at all. No httpx,
+  no WebSocket, no import from the rest of this project — safe to run
+  against a bare YAML file on a machine with no Home Assistant on it.
+- **`scripts/lint_automations.py`** — a CLI over `validate_all_automations()`
+  for CI or a schedule. Prints every dead reference, restored reference,
+  unavailable reference and fail-open wait found, and exits `0` (clean),
+  `1` (at least one dead reference or fail-open wait — the two fault kinds
+  that actually need fixing), or `2` (the sweep could not run at all —
+  missing `HA_URL`/`HA_TOKEN`, or a transport/WebSocket failure). No
+  offline mode: resolving a reference needs the live registry, which a
+  YAML file cannot answer about itself.
+
+Validation is deliberately **static** throughout: nothing here evaluates a
+template to decide whether the reference it names is dead — a rendered
+template says what it returns right now, which is a different question.
+`render_template()` remains the tool for actually evaluating one you already
+suspect.
 
 ## 1.1.0
 

@@ -302,6 +302,18 @@ def validate_automation(entity_id: str) -> dict:
        summary: {refs_checked, dead_references, restored, unavailable,
                  fail_open_waits}}
 
+    `issues` and `fail_open_waits` are TWO SEPARATE LISTS, and `summary`
+    counts both — deliberately kept apart rather than merged into one
+    "problems" list, because they describe different kinds of fault (a bad
+    reference vs. a control-flow hazard) and that split is what makes
+    scripts/lint_automations.py's exit logic trivial. But it also means a
+    caller that reads only `issues` and ignores `fail_open_waits` (or vice
+    versa) can walk away having found one problem when there were two. That
+    is not hypothetical: the incident this tool exists for happened
+    precisely because both faults were present on the SAME automation at
+    once — a dead reference inside a template guard, and a fail-open wait
+    right after it. Check both lists, every time.
+
     Each `issues` entry is one problem reference — never a reference
     that resolved cleanly, see _classify()'s own docstring for why a
     validator that lists everything it checked, correct or not, gets

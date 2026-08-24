@@ -1,7 +1,7 @@
 # HA MCP Server
 
 An [MCP](https://modelcontextprotocol.io/) server that exposes Home Assistant's
-REST and WebSocket APIs as **185 tools** (181 registered by default — four are
+REST and WebSocket APIs as **189 tools** (185 registered by default — four are
 off until explicitly enabled, see [the registration
 gate](#the-registration-gate-three-groups-two-defaults) below), so an MCP
 client — Claude Code among others — can drive an instance directly.
@@ -255,6 +255,55 @@ normal run prints a warning stating how much of the tool surface the runtime
 conformance check actually covers (it calls every tool that takes no
 arguments and confirms it returns the expected shape) — that is a
 disclosure, not noise, so don't silence warnings to make it go away.
+
+### Reference validation
+
+A Home Assistant automation cut mains power to a running NAS mid-write and
+corrupted 245 GB. The guard was `{{ not is_state("button.nas_shutdown",
+"unavailable") }}`, and the entity had been renamed. In Home Assistant the
+state of an entity that does not exist is `None`, never the string
+`"unavailable"` — so `is_state()` returned `False`, `not False` is `True`,
+and the guard silently started passing instead of blocking. A second,
+independent fault stacked on top of it: a `wait_for_trigger` with a timeout
+and no `continue_on_timeout: false` carried execution past the guard into
+`switch.turn_off` against a machine still writing to disk. Neither fault
+raised an error, wrote a log line, or tripped a repair issue.
+
+Four tools exist to catch both shapes before they cause damage:
+
+- **`validate_automation`** / **`validate_all_automations`** — check every
+  entity/device an automation references against this instance's live
+  registries and state machine (`dead_reference`, `restored`,
+  `unavailable`), and separately report any `wait_for_trigger` that can
+  silently carry a timeout into a destructive action. These are reported as
+  two separate lists (`issues` and `fail_open_waits`) because the incident
+  needed both faults to cause damage — reading only one undercounts.
+- **`find_entity_usages`** — "if I rename or remove this entity, what
+  breaks?", searched across automations and scripts only (not dashboards,
+  template entities or helpers).
+- **`list_orphan_entities`** — registry entries with no current state,
+  exactly what a reconfigured integration leaves behind.
+
+**`scripts/lint_automations.py`** is a CLI over the same validator, for CI or
+a schedule:
+
+```bash
+HA_URL=https://your-instance:8123 HA_TOKEN=… python3 scripts/lint_automations.py
+```
+
+It prints every dead reference, restored reference, unavailable reference and
+fail-open wait it finds, and exits:
+
+- `0` — no dead references and no fail-open waits found (there may still be
+  `restored`/`unavailable` warnings printed above — an integration problem,
+  not a config defect, so it does not fail the build).
+- `1` — at least one dead reference or fail-open wait was found — see the
+  printed report for which automation and which one.
+- `2` — the sweep could not run at all (missing `HA_URL`/`HA_TOKEN`, or a
+  transport/WebSocket failure reading the registry or states).
+
+There is no offline mode: resolving a reference needs the live entity/device
+registry, which a YAML file on disk cannot answer about itself.
 
 ### A note on the base image
 
