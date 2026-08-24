@@ -1,5 +1,60 @@
 # Changelog
 
+## 2.1.0
+
+Two tools returned the expected population mixed into the unexpected one,
+and the expected dominated by about a hundred to one. Measured on a real
+137-automation instance: `list_orphan_entities` answered with 678 KB, and
+`validate_all_automations` with 99 KB — both past what an MCP client
+accepts in a single response, so the answer did not arrive at all.
+
+Neither number was the finding. The findings were "zero abandoned
+entities" and "zero dead references", each buried under thousands of rows
+describing things that were working as configured.
+
+### Changed
+
+- **`list_orphan_entities(include_disabled=False, limit=100, offset=0)`.**
+  A disabled entity legitimately has no state, and on that instance 3249
+  of 3249 orphans were disabled on purpose. They are no longer listed by
+  default; `excluded_disabled` reports how many were left out, so the
+  population is never silently smaller than it looks. `include_disabled=True`
+  restores the previous listing. The tool also paginates now — it was the
+  only collection here that did not, on a population that is thousands of
+  rows by nature.
+
+- **`validate_all_automations(min_severity="error")`.** The floor filters
+  the listing and nothing else: `summary` is computed before the filter
+  runs and always covers every automation checked. A caller reading
+  `unavailable: 91` next to an empty listing is being told the truth
+  twice. Filtering the counts as well would be a checker reporting
+  "nothing found" about a population it stopped counting — the exact
+  fault this module exists to remove, so the counts are deliberately
+  outside the filter's reach.
+
+  `error` is the default because it is the tier the tool exists for: a
+  dead reference, or an entity whose integration is not loaded. The milder
+  tiers describe a device that is offline or resting right now — a real
+  signal, but addressed to whoever maintains the integration, as those
+  outcomes' own detail text says. On the real instance they were 106
+  findings out of 106, and none were of this tool's class.
+
+  A read error and a fail-open wait are never filtered out: the first
+  means the automation was not checked at all, the second carries no
+  severity and is half the incident this module was written for.
+
+  `scripts/lint_automations.py` inherits the new default and its blocking
+  count is unchanged — pinned by a test, because a future default that
+  filtered a dead reference out of the listing would make the linter exit
+  0 on a broken instance.
+
+### Fixed
+
+- `validate_all_automations`'s docstring said `summary.checked` counts the
+  automations "read and validated". It counts the ones **read** — the
+  unreadable ones are in there too, and counted again under `read_errors`.
+  `checked - read_errors` is how many were actually validated.
+
 ## 2.0.0
 
 The entries below cover the result-envelope sweep, the automation-editing
