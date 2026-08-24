@@ -1,10 +1,9 @@
 # Changelog
 
-## Unreleased
+## 2.0.0
 
-Released as 2.0.0 when it ships. The entries below cover the result-envelope
-sweep, the automation-editing work (plan 2), and the reference-validation
-work (plan 3) on this branch.
+The entries below cover the result-envelope sweep, the automation-editing
+work, and the reference-validation work.
 
 Every list-returning tool changes shape. If your client code, prompts, or
 saved conversations assume a bare list, they need updating — see below.
