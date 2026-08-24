@@ -352,7 +352,10 @@ def create_automation(
     (see `overwrite` above), "collision_check_failed" when that check
     itself could not be performed (a transient error reading the existing
     config - nothing is created; pass overwrite=True to proceed without
-    the check if you are sure), or "automation_not_registered"/
+    the check if you are sure), "home_assistant_error" when Home Assistant
+    rejects the config itself - a malformed trigger/condition/action, an
+    unknown platform - with its own validation message reported directly
+    (see rest_error()) and nothing created, or "automation_not_registered"/
     "automation_not_disabled"/"automation_state_unverified" when the
     entity's state after creation could not confirm what was requested.
 
@@ -457,7 +460,24 @@ def create_automation(
             json=payload,
             timeout=15,
         )
-        r.raise_for_status()
+        # Same class of bug already fixed in update_automation() and
+        # patch_automation()'s own config-write POSTs (see rest_error()'s
+        # own docstring): Home Assistant validates the whole config on
+        # write, and a rejected one answers 400 with a plain-text
+        # explanation of what was wrong - e.g. "Invalid trigger
+        # 'nope_not_a_platform' specified" - exactly what a caller needs
+        # to correct itself. A bare r.raise_for_status() here discarded
+        # that message as an uncaught httpx.HTTPStatusError instead of
+        # the named error() every other refusal in this tool already
+        # returns. Nothing is created either way; only this branch says
+        # why. Returning here, before _set_and_verify_enabled() is ever
+        # called, leaves the enabled-verification path below completely
+        # untouched - it never runs against a config Home Assistant
+        # refused to accept.
+        if write_err := rest_error(r):
+            write_err["automation_id"] = automation_id
+            write_err["entity_id"] = entity_id
+            return write_err
         create_result = r.json()
 
     # _set_and_verify_enabled() waits for the entity to register before
@@ -1157,11 +1177,15 @@ def create_automation_from_blueprint(
     only a REST endpoint, the same one create_automation() uses.
 
     Returns: {automation_id, entity_id, alias, blueprint, result} once Home
-    Assistant accepts the config. Unlike create_automation(), this does not
-    wait for the entity to register or read its state back - a blueprint
-    automation is armed the instant it registers, the same way any new
-    automation is; check get_states_by_domain('automation') afterward if
-    you need to confirm it exists.
+    Assistant accepts the config, or error("home_assistant_error", ...,
+    status=...) when it rejects the config itself - a bad blueprint path,
+    input values that don't satisfy the blueprint's own selectors - with
+    Home Assistant's own validation message reported directly (see
+    rest_error()) and nothing created. Unlike create_automation(), this
+    does not wait for the entity to register or read its state back - a
+    blueprint automation is armed the instant it registers, the same way
+    any new automation is; check get_states_by_domain('automation')
+    afterward if you need to confirm it exists.
     """
     automation_id = _slug(alias)
     payload = {
@@ -1178,7 +1202,16 @@ def create_automation_from_blueprint(
             json=payload,
             timeout=15,
         )
-        r.raise_for_status()
+        # Posts to the same config-write endpoint create_automation() does,
+        # and is rejected the same way on a malformed config - see that
+        # tool's identical guard for the full reasoning; this was the
+        # fourth (and, per the sweep below, last) unguarded instance of it
+        # in this module.
+        if write_err := rest_error(r):
+            write_err["automation_id"] = automation_id
+            write_err["entity_id"] = f"automation.{automation_id}"
+            write_err["blueprint"] = blueprint_path
+            return write_err
         return {
             "automation_id": automation_id,
             "entity_id": f"automation.{automation_id}",

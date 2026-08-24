@@ -205,21 +205,28 @@ def test_create_automation_from_blueprint_posts_to_the_rest_config_endpoint(fake
     assert result["entity_id"] == "automation.hallway_motion"
 
 
-def test_create_automation_from_blueprint_raises_on_a_failed_call(fake_ha):
-    import httpx
-    import pytest
-
+def test_create_automation_from_blueprint_reports_home_assistants_rejection(fake_ha):
+    """Posts to the same config-write endpoint create_automation() does,
+    and is rejected by Home Assistant the same way on a malformed config -
+    a bare r.raise_for_status() used to discard HA's own explanation as an
+    uncaught httpx.HTTPStatusError; rest_error() reports it instead, the
+    same fix already applied to create_automation()'s identical POST."""
     from tools.automations import create_automation_from_blueprint
 
     fake_ha.fail_rest("/api/config/automation/config/", status=400,
                       message="Message malformed: not a file")
 
-    with pytest.raises(httpx.HTTPStatusError):
-        create_automation_from_blueprint(
-            blueprint_path="homeassistant/motion_trigger.yaml",
-            alias="Hallway motion",
-            input_values={},
-        )
+    result = create_automation_from_blueprint(
+        blueprint_path="homeassistant/motion_trigger.yaml",
+        alias="Hallway motion",
+        input_values={},
+    )
+
+    assert result["error"] == "home_assistant_error"
+    assert result["status"] == 400
+    assert "not a file" in result["detail"]
+    assert result["entity_id"] == "automation.hallway_motion"
+    assert "hallway_motion" not in fake_ha.automation_configs
 
 
 # ---- tools/automations.py & tools/scripts.py: _slug() id collisions (D2) ----------
