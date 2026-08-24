@@ -143,7 +143,7 @@ def test_the_incidents_summary_counts_match(fake_ha):
     assert result["summary"]["disabled"] == 0
     assert result["summary"]["unavailable"] == 0
     assert result["summary"]["unknown"] == 0
-    assert result["summary"]["fail_open_waits"] == 1
+    assert result["summary"]["fail_open_wait_count"] == 1
     assert result["automation_id"] == "9001"
     assert result["name"] == "NAS shutdown guard"
 
@@ -276,7 +276,7 @@ def test_a_live_normal_reference_is_not_reported(fake_ha):
     assert result["fail_open_waits"] == []
     assert result["summary"] == {
         "refs_checked": 1, "dead_references": 0, "restored": 0,
-        "disabled": 0, "unavailable": 0, "unknown": 0, "fail_open_waits": 0,
+        "disabled": 0, "unavailable": 0, "unknown": 0, "fail_open_wait_count": 0,
     }
 
 
@@ -419,6 +419,25 @@ def test_validate_all_automations_without_only_issues_keeps_every_automation(fak
     assert result["total"] == result["summary"]["checked"]
     entity_ids = {r["entity_id"] for r in result["results"]}
     assert "automation.clean3" in entity_ids
+
+
+def test_validate_all_automations_returns_the_callers_own_offset(fake_ha):
+    """envelope()'s own default offset (0) used to leak straight through
+    regardless of what the caller actually passed - a caller paginating
+    with offset=1 got back {"offset": 0} in every response, indistinguishable
+    from a call that started at the very beginning, with no way to tell
+    whether its own argument had been honoured at all."""
+    from tools.validation import validate_all_automations
+
+    # fakeha's own defaults seed exactly two automations (automation.morning,
+    # automation.nas_shutdown - see DEFAULT_STATES, tests/fakeha.py), sorted
+    # by name: "Morning" then "NAS shutdown".
+    result = validate_all_automations(only_issues=False, limit=1, offset=1)
+
+    assert result["offset"] == 1
+    assert result["total"] == 1
+    assert result["returned"] == 1
+    assert result["results"][0]["name"] == "NAS shutdown"
 
 
 def test_validate_all_automations_reports_a_read_error_regardless_of_only_issues(fake_ha):

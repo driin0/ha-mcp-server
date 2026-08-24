@@ -536,8 +536,10 @@ both, before either did damage.
   only_issues=True, limit=0, offset=0)`** — check every entity/device an
   automation references against this instance's live entity/device
   registries and current state machine, and separately report any
-  `wait_for_trigger` that can silently carry a timeout into a destructive
-  action — scoped to what is actually irreversible or destructive
+  `wait_for_trigger` OR `wait_template` (identical timeout/
+  `continue_on_timeout` semantics, checked identically) that can silently
+  carry a timeout into a destructive action — scoped to what is actually
+  irreversible or destructive
   unattended (`switch.turn_off`, `homeassistant.stop`/`restart`,
   `hassio.host_*`, `lock.*`, `alarm_control_panel.alarm_arm_*`/
   `alarm_disarm`), not every domain's `turn_off` or every switch service:
@@ -560,10 +562,21 @@ both, before either did damage.
   a template explains the exact failure mechanism above in its own `detail`
   text, not just the bare fact that the id is missing. Findings come back
   as **two separate lists** — `issues` (reference problems) and
-  `fail_open_waits` (control-flow hazards) — both counted in `summary`; a
+  `fail_open_waits` (control-flow hazards) — counted in `summary` as
+  `summary.fail_open_wait_count` (not `summary.fail_open_waits` — kept
+  distinct from the top-level list of the identical name, since every
+  other `summary` field is a count and a caller destructuring `summary`
+  should not need a type check to find the one that is a list instead); a
   caller reading only one of the two undercounts, since the incident this
   tool exists for needed both faults on the *same* automation to cause
-  damage.
+  damage. A UI-built device action (`{device_id, domain, type}`, no
+  `service:`/`action:` key at all — Home Assistant resolves it to a
+  service call itself at run time) is now recognised for the
+  destructiveness check the same as an equivalent plain service call
+  would be; it used to be invisible to it entirely.
+  `validate_all_automations()` now also returns the caller's own `offset`
+  instead of always `0`, so a caller paginating with `offset`/`limit` can
+  actually advance.
 - **`find_entity_usages(entity_id)`** — "if I rename or remove this entity,
   what breaks?", answered before acting instead of after. Searches every
   automation's and script's stored config, including inside templates.

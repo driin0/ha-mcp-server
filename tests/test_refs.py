@@ -371,6 +371,41 @@ def test_continue_on_timeout_true_is_still_fail_open():
     assert len(find_fail_open_waits(config)) == 1
 
 
+def test_continue_on_timeout_as_the_string_false_fails_closed():
+    """Home Assistant's own cv.boolean() config validator coerces the
+    STRING "false" (any case) to the boolean False, the same as it does
+    for "no"/"off"/"disable"/"0" - continue_on_timeout: "false" is
+    therefore exactly as fail-closed as continue_on_timeout: false, not a
+    truthy string that fails open."""
+    config = {"action": [
+        {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30",
+         "continue_on_timeout": "false"},
+        {"service": "switch.turn_off", "target": {"entity_id": "switch.nas_power"}},
+    ]}
+
+    assert find_fail_open_waits(config) == []
+
+
+def test_continue_on_timeout_as_other_falsy_spellings_also_fails_closed():
+    for value in ("False", "FALSE", "no", "off", "disable", "0", 0):
+        config = {"action": [
+            {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30",
+             "continue_on_timeout": value},
+            {"service": "switch.turn_off", "target": {"entity_id": "switch.nas_power"}},
+        ]}
+        assert find_fail_open_waits(config) == [], value
+
+
+def test_continue_on_timeout_as_the_string_true_is_still_fail_open():
+    config = {"action": [
+        {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30",
+         "continue_on_timeout": "true"},
+        {"service": "switch.turn_off", "target": {"entity_id": "switch.nas_power"}},
+    ]}
+
+    assert len(find_fail_open_waits(config)) == 1
+
+
 def test_no_timeout_blocks_forever_and_is_not_reported():
     """A wait with no timeout at all fails closed by construction — it
     never lets execution continue on its own."""
@@ -735,3 +770,84 @@ def test_the_incidents_own_shape_is_detected():
     assert waits[0]["action_where"] == "action.2"
     assert waits[0]["service"] == "switch.turn_off"
     assert waits[0]["timeout"] == "00:00:30"
+
+
+# ---------------------------------------------------------------------------
+# find_fail_open_waits() — wait_template, device actions, script configs
+# ---------------------------------------------------------------------------
+
+def test_wait_template_with_a_timeout_is_checked_the_same_as_wait_for_trigger():
+    """wait_template shares wait_for_trigger's exact timeout/
+    continue_on_timeout semantics in Home Assistant - a fail-open
+    wait_template ahead of a destructive action is exactly as dangerous
+    and must be reported the same way."""
+    config = {"action": [
+        {"wait_template": "{{ is_state('button.x', 'unavailable') }}",
+         "timeout": "00:00:30"},
+        {"service": "switch.turn_off", "target": {"entity_id": "switch.nas_power"}},
+    ]}
+
+    waits = find_fail_open_waits(config)
+
+    assert len(waits) == 1
+    assert waits[0]["wait_where"] == "action.0"
+    assert waits[0]["action_where"] == "action.1"
+
+
+def test_wait_template_with_continue_on_timeout_false_is_not_reported():
+    config = {"action": [
+        {"wait_template": "{{ is_state('button.x', 'unavailable') }}",
+         "timeout": "00:00:30", "continue_on_timeout": False},
+        {"service": "switch.turn_off", "target": {"entity_id": "switch.nas_power"}},
+    ]}
+
+    assert find_fail_open_waits(config) == []
+
+
+def test_a_ui_built_device_action_is_checked_for_destructiveness():
+    """A device action has no service:/action: key at all - Home
+    Assistant's own UI editor writes {device_id, domain, type} and
+    resolves it to a service call (here, switch.turn_off) itself at run
+    time. Without reading this shape, this step would be silently
+    invisible to the destructive check even though its effect is
+    identical to a plain switch.turn_off service call."""
+    config = {"action": [
+        {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
+        {"device_id": "abc123", "domain": "switch", "type": "turn_off"},
+    ]}
+
+    waits = find_fail_open_waits(config)
+
+    assert len(waits) == 1
+    assert waits[0]["service"] == "switch.turn_off"
+
+
+def test_a_ui_built_device_action_for_a_non_destructive_type_is_silent():
+    config = {"action": [
+        {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
+        {"device_id": "abc123", "domain": "light", "type": "turn_off"},
+    ]}
+
+    assert find_fail_open_waits(config) == []
+
+
+def test_a_scripts_own_sequence_root_is_scanned():
+    """A script's stored config has no trigger/condition - its steps sit
+    directly under 'sequence', not 'action'/'actions'. This function
+    itself is root-key-agnostic so a script config works if ever passed
+    to it; no current caller in this codebase actually does that (see
+    this function's own docstring) - a script referencing this exact
+    incident shape is not caught by any tool today."""
+    config = {
+        "alias": "NAS shutdown script",
+        "sequence": [
+            {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
+            {"service": "switch.turn_off", "target": {"entity_id": "switch.nas_power"}},
+        ],
+    }
+
+    waits = find_fail_open_waits(config)
+
+    assert len(waits) == 1
+    assert waits[0]["wait_where"] == "sequence.0"
+    assert waits[0]["action_where"] == "sequence.1"

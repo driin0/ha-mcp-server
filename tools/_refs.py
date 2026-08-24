@@ -287,19 +287,75 @@ def _step_service(step: dict) -> str | None:
     destructiveness needs its actual service name. Every other key this
     module reads (entity_id, device_id, wait_for_trigger, then/else/
     default/sequence/repeat/choose/parallel) is spelled identically in
-    both vocabularies."""
+    both vocabularies.
+
+    A UI-built device action has no 'service:'/'action:' key at all -
+    Home Assistant's own device-action shape is
+    {device_id, domain, type}, e.g. {"device_id": "abc", "domain":
+    "switch", "type": "turn_off"}, and it is HA itself, not the stored
+    config, that turns that into a call to switch.turn_off at run time.
+    Without reading this shape, that exact step - identical in effect to
+    a plain switch.turn_off service call - would be invisible to
+    _destructive_service() below. Synthesised as "domain.type", the same
+    dotted form every other service name in this module already takes."""
     service = step.get("service", step.get("action"))
-    return service if isinstance(service, str) else None
+    if isinstance(service, str):
+        return service
+    if "device_id" in step:
+        domain, type_ = step.get("domain"), step.get("type")
+        if isinstance(domain, str) and isinstance(type_, str):
+            return f"{domain}.{type_}"
+    return None
+
+
+# wait_for_trigger and wait_template share identical continue_on_timeout
+# semantics in Home Assistant - both block on a timeout and both accept
+# continue_on_timeout to decide what happens once it elapses - so both
+# are treated as the same kind of wait for fail-open purposes.
+_WAIT_KEYS = ("wait_for_trigger", "wait_template")
+
+# The exact string/number spellings Home Assistant's own cv.boolean()
+# helper accepts for a YAML boolean field, lowercased. continue_on_timeout
+# goes through this same validator when Home Assistant loads a config, so
+# "false" (a string, e.g. from a template rendering to text, or just an
+# author's habit from another config language) is coerced to False by HA
+# itself long before this step ever runs - not a special case this module
+# invented.
+_CV_BOOLEAN_TRUE = frozenset({"1", "true", "yes", "on", "enable"})
+_CV_BOOLEAN_FALSE = frozenset({"0", "false", "no", "off", "disable"})
+
+
+def _coerce_cv_boolean(value) -> bool | None:
+    """Mirror Home Assistant's own cv.boolean() coercion. Returns None
+    when `value` cannot be coerced at all (an unparseable string, a list,
+    ...) - a config shaped that way would fail to load in HA itself, so
+    this module does not need to guess further than "not explicitly
+    False", the same permissive default an absent key already gets."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _CV_BOOLEAN_TRUE:
+            return True
+        if lowered in _CV_BOOLEAN_FALSE:
+            return False
+        return None
+    if isinstance(value, (int, float)):
+        return value != 0
+    return None
 
 
 def _wait_fails_open(step: dict) -> bool:
-    """A wait_for_trigger step fails open when it carries a timeout and
-    does not explicitly set continue_on_timeout: false. No timeout at all
-    is not reported: with nothing to time out on, the step blocks forever
+    """A wait_for_trigger/wait_template step fails open when it carries a
+    timeout and does not explicitly set continue_on_timeout to something
+    that coerces to False (see _coerce_cv_boolean() - "false" the STRING
+    is just as much False as the boolean, because Home Assistant's own
+    config validation treats them identically). No timeout at all is not
+    reported: with nothing to time out on, the step blocks forever
     waiting for its own trigger, which fails closed by construction."""
     if "timeout" not in step:
         return False
-    return step.get("continue_on_timeout") is not False
+    return _coerce_cv_boolean(step.get("continue_on_timeout")) is not False
 
 
 def _nested_sequences(step: dict, step_path: str):
@@ -385,7 +441,7 @@ def _scan_sequence(steps, path: str, results: list, pending: dict | None = None)
         if not isinstance(step, dict):
             continue
 
-        if "wait_for_trigger" in step:
+        if any(key in step for key in _WAIT_KEYS):
             pending = {"where": step_path, "timeout": step.get("timeout")} \
                 if _wait_fails_open(step) else None
         else:
@@ -403,9 +459,14 @@ def _scan_sequence(steps, path: str, results: list, pending: dict | None = None)
 
 
 def find_fail_open_waits(config: dict) -> list[dict]:
-    """Every wait_for_trigger in `config` that can silently let execution
-    continue - via its own timeout, with no `continue_on_timeout: false`
+    """Every wait_for_trigger OR wait_template in `config` that can
+    silently let execution continue - via its own timeout, with nothing
+    that coerces to continue_on_timeout: false (see _coerce_cv_boolean())
     to stop it - into a destructive action later in the same sequence.
+    The two step types are checked identically: Home Assistant gives them
+    the exact same timeout/continue_on_timeout semantics, so a
+    wait_template ahead of a destructive action is exactly as dangerous
+    as a wait_for_trigger there, and is reported the same way.
 
     This is the second half of the incident this module exists for (see
     the module docstring): a wait_for_trigger with a timeout and no
@@ -458,9 +519,26 @@ def find_fail_open_waits(config: dict) -> list[dict]:
     destructive action reachable after a fail-open wait, not only the
     first, gets its own entry - see _scan_sequence()'s own docstring for
     why.
+
+    Reads whichever root key `config` actually has - `actions`/`action`
+    (an automation) or `sequence` (a script, whose own config has no
+    trigger/condition and stores its steps directly under `sequence`) -
+    so this function itself works identically on either kind of config.
+    That does NOT mean a script is actually checked anywhere today: every
+    current caller (validate_automation(), validate_all_automations(),
+    tools/validation.py) only ever calls this on an AUTOMATION's config -
+    unlike find_entity_usages() (tools/validation.py), which does search
+    both automations and scripts, this asymmetry is easy to miss. A
+    script that waits on a timeout ahead of a destructive action is just
+    as exposed as an automation with the identical shape and is not
+    currently caught by anything in this codebase.
     """
     results: list[dict] = []
-    actions = config.get("actions", config.get("action"))
-    root_path = "actions" if "actions" in config else "action"
-    _scan_sequence(actions, root_path, results)
+    if "actions" in config:
+        steps, root_path = config["actions"], "actions"
+    elif "action" in config:
+        steps, root_path = config["action"], "action"
+    else:
+        steps, root_path = config.get("sequence"), "sequence"
+    _scan_sequence(steps, root_path, results)
     return results

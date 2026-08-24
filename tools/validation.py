@@ -360,6 +360,14 @@ def _validate_config(automation_id: str | None, entity_id: str, name: str, confi
     in here — both already happened by the time this runs, which is what
     lets validate_all_automations() share one snapshot across every
     automation it checks instead of re-fetching it per automation.
+
+    The top-level `fail_open_waits` key is the LIST of findings;
+    `summary.fail_open_wait_count` is the INT count of that same list.
+    Deliberately not the same name twice in one response — `summary`'s
+    other keys are already all counts (refs_checked, dead_references,
+    ...), and a caller that destructures `summary` alongside the rest of
+    this dict and gets a list where every sibling key is an int is the
+    kind of surprise a name should not need a type check to catch.
     """
     refs = extract_refs(config)
     waits = find_fail_open_waits(config)
@@ -382,7 +390,7 @@ def _validate_config(automation_id: str | None, entity_id: str, name: str, confi
             "disabled": sum(1 for i in issues if i["outcome"] == "disabled"),
             "unavailable": sum(1 for i in issues if i["outcome"] == "unavailable"),
             "unknown": sum(1 for i in issues if i["outcome"] == "unknown"),
-            "fail_open_waits": len(waits),
+            "fail_open_wait_count": len(waits),
         },
     }
 
@@ -439,7 +447,7 @@ def validate_automation(entity_id: str) -> dict:
       {automation_id, entity_id, name, issues: [...],
        fail_open_waits: [...],
        summary: {refs_checked, dead_references, restored, disabled,
-                 unavailable, unknown, fail_open_waits}}
+                 unavailable, unknown, fail_open_wait_count}}
 
     `issues` and `fail_open_waits` are TWO SEPARATE LISTS, and `summary`
     counts both — deliberately kept apart rather than merged into one
@@ -537,7 +545,7 @@ def validate_all_automations(only_issues: bool = True, limit: int = 0, offset: i
 
     Returns: {total, returned, offset, note?, results: [...],
     summary: {checked, with_issues, read_errors, dead_references,
-    restored, disabled, unavailable, unknown, fail_open_waits}}.
+    restored, disabled, unavailable, unknown, fail_open_wait_count}}.
 
     `total`/`returned`/`offset`/`note` describe `results` exactly the
     way every other paginated tool in this codebase does (see
@@ -628,7 +636,18 @@ def validate_all_automations(only_issues: bool = True, limit: int = 0, offset: i
             continue
         results.append(outcome)
 
-    out = envelope(results, key="results")
+    # total=len(results) tells envelope() `results` is already the page
+    # (list_automations(limit=limit, offset=offset) above already applied
+    # both) - without it, envelope()'s own default slicing would apply
+    # `offset` to `results` a SECOND time on top of the one list_automations()
+    # already did. offset=offset (this function's own parameter, not the
+    # 0 default) is passed through purely for the response's own {offset}
+    # metadata field, not for slicing - a caller paginating with offset=50
+    # used to always see {"offset": 0} back regardless of what it asked
+    # for, with nothing to tell it whether the call had actually honoured
+    # its own argument.
+    out = envelope(results, key="results", total=len(results), offset=offset,
+                   offset_paginated=True)
     out["summary"] = {
         "checked": checked,
         "with_issues": sum(
@@ -646,8 +665,8 @@ def validate_all_automations(only_issues: bool = True, limit: int = 0, offset: i
             r["summary"]["unavailable"] for r in results if "summary" in r),
         "unknown": sum(
             r["summary"]["unknown"] for r in results if "summary" in r),
-        "fail_open_waits": sum(
-            r["summary"]["fail_open_waits"] for r in results if "summary" in r),
+        "fail_open_wait_count": sum(
+            r["summary"]["fail_open_wait_count"] for r in results if "summary" in r),
     }
     return out
 
@@ -747,6 +766,20 @@ def find_entity_usages(entity_id: str) -> dict:
     validate_automation() runs above, not a second, independently
     maintained walker that could silently drift from it and miss a shape
     the other one catches.
+
+    Cost: unlike validate_automation()/validate_all_automations() (see
+    this module's own "## Cost" section), this makes 1 + N + 1 + M HTTP
+    requests — list_automations() once, get_automation() once per one of
+    N automations, list_scripts() once, get_script() once per one of M
+    scripts — with no live snapshot to share, because this tool resolves
+    nothing against live state at all; it only reads stored configs.
+    get_automation()/get_script() also each open their OWN
+    `httpx.Client()` (see tools/automations.py, tools/scripts.py), so this
+    opens a fresh connection per automation and per script rather than
+    reusing one across the whole sweep — real, unbounded per-instance
+    cost this docstring did not previously say anything about, on the one
+    tool in this module meant to be called before every rename, the exact
+    moment a slow response is least welcome.
 
     ⚠️ SEARCHED: automations and scripts, including inside their template
     strings — a value_template naming entity_id via is_state(), states(),

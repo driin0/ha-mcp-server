@@ -248,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{summary['unavailable']} unavailable, "
         f"{summary['unknown']} unknown (often normal - see the tool's "
         "own docstring), "
-        f"{summary['fail_open_waits']} fail-open wait(s), "
+        f"{summary['fail_open_wait_count']} fail-open wait(s), "
         f"{summary['read_errors']} config(s) could not be read."
     )
 
