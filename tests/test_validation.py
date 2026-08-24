@@ -140,6 +140,7 @@ def test_the_incidents_summary_counts_match(fake_ha):
 
     assert result["summary"]["dead_references"] == 1
     assert result["summary"]["restored"] == 0
+    assert result["summary"]["disabled"] == 0
     assert result["summary"]["unavailable"] == 0
     assert result["summary"]["unknown"] == 0
     assert result["summary"]["fail_open_waits"] == 1
@@ -185,7 +186,8 @@ def test_a_reference_in_the_registry_with_no_state_is_restored(fake_ha):
     from tools.validation import validate_automation
 
     fake_ha.registry.append(
-        {"entity_id": "light.reconfigured", "area_id": None, "device_id": None, "labels": []})
+        {"entity_id": "light.reconfigured", "area_id": None, "device_id": None,
+         "labels": [], "disabled_by": None})
     _minimal_automation(fake_ha, "p2", "automation.probe2", "light.reconfigured")
 
     result = validate_automation("automation.probe2")
@@ -194,7 +196,32 @@ def test_a_reference_in_the_registry_with_no_state_is_restored(fake_ha):
     issue = result["issues"][0]
     assert issue["outcome"] == "restored"
     assert issue["severity"] == "error"
+    assert issue["disabled_by"] is None
     assert "integration" in issue["detail"]
+
+
+def test_a_reference_to_a_deliberately_disabled_entity_is_disabled_not_restored(fake_ha):
+    """_classify() has the registry row in hand and must read disabled_by
+    from it, the same way list_orphan_entities() already does - a
+    deliberately disabled entity is not an integration failure, and must
+    not be reported with detail text claiming one."""
+    from tools.validation import validate_automation
+
+    fake_ha.registry.append(
+        {"entity_id": "light.turned_off_on_purpose", "area_id": None, "device_id": None,
+         "labels": [], "disabled_by": "user"})
+    _minimal_automation(fake_ha, "p2b", "automation.probe2b", "light.turned_off_on_purpose")
+
+    result = validate_automation("automation.probe2b")
+
+    assert len(result["issues"]) == 1
+    issue = result["issues"][0]
+    assert issue["outcome"] == "disabled"
+    assert issue["severity"] == "warning"
+    assert issue["disabled_by"] == "user"
+    assert "integration is not loaded" not in issue["detail"]
+    assert result["summary"]["restored"] == 0
+    assert result["summary"]["disabled"] == 1
 
 
 def test_a_reference_with_state_unavailable_is_unavailable(fake_ha):
@@ -249,7 +276,7 @@ def test_a_live_normal_reference_is_not_reported(fake_ha):
     assert result["fail_open_waits"] == []
     assert result["summary"] == {
         "refs_checked": 1, "dead_references": 0, "restored": 0,
-        "unavailable": 0, "unknown": 0, "fail_open_waits": 0,
+        "disabled": 0, "unavailable": 0, "unknown": 0, "fail_open_waits": 0,
     }
 
 

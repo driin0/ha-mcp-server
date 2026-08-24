@@ -542,10 +542,14 @@ both, before either did damage.
   `hassio.host_*`, `lock.*`, `alarm_control_panel.alarm_arm_*`/
   `alarm_disarm`), not every domain's `turn_off` or every switch service:
   turning a light off after a timeout is what automations are for. A
-  reference resolves to one of four outcomes:
+  reference resolves to one of five outcomes:
   `dead_reference` (absent from both the registry and the state machine —
-  fix the automation), `restored` (in the registry but has no state — its
-  integration is not loaded, fix that instead), `unavailable` (has a
+  fix the automation), `restored` (in the registry, not disabled, but has
+  no state — its integration is not loaded, fix that instead), `disabled`
+  (in the registry with no state because it was deliberately turned off —
+  working as configured, not an integration failure; kept separate from
+  `restored` since the earlier version reported both identically, sending
+  an operator to debug an integration that was fine), `unavailable` (has a
   state, and it is currently `"unavailable"` — always a real integration
   problem, not the automation's), or `unknown` (has a state, and it is
   currently `"unknown"` — often the ordinary resting state for a whole
@@ -568,8 +572,8 @@ both, before either did damage.
   mistaken for "nothing else references this."
 - **`list_orphan_entities()`** — every entity-registry entry with no current
   state: exactly what a reconfigured integration leaves behind, and the
-  same population `validate_automation()`'s `restored` outcome draws a
-  single row from when an automation happens to reference one.
+  same population `validate_automation()`'s `restored`/`disabled` outcomes
+  each draw a single row from when an automation happens to reference one.
 - **`tools/_refs.py`** — the pure, dependency-free extraction the four tools
   above and the script below all share, so the definition of "what this
   config references" lives in exactly one place. `extract_refs(config)`

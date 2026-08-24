@@ -5,17 +5,23 @@ tools/_refs.py answers "what does this automation's config NAME" — purely,
 with no network at all. This module answers the next question, the one
 that needs a live instance to answer: "does each of those names still
 point at something real, and if so, is that something currently
-answering?" Four outcomes, kept deliberately distinct because the right
-response to each is different (and "unavailable"/"unknown" are less alike
-than they look — see below):
+answering?" Five outcomes, kept deliberately distinct because the right
+response to each is different (and "unavailable"/"unknown", and
+"restored"/"disabled", are each less alike than they look — see below):
 
   dead_reference (error)   the id is absent from BOTH the entity/device
     registry AND the state machine. It does not exist here at all — a
     stale id, almost always left behind by a rename. Fix the automation.
-  restored (error)         the id IS in the registry, but has no current
-    state. The id is correct; its integration is not loaded (failed to
-    start, its config entry was removed, an add-on is stopped). Fix the
-    integration, not the automation.
+  restored (error)         the id IS in the registry, is NOT disabled,
+    but has no current state. The id is correct; its integration is not
+    loaded (failed to start, its config entry was removed, an add-on is
+    stopped). Fix the integration, not the automation.
+  disabled (warning)       the id IS in the registry, but has no current
+    state because it is DELIBERATELY DISABLED (`disabled_by` is set — by
+    a person, an integration, or Home Assistant itself), not because an
+    integration failed. The reference is correct; the entity simply will
+    not respond while disabled. See _classify()'s own docstring for why
+    this must not be reported as "restored".
   unavailable (warning)    the id has a state, and that state is
     currently "unavailable" — present, but not currently answering (an
     offline device, a degraded connection, mid-reconnect). This is
@@ -30,6 +36,24 @@ than they look — see below):
     entities), not necessarily a sign of anything wrong. See
     _classify()'s own docstring for why this is reported as its own,
     lower-confidence outcome rather than folded into "unavailable".
+
+## Why "disabled" is not "restored"
+
+`list_orphan_entities()` (below) already draws this exact distinction for
+the population it lists directly: "a disabled entity ... legitimately has
+no state: that is a different, expected situation from an enabled entity
+that is silently orphaned." Before this fix, `_classify()` had the same
+registry row in hand — the same one that carries `disabled_by` — and never
+read it, so a reference to a deliberately disabled entity was reported as
+`restored`/error with detail text saying "its integration is not loaded
+(failed to start, its config entry was removed, an add-on is stopped)".
+Measured against the vanilla demo instance's own orphaned entities: 3 of 4
+are disabled, not failed. That detail text sends an operator to debug an
+integration that is working exactly as configured — the distinction was
+made in one tool in this module and silently dropped in the other.
+`disabled` now carries `disabled_by` itself (mirroring
+`list_orphan_entities()`'s own shape) and a detail text that names the
+actual cause.
 
 ## Why "unknown" is not "unavailable"
 
@@ -115,8 +139,9 @@ list_orphan_entities() answers the other half of the same incident from
 the opposite direction: not "what points at this id" but "which ids in
 the registry have nothing pointing back at them from Home Assistant's own
 state machine at all" — precisely what a reconfigured integration leaves
-behind, and the population validate_automation()'s own "restored" outcome
-draws a single row from when an automation happens to reference one.
+behind, and the population validate_automation()'s own "restored" and
+"disabled" outcomes each draw a single row from when an automation
+happens to reference one.
 """
 import httpx
 
@@ -178,12 +203,12 @@ def _classify(ref: dict, states: dict, entity_registry: dict, device_registry: d
     references that are simply fine. Crying wolf on a correct automation
     is how a validator gets ignored.
 
-    A device reference gets only two outcomes, not four: a device
+    A device reference gets only two outcomes, not five: a device
     carries no live "state" of its own the way an entity does — state
     belongs to the entities a device groups, not to the device row
-    itself — so the restored/unavailable/unknown split (fundamentally
-    about whether, and what, a *state-machine* entry says) has nothing
-    to apply to for a device. A device_id is either in
+    itself — so the restored/disabled/unavailable/unknown split
+    (fundamentally about whether, and what, a *state-machine* entry
+    says) has nothing to apply to for a device. A device_id is either in
     config/device_registry/list or it is not; this is a deliberate scope
     decision, not an oversight.
 
@@ -200,6 +225,18 @@ def _classify(ref: dict, states: dict, entity_registry: dict, device_registry: d
     severity ("info") with a detail text that says only what is
     established (the state is unknown) rather than asserting a cause it
     has not established.
+
+    restored and disabled are split the same way, for the same reason:
+    both describe a registered id with no current state, but the ENTITY
+    REGISTRY's own `disabled_by` field distinguishes a genuinely dead
+    integration (restored, error - fix it) from an entity a person, an
+    integration, or Home Assistant itself deliberately turned off
+    (disabled, warning - working as configured). This module already had
+    the registry row in hand for every "no state" reference; the earlier
+    version simply never read `disabled_by` from it, and reported both
+    cases as "restored" with a detail text that named the wrong cause for
+    a disabled entity. See this module's own docstring for the measured
+    count on the vanilla demo instance's own orphans.
     """
     if ref["kind"] == "device":
         if ref["id"] in device_registry:
@@ -241,12 +278,27 @@ def _classify(ref: dict, states: dict, entity_registry: dict, device_registry: d
         return None
 
     if ref["id"] in entity_registry:
-        return {**ref, "outcome": "restored", "severity": "error", "detail": (
-            f"{ref['id']} is in the entity registry but has no state at "
-            "all right now — its integration is not loaded (failed to "
-            "start, its config entry was removed, an add-on is "
-            "stopped). The id itself is correct; investigate the "
-            "integration, not this automation."
+        disabled_by = entity_registry[ref["id"]].get("disabled_by")
+        if disabled_by is not None:
+            return {**ref, "outcome": "disabled", "severity": "warning",
+                    "disabled_by": disabled_by, "detail": (
+                f"{ref['id']} is in the entity registry but has no state "
+                f"right now because it is DISABLED ({disabled_by!r} — "
+                "turned off by a person, an integration, or Home "
+                "Assistant itself), not because its integration failed "
+                "to load or its config entry was removed. The reference "
+                "itself is correct; the entity simply will not respond "
+                "while it stays disabled. Re-enable it if this "
+                "automation needs it to fire, or leave both as they are "
+                "if the entity being off is intentional."
+            )}
+        return {**ref, "outcome": "restored", "severity": "error",
+                "disabled_by": None, "detail": (
+            f"{ref['id']} is in the entity registry, is not disabled, "
+            "but has no state at all right now — its integration is not "
+            "loaded (failed to start, its config entry was removed, an "
+            "add-on is stopped). The id itself is correct; investigate "
+            "the integration, not this automation."
         )}
 
     if ref["source"] == "template":
@@ -309,6 +361,7 @@ def _validate_config(automation_id: str | None, entity_id: str, name: str, confi
             "refs_checked": len(refs),
             "dead_references": sum(1 for i in issues if i["outcome"] == "dead_reference"),
             "restored": sum(1 for i in issues if i["outcome"] == "restored"),
+            "disabled": sum(1 for i in issues if i["outcome"] == "disabled"),
             "unavailable": sum(1 for i in issues if i["outcome"] == "unavailable"),
             "unknown": sum(1 for i in issues if i["outcome"] == "unknown"),
             "fail_open_waits": len(waits),
@@ -325,14 +378,17 @@ def validate_automation(entity_id: str) -> dict:
     into a destructive action. See this module's own docstring for the
     full reasoning — in short: a reference can be dead_reference
     (does not exist anywhere — fix the automation), restored (exists in
-    the registry but has no state — its integration is not loaded, fix
-    THAT instead), unavailable (has a state, and it is currently
-    "unavailable" — always a real integration problem, not this
-    automation's) or unknown (has a state, and it is currently
-    "unknown" — often the ordinary resting state for a whole class of
-    entity, not necessarily a problem at all; see this module's own
-    docstring for why it is kept separate from unavailable rather than
-    folded in).
+    the registry, is NOT disabled, but has no state — its integration is
+    not loaded, fix THAT instead), disabled (exists in the registry and
+    has no state because it was DELIBERATELY turned off — working as
+    configured, not a fault; see this module's own docstring for why
+    this must not be reported as restored), unavailable (has a state,
+    and it is currently "unavailable" — always a real integration
+    problem, not this automation's) or unknown (has a state, and it is
+    currently "unknown" — often the ordinary resting state for a whole
+    class of entity, not necessarily a problem at all; see this module's
+    own docstring for why it is kept separate from unavailable rather
+    than folded in).
 
     The single most important thing this tool reports is a dead
     reference found INSIDE A TEMPLATE: in Home Assistant the state of an
@@ -364,8 +420,8 @@ def validate_automation(entity_id: str) -> dict:
     Returns, on success:
       {automation_id, entity_id, name, issues: [...],
        fail_open_waits: [...],
-       summary: {refs_checked, dead_references, restored, unavailable,
-                 unknown, fail_open_waits}}
+       summary: {refs_checked, dead_references, restored, disabled,
+                 unavailable, unknown, fail_open_waits}}
 
     `issues` and `fail_open_waits` are TWO SEPARATE LISTS, and `summary`
     counts both — deliberately kept apart rather than merged into one
@@ -387,15 +443,23 @@ def validate_automation(entity_id: str) -> dict:
     - id/kind/where/source: exactly as extract_refs() (tools/_refs.py)
       reported them — `where` is the dotted config path the reference
       was found at, `source` is "field" or "template".
-    - outcome: "dead_reference" | "restored" | "unavailable" | "unknown".
+    - outcome: "dead_reference" | "restored" | "disabled" | "unavailable" |
+      "unknown".
     - severity: "error" for dead_reference/restored (the automation is
-      currently wrong right now), "warning" for unavailable (a real
-      integration problem to keep an eye on), "info" for unknown (often
-      not a problem at all — see this module's own docstring).
+      currently wrong right now), "warning" for disabled/unavailable (a
+      real, worth-knowing situation — but "working as configured" for
+      disabled, not "broken", unlike unavailable), "info" for unknown
+      (often not a problem at all — see this module's own docstring).
     - detail: the sentence explaining what was found and what to do
       about it — see this module's own docstring for why the
       dead-reference-inside-a-template case spells out the mechanism,
       and why the unknown case deliberately does NOT.
+    - disabled_by: present only on "restored" and "disabled" issues (the
+      two outcomes for a registered id with no current state) — `None`
+      for "restored", or the same `disabled_by` value
+      `list_orphan_entities()` (below) reports for the same entity when
+      "disabled". Absent on dead_reference/unavailable/unknown, where it
+      does not apply.
 
     Each `fail_open_waits` entry is exactly find_fail_open_waits()'s
     (tools/_refs.py) own shape: {wait_where, timeout, action_where,
@@ -455,7 +519,7 @@ def validate_all_automations(only_issues: bool = True, limit: int = 0, offset: i
 
     Returns: {total, returned, offset, note?, results: [...],
     summary: {checked, with_issues, read_errors, dead_references,
-    restored, unavailable, unknown, fail_open_waits}}.
+    restored, disabled, unavailable, unknown, fail_open_waits}}.
 
     `total`/`returned`/`offset`/`note` describe `results` exactly the
     way every other paginated tool in this codebase does (see
@@ -558,6 +622,8 @@ def validate_all_automations(only_issues: bool = True, limit: int = 0, offset: i
             r["summary"]["dead_references"] for r in results if "summary" in r),
         "restored": sum(
             r["summary"]["restored"] for r in results if "summary" in r),
+        "disabled": sum(
+            r["summary"]["disabled"] for r in results if "summary" in r),
         "unavailable": sum(
             r["summary"]["unavailable"] for r in results if "summary" in r),
         "unknown": sum(
@@ -754,11 +820,13 @@ def list_orphan_entities() -> dict:
     entity_id stays in the registry, orphaned, indefinitely — Home
     Assistant does not garbage-collect a registry entry just because
     nothing currently reports a state for it. This is the exact same
-    population validate_automation()'s "restored" outcome draws a single
-    row from, when some automation happens to reference one; this tool
-    lists the whole population directly, with no automation involved at
-    all — the state an incident's own instance was left in for weeks, with
-    nothing surfacing it.
+    population validate_automation()'s "restored"/"disabled" outcomes each
+    draw a single row from, when some automation happens to reference
+    one — see that module's own docstring for why the two are kept
+    separate rather than reported as one; this tool lists the whole
+    population directly, with no automation involved at all — the state
+    an incident's own instance was left in for weeks, with nothing
+    surfacing it.
 
     A disabled entity (`disabled_by` is not null — turned off by a person,
     an integration, or Home Assistant itself) legitimately has no state:
