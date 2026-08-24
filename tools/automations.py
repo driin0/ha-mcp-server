@@ -23,9 +23,13 @@ from tools._base import (
 _PROTECTED_PATCH_ROOT_PATHS = {"id"}
 
 
-def _resolve_automation_id(entity_id: str, client: httpx.Client) -> str | None:
+def _resolve_automation_id(entity_id: str, client: httpx.Client) -> tuple[str | None, dict | None]:
     """Resolve the config id Home Assistant's automation config API is
-    keyed by, from entity_id's own registered state.
+    keyed by, from entity_id's own registered state - and hand back that
+    same state object, since a caller that also needs one of its other
+    attributes (get_automation()'s `mode`, for a blueprint automation -
+    see its own docstring) would otherwise have to read the identical URL
+    a second time.
 
     A UI-created automation carries a numeric timestamp config id,
     unrelated to its entity_id's own object_id, in the entity's `id`
@@ -35,16 +39,19 @@ def _resolve_automation_id(entity_id: str, client: httpx.Client) -> str | None:
     slug when the entity has no `id` attribute is correct for both
     origins.
 
-    Returns None when entity_id has no registered state at all - the
-    caller decides what that means (does not exist, or a config might
-    still be found by slug alone; see _fetch_config()).
+    Returns (config_id, state). Both None together mean entity_id has no
+    registered state at all - the caller decides what that means (does
+    not exist, or a config might still be found by slug alone; see
+    _fetch_config()).
     """
     r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
     if r.status_code == 404:
-        return None
+        return None, None
     r.raise_for_status()
-    numeric_id = r.json().get("attributes", {}).get("id")
-    return str(numeric_id) if numeric_id else entity_id.removeprefix("automation.")
+    state = r.json()
+    numeric_id = state.get("attributes", {}).get("id")
+    config_id = str(numeric_id) if numeric_id else entity_id.removeprefix("automation.")
+    return config_id, state
 
 
 def _fetch_config(automation_id: str, slug: str, client: httpx.Client) -> tuple[str | None, dict | None]:
@@ -73,11 +80,11 @@ def _fetch_config(automation_id: str, slug: str, client: httpx.Client) -> tuple[
     return None, None
 
 
-def _resolve_and_fetch(entity_id: str, slug: str) -> tuple[str, str | None, dict | None, dict | None]:
-    """Resolve entity_id's config id and fetch its stored config in one
-    guarded call - the two-step read get_automation(), update_automation()
-    and patch_automation() all start with, before they can do anything
-    else.
+def _resolve_and_fetch(entity_id: str, slug: str) -> tuple[str, str | None, dict | None, dict | None, dict | None]:
+    """Resolve entity_id's config id, read its state and fetch its stored
+    config in one guarded call - the two-step read get_automation(),
+    update_automation() and patch_automation() all start with, before
+    they can do anything else.
 
     Wraps _resolve_automation_id() and _fetch_config() so a transient
     failure while reading (a revoked token, a 500 from an overloaded
@@ -92,19 +99,23 @@ def _resolve_and_fetch(entity_id: str, slug: str) -> tuple[str, str | None, dict
     calls _fetch_config() at all - let that same class of failure raise
     uncaught instead.
 
-    Returns (automation_id, resolved_id, raw, error). `error` is non-None
-    only when the read itself failed outright - never for an ordinary "no
-    such automation", which is still `raw is None` with `error` None,
-    exactly as before this existed. When `error` is set, the other three
-    elements are meaningless; every caller returns `error` immediately
-    without reading them.
+    Returns (automation_id, resolved_id, raw, state, error). `error` is
+    non-None only when the read itself failed outright - never for an
+    ordinary "no such automation", which is still `raw is None` with
+    `error` None, exactly as before this existed. When `error` is set,
+    the other four elements are meaningless; every caller returns `error`
+    immediately without reading them. `state` is entity_id's own state
+    object (or None when it has none) - get_automation() reads its `mode`
+    attribute from this rather than performing a second GET of the
+    identical URL _resolve_automation_id() already read.
     """
     try:
         with httpx.Client() as client:
-            automation_id = _resolve_automation_id(entity_id, client) or slug
+            resolved_from_state, state = _resolve_automation_id(entity_id, client)
+            automation_id = resolved_from_state or slug
             resolved_id, raw = _fetch_config(automation_id, slug, client)
     except httpx.HTTPStatusError as exc:
-        return slug, None, None, error(
+        return slug, None, None, None, error(
             "config_read_failed",
             f"Could not read {entity_id!r}'s stored config - the read "
             f"itself failed ({exc.response.status_code}), which is not "
@@ -112,7 +123,7 @@ def _resolve_and_fetch(entity_id: str, slug: str) -> tuple[str, str | None, dict
             "changed.",
             entity_id=entity_id, status=exc.response.status_code,
         )
-    return automation_id, resolved_id, raw, None
+    return automation_id, resolved_id, raw, state, None
 
 
 def _set_and_verify_enabled(entity_id: str, enabled: bool, *,
@@ -500,7 +511,7 @@ def delete_automation(entity_id: str) -> dict:
     """
     try:
         with httpx.Client() as client:
-            automation_id = _resolve_automation_id(entity_id, client)
+            automation_id, _state = _resolve_automation_id(entity_id, client)
     except httpx.HTTPStatusError as exc:
         # Same class of bug create_automation()'s own pre-create collision
         # check already guards against on its own read (see
@@ -613,11 +624,30 @@ def get_automation(entity_id: str) -> dict:
     entity_id's own slug when there is no registered id or entity to read
     one from.
 
-    Returns: {automation_id, entity_id, name, mode, stored_format, config}.
+    Returns: {automation_id, entity_id, name, mode?, stored_format, config}.
     `stored_format` names what vocabulary the config actually had on disk
     ("legacy" or "modern") at the moment this call read it; `config` is
-    always normalised to the modern vocabulary regardless, so a caller
-    reads one consistent shape either way.
+    normalised to the modern vocabulary at the level the vocabulary
+    actually applies - root keys, and the direct trigger/action list
+    items - the same level update_automation()/patch_automation() write
+    at (see tools/_aliases.py's module docstring). A trigger or action
+    step nested deeper (inside `choose`, `if`/`then`/`else`, `repeat`,
+    `parallel`) is carried through exactly as stored, in whichever
+    vocabulary it was last saved in - `config` is not a promise that
+    every nested step is modern-spelled, only that the top-level lists
+    and their direct items are.
+
+    `mode` is read from the entity's own state attribute when it has one,
+    falling back to the config's own root `mode` key, and omitted
+    entirely when neither has it. This is deliberately NOT
+    `config.get("mode", "single")`: a blueprint automation's `mode` comes
+    from the blueprint, not a root key in its own config - measured live,
+    a blueprint whose own metadata says `mode: restart` (matching the
+    entity's `mode` attribute) had no root `mode` key in its stored
+    config at all, so defaulting to `"single"` there was not a fallback,
+    it was a wrong answer reported as fact - and an actionable one, since
+    a caller "correcting" it by writing `mode: single` to the config root
+    would genuinely change the automation's concurrency behaviour.
 
     update_automation() and patch_automation() send a config back in the
     vocabulary `stored_format` names here - but whether it stays that way
@@ -641,7 +671,7 @@ def get_automation(entity_id: str) -> dict:
     see _resolve_and_fetch().
     """
     slug = entity_id.removeprefix("automation.")
-    automation_id, resolved_id, raw, read_err = _resolve_and_fetch(entity_id, slug)
+    automation_id, resolved_id, raw, state, read_err = _resolve_and_fetch(entity_id, slug)
     if read_err:
         return read_err
 
@@ -655,14 +685,27 @@ def get_automation(entity_id: str) -> dict:
         )
 
     config, restore = to_modern(raw)
-    return {
+    # The entity's own `mode` attribute is the true value for a blueprint
+    # automation - its config has no root `mode` key at all, since mode
+    # comes from the blueprint (measured live: a blueprint whose metadata
+    # says mode: restart produced a stored config with no "mode" key
+    # anywhere, and an entity state attribute "mode": "restart"). Falling
+    # back to config.get("mode") covers a non-blueprint automation read
+    # before its entity has registered (raw exists via the slug fallback,
+    # state is None); the key is omitted entirely only when neither has
+    # an answer, rather than inventing "single" as if it were read.
+    mode = (state or {}).get("attributes", {}).get("mode", config.get("mode"))
+    result = {
         "automation_id": resolved_id,
         "entity_id": entity_id,
         "name": config.get("alias", ""),
-        "mode": config.get("mode", "single"),
+        "mode": mode,
         "stored_format": stored_format(restore),
         "config": config,
     }
+    if mode is None:
+        del result["mode"]
+    return result
 
 
 def _not_found_for_edit(entity_id: str, automation_id: str, slug: str,
@@ -792,7 +835,7 @@ def update_automation(
     was requested and could not be confirmed.
     """
     slug = entity_id.removeprefix("automation.")
-    automation_id, resolved_id, raw, read_err = _resolve_and_fetch(entity_id, slug)
+    automation_id, resolved_id, raw, _state, read_err = _resolve_and_fetch(entity_id, slug)
     if read_err:
         return read_err
 
@@ -961,7 +1004,7 @@ def patch_automation(
         )
 
     slug = entity_id.removeprefix("automation.")
-    automation_id, resolved_id, raw, read_err = _resolve_and_fetch(entity_id, slug)
+    automation_id, resolved_id, raw, _state, read_err = _resolve_and_fetch(entity_id, slug)
     if read_err:
         return read_err
 

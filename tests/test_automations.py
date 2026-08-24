@@ -53,6 +53,46 @@ def test_get_automation_config_comes_back_in_the_modern_vocabulary(fake_ha):
     assert config["actions"][1]["wait_for_trigger"][0]["platform"] == "state"
 
 
+def test_get_automation_reports_mode_from_the_entity_state_for_a_blueprint_automation(fake_ha):
+    """A blueprint automation's mode comes from the blueprint, not a root
+    key in its own stored config - measured live: a blueprint automation
+    whose config was only {"id", "alias", "use_blueprint"} (no "mode" key
+    anywhere) had its entity's own state attribute "mode": "restart",
+    matching the blueprint's own mode: restart. config.get("mode",
+    "single") would have invented "single" here - a wrong, actionable
+    answer a caller could "correct" by writing a root mode key that
+    genuinely changes the automation's concurrency."""
+    from tools.automations import get_automation
+
+    fake_ha.states.append({
+        "entity_id": "automation.blueprint_probe", "state": "on",
+        "attributes": {"id": "blueprint_probe", "mode": "restart"},
+    })
+    fake_ha.automation_configs["blueprint_probe"] = {
+        "alias": "Blueprint probe",
+        "use_blueprint": {"path": "homeassistant/motion_light.yaml", "input": {}},
+    }
+
+    result = get_automation("automation.blueprint_probe")
+
+    assert result["mode"] == "restart"
+    assert "mode" not in result["config"]
+
+
+def test_get_automation_omits_mode_when_neither_state_nor_config_has_it(fake_ha):
+    """Falling back to config.get("mode") (rather than defaulting
+    "single") still leaves a gap: an automation resolved only by slug,
+    with no registered state at all (state is None) and no root mode key
+    of its own. Reported as absent, never invented."""
+    from tools.automations import get_automation
+
+    fake_ha.automation_configs["no_mode_no_state"] = {"alias": "No mode"}
+
+    result = get_automation("automation.no_mode_no_state")
+
+    assert "mode" not in result
+
+
 def test_get_automation_reports_the_stored_format_as_legacy(fake_ha):
     from tools.automations import get_automation
 
