@@ -589,6 +589,52 @@ def test_a_destructive_action_in_a_different_branch_is_not_reported():
     assert find_fail_open_waits(config) == []
 
 
+def test_a_destructive_action_downstream_of_the_wait_inside_an_if_then_is_reported():
+    """The incident shape as Home Assistant's own UI editor writes it: the
+    wait sits at the top level, and the destructive action is not a
+    sibling step but one level of nesting BELOW it, inside an if/then
+    that comes after the wait. This is reachable from the wait's own
+    timeout (whichever way the `if` resolves, the branch taken is still on
+    the path the timeout opened up) and must be reported - unlike the
+    sibling-branch case in
+    test_a_destructive_action_in_a_different_branch_is_not_reported above,
+    which is a genuinely different shape."""
+    config = {"action": [
+        {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
+        {"if": [{"condition": "state", "entity_id": "input_boolean.x", "state": "on"}],
+         "then": [
+             {"service": "switch.turn_off", "target": {"entity_id": "switch.nas_power"}},
+         ]},
+    ]}
+
+    waits = find_fail_open_waits(config)
+
+    assert len(waits) == 1
+    assert waits[0]["wait_where"] == "action.0"
+    assert waits[0]["action_where"] == "action.1.then.0"
+    assert waits[0]["service"] == "switch.turn_off"
+
+
+def test_a_destructive_action_downstream_of_the_wait_inside_choose_sequence_is_reported():
+    """Same shape, via choose/sequence instead of if/then."""
+    config = {"action": [
+        {"wait_for_trigger": [{"platform": "state"}], "timeout": "00:00:30"},
+        {"choose": [
+            {"conditions": [{"condition": "state", "entity_id": "input_boolean.x", "state": "on"}],
+             "sequence": [
+                 {"service": "switch.turn_off", "target": {"entity_id": "switch.nas_power"}},
+             ]},
+        ]},
+    ]}
+
+    waits = find_fail_open_waits(config)
+
+    assert len(waits) == 1
+    assert waits[0]["wait_where"] == "action.0"
+    assert waits[0]["action_where"] == "action.1.choose.0.sequence.0"
+    assert waits[0]["service"] == "switch.turn_off"
+
+
 def test_a_later_wait_for_trigger_that_fails_closed_re_gates_what_follows():
     """A second, safely-blocking wait between the fail-open one and the
     destructive action means the destructive action is no longer exposed

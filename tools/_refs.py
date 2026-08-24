@@ -281,27 +281,54 @@ def _nested_sequences(step: dict, step_path: str):
                 yield branch["sequence"], f"{step_path}.parallel.{i}.sequence"
 
 
-def _scan_sequence(steps, path: str, results: list) -> None:
+def _scan_sequence(steps, path: str, results: list, pending: dict | None = None) -> None:
     """Walk one flat list of steps looking for a fail-open wait_for_trigger
-    followed - later in this exact list, not in some nested branch it may
-    never reach - by a destructive action.
+    followed - later in this exact list, OR inside any sequence nested
+    inside a LATER step of this list (an if/then, a choose branch's own
+    sequence, ...) - by a destructive action. A destructive action nested
+    inside a branch that sits BEFORE the wait, or inside a sibling branch
+    the wait itself is nested in, is a different case - see
+    find_fail_open_waits()'s own docstring for why the two are not the
+    same and must not be conflated.
 
     `pending` names the closest fail-open wait behind the step currently
-    being looked at, or None. It is set on every wait_for_trigger step,
-    fail-open or not: reaching *any* wait_for_trigger re-gates whatever
-    follows it, because getting past it now requires either that wait's
-    own trigger to fire or (only if it fails open) its own timeout - a
-    later, safely-blocking wait is not exposed by an earlier fail-open
-    one, so a fail-open wait is only ever pending until the next
-    wait_for_trigger, whichever kind it is (see this module's own tests
-    for why). It is *not* cleared on the first destructive action found
-    after it: every destructive step reachable before the next
-    wait_for_trigger is equally exposed by that same open guard, not just
-    the first one.
+    being looked at, or None. A fresh top-level scan (the call
+    find_fail_open_waits() makes) starts with pending=None; every
+    recursive call this function makes into a nested sequence is started
+    with the CURRENT value of `pending` at the step being recursed from -
+    never reinitialised to None - because a step nested inside a LATER
+    step in this list (the `then` branch of an `if`, one `choose`
+    branch's own `sequence`, ...) is still reachable through that same
+    fail-open wait's own timeout: whichever inner branch execution
+    happens to take, it is still on the path the wait's timeout opened up.
+    Reinitialising `pending` to None at the top of every call - the bug
+    this module shipped with - is exactly what let a wait followed by an
+    `if:`/`then:` or a `choose:`/`sequence:` slip past this check
+    silently: the destructive action sat one level of nesting below the
+    wait, fully reachable from it, and a fresh, wait-blind `pending`
+    inside the recursive call never saw it.
+
+    It is set on every wait_for_trigger step, fail-open or not: reaching
+    *any* wait_for_trigger re-gates whatever follows it, because getting
+    past it now requires either that wait's own trigger to fire or (only
+    if it fails open) its own timeout - a later, safely-blocking wait is
+    not exposed by an earlier fail-open one, so a fail-open wait is only
+    ever pending until the next wait_for_trigger, whichever kind it is
+    (see this module's own tests for why). It is *not* cleared on the
+    first destructive action found after it: every destructive step
+    reachable before the next wait_for_trigger is equally exposed by that
+    same open guard, not just the first one.
+
+    A nested call's own local changes to `pending` (its own
+    wait_for_trigger steps, fail-open or not) are never propagated back
+    out to the caller: once a recursive call returns, the scan that made
+    it continues with whatever `pending` it already had, because a
+    branch's own inner waits do not change whether the OUTER wait's
+    timeout can still reach a step later in the OUTER list - it already
+    could, before that branch was ever entered.
     """
     if not isinstance(steps, list):
         return
-    pending = None
     for i, step in enumerate(steps):
         step_path = f"{path}.{i}" if path else str(i)
         if not isinstance(step, dict):
@@ -321,7 +348,7 @@ def _scan_sequence(steps, path: str, results: list) -> None:
                 })
 
         for nested_steps, nested_path in _nested_sequences(step, step_path):
-            _scan_sequence(nested_steps, nested_path, results)
+            _scan_sequence(nested_steps, nested_path, results, pending)
 
 
 def find_fail_open_waits(config: dict) -> list[dict]:
@@ -339,11 +366,34 @@ def find_fail_open_waits(config: dict) -> list[dict]:
 
     Recurses into every nested sequence of steps Home Assistant's own
     schema defines - if/then, if/else, choose's own branches and its
-    default, repeat's own sequence, and parallel's own branches - but
-    "follows it in the same sequence" is read literally: a destructive
-    action living in a *different* branch than the wait (a sibling
-    choose branch, for instance) is never reachable from that wait at
-    all, and is not reported against it.
+    default, repeat's own sequence, and parallel's own branches - and a
+    fail-open wait's `pending` state (see _scan_sequence()'s own
+    docstring) is threaded into every one of those nested sequences that
+    sits AFTER the wait in the same flat list, not reset to None at each
+    level of nesting. Concretely, two shapes that sound alike are not the
+    same:
+
+    - REACHABLE, and reported: a destructive action nested inside a LATER
+      step of the same list the wait sits in - the `then` branch of an
+      `if` that comes after the wait, one `choose` branch's own
+      `sequence` - because whichever inner branch execution takes, it is
+      still on the path the wait's own timeout opened up. `wait, then an
+      if:/then: containing switch.turn_off` and `wait, then a
+      choose:/sequence: containing switch.turn_off` are both this shape,
+      and both are reported - this is the exact shape Home Assistant's own
+      UI editor produces for "wait, then act", and silently missing it
+      was the mechanism this check most needed to catch.
+    - NOT reachable, and not reported: a destructive action living in a
+      *different branch than the wait itself* - a step in a sibling
+      `choose` branch, when the wait is nested inside a *different*
+      branch of that same `choose` - because execution that takes the
+      sibling branch never runs the branch holding the wait at all, and
+      so can never reach that destructive action through this wait's
+      timeout either.
+
+    The first shape being unreachable was this module's own bug (fixed by
+    threading `pending` through the recursive calls - see
+    _scan_sequence()); the second is correct by construction, not a gap.
 
     Returns a list of:
       {"wait_where": <path to the wait_for_trigger step>,
