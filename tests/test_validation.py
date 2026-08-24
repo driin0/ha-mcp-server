@@ -642,3 +642,61 @@ def test_list_orphan_entities_reports_disabled_by_for_a_deliberately_disabled_en
 
     entry = next(o for o in result["orphans"] if o["entity_id"] == "sensor.disabled_by_user")
     assert entry["disabled_by"] == "user"
+
+
+def test_list_orphan_entities_reports_an_error_instead_of_raising_on_401(fake_ha):
+    """The states read used to be a bare r.raise_for_status(), which raised
+    httpx.HTTPStatusError straight through this function for an expired or
+    revoked token instead of the error() envelope every other failure in
+    this module already returns. A 401 is a normal (if unwelcome) HTTP
+    response - rest_error() reports it as "home_assistant_error", the same
+    code every other REST rejection in this codebase gets; "connection_failed"
+    (below) is reserved for the request never getting a response at all."""
+    from tools.validation import list_orphan_entities
+
+    fake_ha.fail_rest("/api/states", status=401, message="Unauthorized")
+
+    result = list_orphan_entities()
+
+    assert result["error"] == "home_assistant_error"
+    assert result["status"] == 401
+
+
+def test_list_orphan_entities_reports_an_error_instead_of_raising_when_unreachable(fake_ha):
+    from tools.validation import list_orphan_entities
+
+    fake_ha.raise_rest("/api/states")  # defaults to httpx.ConnectError
+
+    result = list_orphan_entities()
+
+    assert result["error"] == "connection_failed"
+
+
+def test_live_snapshot_reports_an_error_instead_of_raising_on_401(fake_ha):
+    """Same fix, isolated: _live_snapshot() is shared by validate_automation()
+    and validate_all_automations(), both of which reach Home Assistant at
+    least once before this call (get_automation(), list_automations()) over
+    the identical /api/states endpoint - so exercising this through either
+    public tool would test THEIR already-separate error handling, not this
+    function's own. Testing _live_snapshot() directly isolates the fix this
+    review actually asked for (tools/validation.py:140)."""
+    from tools.validation import _live_snapshot
+
+    fake_ha.fail_rest("/api/states", status=401, message="Unauthorized")
+
+    states, entity_registry, device_registry, err = _live_snapshot()
+
+    assert err["error"] == "home_assistant_error"
+    assert err["status"] == 401
+    assert states == {} and entity_registry == {} and device_registry == {}
+
+
+def test_live_snapshot_reports_an_error_instead_of_raising_when_unreachable(fake_ha):
+    from tools.validation import _live_snapshot
+
+    fake_ha.raise_rest("/api/states")  # defaults to httpx.ConnectError
+
+    states, entity_registry, device_registry, err = _live_snapshot()
+
+    assert err["error"] == "connection_failed"
+    assert states == {} and entity_registry == {} and device_registry == {}

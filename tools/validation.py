@@ -146,7 +146,7 @@ happens to reference one.
 import httpx
 
 from tools._aliases import to_modern
-from tools._base import HA_URL, HEADERS, _ws_multi, envelope, error, mcp, ws_error
+from tools._base import HA_URL, HEADERS, _ws_multi, envelope, error, mcp, rest_error, ws_error
 from tools._refs import extract_refs, find_fail_open_waits
 from tools.automations import _fetch_config, get_automation, list_automations
 from tools.scripts import get_script, list_scripts
@@ -175,6 +175,17 @@ def _live_snapshot() -> tuple[dict, dict, dict, dict | None]:
                        failed outright, else None — a caller returns this
                        immediately without looking at the other three
                        values, the same contract ws_error() itself uses.
+
+    The REST read below used to call a bare r.raise_for_status(), which
+    raises httpx.HTTPStatusError straight through this function and every
+    caller above it (validate_automation(), validate_all_automations(),
+    scripts/lint_automations.py) uncaught - an expired/revoked HA_TOKEN
+    surfaced as a raw traceback rather than the error() envelope every
+    other failure in this function already returns. rest_error() (see
+    tools/_base.py) fixes the status-code half; a connection failure
+    (instance unreachable) that never gets a response at all is caught
+    separately, since rest_error() has nothing to inspect when the
+    request itself raised.
     """
     ws_results = _ws_multi([
         {"type": "config/entity_registry/list"},
@@ -187,9 +198,16 @@ def _live_snapshot() -> tuple[dict, dict, dict, dict | None]:
     entity_registry = {e["entity_id"]: e for e in ws_results[0]["result"]}
     device_registry = {d["id"]: d for d in ws_results[1]["result"]}
 
-    with httpx.Client() as client:
-        r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
-    r.raise_for_status()
+    try:
+        with httpx.Client() as client:
+            r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
+    except httpx.HTTPError as exc:
+        return {}, {}, {}, error(
+            "connection_failed",
+            f"Could not reach {HA_URL} to read /api/states: {exc}",
+        )
+    if err := rest_error(r):
+        return {}, {}, {}, err
     states = {s["entity_id"]: s for s in r.json()}
 
     return states, entity_registry, device_registry, None
@@ -841,18 +859,26 @@ def list_orphan_entities() -> dict:
     the first thing to check when deciding why it has no state (not
     loaded, its config entry removed, an add-on backing it stopped).
 
-    Returns an error() envelope when the entity registry itself could not
-    be read (a WebSocket failure) — never for finding zero orphans, which
-    is simply `orphans: []`.
+    Returns an error() envelope when the entity registry (a WebSocket
+    failure) or the live states read (a REST failure — an expired/revoked
+    token, or the instance being unreachable) could not be read — never
+    for finding zero orphans, which is simply `orphans: []`.
     """
     ws_results = _ws_multi([{"type": "config/entity_registry/list"}])
     if err := ws_error(ws_results[0]):
         return err
     registry = ws_results[0]["result"]
 
-    with httpx.Client() as client:
-        r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
-    r.raise_for_status()
+    try:
+        with httpx.Client() as client:
+            r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
+    except httpx.HTTPError as exc:
+        return error(
+            "connection_failed",
+            f"Could not reach {HA_URL} to read /api/states: {exc}",
+        )
+    if err := rest_error(r):
+        return err
     live_ids = {s["entity_id"] for s in r.json()}
 
     orphans = sorted(

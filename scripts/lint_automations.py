@@ -78,6 +78,8 @@ import argparse
 import sys
 from pathlib import Path
 
+import httpx
+
 # Running this file directly (`python3 scripts/lint_automations.py`) puts
 # scripts/ itself on sys.path[0], not the repository root - "import
 # tools.validation" would fail with ModuleNotFoundError without this, the
@@ -190,7 +192,43 @@ def main(argv: list[str] | None = None) -> int:
     if validate_all_automations is None:
         return 2
 
-    result = validate_all_automations(only_issues=True, limit=args.limit)
+    # validate_all_automations() itself now converts an HTTP-status
+    # failure and a REST connection failure in its own live-snapshot read
+    # (tools/validation.py's _live_snapshot()) into an error() envelope
+    # rather than raising - but list_automations() (tools/automations.py),
+    # which this call reaches FIRST, still has its own uncaught
+    # r.raise_for_status(), and a WebSocket connection failure
+    # (tools/_base.py's _ws_commands(), reached transitively through
+    # EITHER call) raises a raw OSError that nothing in that stack catches
+    # at all - fixing every site an HTTP or WebSocket call could fail
+    # across ~100 tools sharing that plumbing is a different, far larger
+    # change than this review's scope. This except is the CLI's own
+    # backstop: whichever module actually raises, an expired/revoked
+    # token or an unreachable instance must exit 2 with a clear message,
+    # not 1 with a raw traceback that reads exactly like "the sweep ran
+    # and found a real problem" - see this module's own docstring for why
+    # that exact confusion is what this script's exit code promises never
+    # to cause.
+    try:
+        result = validate_all_automations(only_issues=True, limit=args.limit)
+    except httpx.HTTPStatusError as exc:
+        print(
+            f"lint_automations: could not run the sweep - HTTP "
+            f"{exc.response.status_code} from {exc.request.url} - check "
+            "HA_TOKEN is still valid (an expired or revoked token is an "
+            "infrastructure failure, not a broken automation).",
+            file=sys.stderr,
+        )
+        return 2
+    except (httpx.RequestError, OSError) as exc:
+        print(
+            f"lint_automations: could not run the sweep - could not "
+            f"reach the Home Assistant instance ({exc}) - check HA_URL "
+            "and that the instance is up (an unreachable instance is an "
+            "infrastructure failure, not a broken automation).",
+            file=sys.stderr,
+        )
+        return 2
     if "error" in result:
         print(
             f"lint_automations: could not run the sweep - "
