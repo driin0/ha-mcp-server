@@ -192,12 +192,26 @@ def _set_and_verify_enabled(entity_id: str, enabled: bool, *,
     surrounding context do not have to agree on one error shape.
     """
     if not wait_for_entity(entity_id):
-        return error(
-            "automation_not_registered",
+        # "it may still be armed" (not "in its previous state") when a
+        # disable was requested: Home Assistant arms every new automation
+        # by default, and an existing one that failed to register here has
+        # given no evidence its prior armed state changed either - "armed"
+        # is the actionable, safety-relevant assumption either way. For a
+        # create (create_automation() has no "previous state" to speak of
+        # at all) that wording would be nonsensical anyway; for an enable
+        # request there is no equivalent safety-relevant default to name,
+        # so this says plainly that the state is unknown rather than
+        # guessing in either direction.
+        detail = (
             f"{entity_id} has no registered state, so its enabled state "
-            "could not be changed or confirmed - it may still be in its "
-            "previous state. Check manually before relying on it.",
+            "could not be changed or confirmed - " + (
+                "it may still be armed (Home Assistant arms a new "
+                "automation by default, and nothing here confirms an "
+                "existing one's prior state changed)." if not enabled else
+                "its actual state is unknown."
+            ) + " Check manually before relying on it."
         )
+        return error("automation_not_registered", detail)
     if not enabled or arm_when_enabling:
         with httpx.Client() as client:
             client.post(
@@ -1030,7 +1044,11 @@ def patch_automation(
         old = get_path(config, path)
         set_path(config, path, value)
     except PathError as exc:
-        return error("bad_path", str(exc), entity_id=entity_id, path=path)
+        # PathError is a KeyError subclass, and KeyError.__str__() reprs
+        # a single-arg message - wrapping it in an extra pair of quotes
+        # that were never part of the message PathError actually raised
+        # with. exc.args[0] is the message itself, unwrapped.
+        return error("bad_path", exc.args[0], entity_id=entity_id, path=path)
 
     payload = to_stored(config, restore)
     with httpx.Client() as client:

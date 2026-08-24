@@ -595,8 +595,11 @@ def wait_for_entity(entity_id: str, *, retries: int = 4, delay: float = 1.0) -> 
     created back-to-back and immediately disabled: 9 of 10 stayed armed,
     because the disable landed on an entity_id that did not exist yet and
     was accepted as a 200 [] no-op. This is the "wait it out" loop that
-    race needs, before the disabling call is sent at all - see
-    create_automation()'s enabled=False path, its only caller today.
+    race needs, before any toggle is sent at all - see
+    tools/automations.py's _set_and_verify_enabled(), the shared helper
+    create_automation() and update_automation() both call before changing
+    `enabled` (their only two callers today, not create_automation()'s
+    enabled=False path alone as when this was first written).
 
     Returns True once a non-404 read is seen (the entity may still not be
     in its final state - this only confirms it exists), False if every

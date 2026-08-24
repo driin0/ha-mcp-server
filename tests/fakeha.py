@@ -194,6 +194,22 @@ class FakeHA:
                     is_new = item_id not in store
                     existing = next(
                         (s for s in self.states if s["entity_id"] == entity_id), None)
+                    # Stored verbatim, whatever vocabulary `body` is
+                    # actually in - deliberately NOT a model of the real
+                    # config-write endpoint's own rename-on-save (root
+                    # keys and an action step's service: get renamed to
+                    # the modern spelling on every save, regardless of
+                    # what was posted; only a trigger step's platform:
+                    # survives as sent - see tools/_aliases.py's module
+                    # docstring for the live measurement this describes).
+                    # No test in this suite exercises that renaming; it
+                    # was verified separately against a live instance, and
+                    # get_automation()/update_automation()/
+                    # patch_automation()'s own docstrings say so - a fake
+                    # that silently re-normalised on every write would
+                    # make `stored_format` untestable as "what was
+                    # actually read", since every POST would immediately
+                    # make the next GET look modern again.
                     store[item_id] = body
                     # A genuinely new automation registers armed
                     # (default_state) - measured live for creation. But

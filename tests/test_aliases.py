@@ -108,6 +108,31 @@ def test_round_trip_is_exact_for_a_fully_legacy_config():
     assert restored == LEGACY_CONFIG
 
 
+def test_round_trip_reinserts_a_renamed_key_at_the_end_not_its_original_position():
+    """`==` on dicts ignores key order, so the test above cannot see this:
+    to_stored() reverses a rename by deleting the modern key and adding
+    the legacy one back (`parent[legacy_key] = value`), which - like any
+    plain dict assignment for a key that is not already present - always
+    inserts at the END, not back where the key originally was. Idempotent
+    and semantically null for Home Assistant (a dict's key order carries
+    no meaning to the automation engine), but visible to anyone keeping
+    automations.yaml in git: a round-tripped legacy automation reorders
+    every renamed key on its first edit, even one that changes nothing
+    else. Pinned here explicitly so a future change to this reordering
+    behaviour - in either direction - is a deliberate, visible decision,
+    not a silent side effect only a key-order diff would catch."""
+    normalised, restore = to_modern(LEGACY_CONFIG)
+
+    restored = to_stored(normalised, restore)
+
+    assert list(LEGACY_CONFIG.keys()) == ["alias", "trigger", "condition", "action", "mode"]
+    assert list(restored.keys()) == ["alias", "mode", "trigger", "condition", "action"]
+    assert list(LEGACY_CONFIG["trigger"][0].keys()) == ["platform", "entity_id", "to"]
+    assert list(restored["trigger"][0].keys()) == ["entity_id", "to", "platform"]
+    assert list(LEGACY_CONFIG["action"][0].keys()) == ["service", "target"]
+    assert list(restored["action"][0].keys()) == ["target", "service"]
+
+
 def test_round_trip_is_exact_for_a_fully_modern_config():
     normalised, restore = to_modern(MODERN_CONFIG)
 
