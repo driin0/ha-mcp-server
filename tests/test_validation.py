@@ -141,6 +141,7 @@ def test_the_incidents_summary_counts_match(fake_ha):
     assert result["summary"]["dead_references"] == 1
     assert result["summary"]["restored"] == 0
     assert result["summary"]["unavailable"] == 0
+    assert result["summary"]["unknown"] == 0
     assert result["summary"]["fail_open_waits"] == 1
     assert result["automation_id"] == "9001"
     assert result["name"] == "NAS shutdown guard"
@@ -210,7 +211,13 @@ def test_a_reference_with_state_unavailable_is_unavailable(fake_ha):
     assert issue["severity"] == "warning"
 
 
-def test_a_reference_with_state_unknown_is_also_unavailable(fake_ha):
+def test_a_reference_with_state_unknown_is_its_own_outcome_not_unavailable(fake_ha):
+    """unknown is common as an entity's normal resting state (a button or
+    event entity before it is first triggered, a scene, ...) - unlike
+    unavailable, which never happens as a resting state. Conflating them
+    under one "unavailable" outcome would make a diagnosis ("its own
+    integration is reporting it as not answering right now") about an
+    entity that has simply never had an event."""
     from tools.validation import validate_automation
 
     fake_ha.states.append({"entity_id": "sensor.confused", "state": "unknown", "attributes": {}})
@@ -218,7 +225,16 @@ def test_a_reference_with_state_unknown_is_also_unavailable(fake_ha):
 
     result = validate_automation("automation.probe4")
 
-    assert result["issues"][0]["outcome"] == "unavailable"
+    assert len(result["issues"]) == 1
+    issue = result["issues"][0]
+    assert issue["outcome"] == "unknown"
+    assert issue["severity"] == "info"
+    # No false diagnosis: unlike the unavailable case, this must not claim
+    # the integration is "not answering right now" - that is not
+    # established from state "unknown" alone.
+    assert "not answering right now" not in issue["detail"]
+    assert result["summary"]["unavailable"] == 0
+    assert result["summary"]["unknown"] == 1
 
 
 def test_a_live_normal_reference_is_not_reported(fake_ha):
@@ -233,7 +249,7 @@ def test_a_live_normal_reference_is_not_reported(fake_ha):
     assert result["fail_open_waits"] == []
     assert result["summary"] == {
         "refs_checked": 1, "dead_references": 0, "restored": 0,
-        "unavailable": 0, "fail_open_waits": 0,
+        "unavailable": 0, "unknown": 0, "fail_open_waits": 0,
     }
 
 

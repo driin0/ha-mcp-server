@@ -5,8 +5,9 @@ tools/_refs.py answers "what does this automation's config NAME" — purely,
 with no network at all. This module answers the next question, the one
 that needs a live instance to answer: "does each of those names still
 point at something real, and if so, is that something currently
-answering?" Three outcomes, kept deliberately distinct because the right
-response to each is opposite one another:
+answering?" Four outcomes, kept deliberately distinct because the right
+response to each is different (and "unavailable"/"unknown" are less alike
+than they look — see below):
 
   dead_reference (error)   the id is absent from BOTH the entity/device
     registry AND the state machine. It does not exist here at all — a
@@ -15,10 +16,36 @@ response to each is opposite one another:
     state. The id is correct; its integration is not loaded (failed to
     start, its config entry was removed, an add-on is stopped). Fix the
     integration, not the automation.
-  unavailable (warning)    the id has a state, but that state is
-    "unavailable" or "unknown" — present, but not currently answering
-    (an offline device, a degraded connection). Investigate the
+  unavailable (warning)    the id has a state, and that state is
+    currently "unavailable" — present, but not currently answering (an
+    offline device, a degraded connection, mid-reconnect). This is
+    ALWAYS a real signal: nothing in Home Assistant reports
+    "unavailable" as an entity's normal resting state. Investigate the
     integration, not the automation.
+  unknown (info)            the id has a state, and that state is
+    currently "unknown" — present, and, unlike "unavailable", this is
+    the ordinary resting state for whole classes of entities until they
+    have something to report (a button or event entity before it is
+    first triggered, a scene, several helper and voice-pipeline
+    entities), not necessarily a sign of anything wrong. See
+    _classify()'s own docstring for why this is reported as its own,
+    lower-confidence outcome rather than folded into "unavailable".
+
+## Why "unknown" is not "unavailable"
+
+Measured against a vanilla, freshly-started demo Home Assistant instance
+with nothing wrong at all: 9 of 123 entities sat in state "unknown" as
+their normal resting state (`person.admin`, `conversation.home_assistant`,
+`notify.notifier`, `tts.*`, `stt.*`, `event.*`, `sensor.backup_*`) and
+ZERO were genuinely `unavailable`. Reporting both under one "unavailable"
+outcome, with detail text claiming "its own integration is reporting it
+as not answering right now", would have made every single finding this
+instance could produce a false alarm — a confident diagnosis stated about
+an entity that has simply never had an event to report. `unknown` is
+reported at a lower severity ("info", not "warning") and its detail text
+says only what is actually established: the state is unknown, which is
+often normal, and this reference is not on its own evidence of anything
+wrong.
 
 ## Why the dead-reference detail text is the most important string this
 ## module returns
@@ -151,13 +178,28 @@ def _classify(ref: dict, states: dict, entity_registry: dict, device_registry: d
     references that are simply fine. Crying wolf on a correct automation
     is how a validator gets ignored.
 
-    A device reference gets only two outcomes, not three: a device
+    A device reference gets only two outcomes, not four: a device
     carries no live "state" of its own the way an entity does — state
     belongs to the entities a device groups, not to the device row
-    itself — so the restored/unavailable split (fundamentally about
-    whether a *state-machine* entry exists) has nothing to apply to for
-    a device. A device_id is either in config/device_registry/list or it
-    is not; this is a deliberate scope decision, not an oversight.
+    itself — so the restored/unavailable/unknown split (fundamentally
+    about whether, and what, a *state-machine* entry says) has nothing
+    to apply to for a device. A device_id is either in
+    config/device_registry/list or it is not; this is a deliberate scope
+    decision, not an oversight.
+
+    unavailable and unknown are split into two different outcomes,
+    deliberately, rather than one "not answering" bucket - see this
+    module's own docstring for why: "unavailable" never happens as an
+    entity's normal resting state, so it is reported as a warning with a
+    diagnosis (an offline device, a degraded connection). "unknown" is
+    the ordinary resting state for whole classes of entities (buttons
+    and event entities before their first trigger, scenes, several
+    helper and voice-pipeline entities) as well as a possible sign of an
+    integration that has not yet reported - this module cannot tell
+    those apart from the state alone, so it is reported at a lower
+    severity ("info") with a detail text that says only what is
+    established (the state is unknown) rather than asserting a cause it
+    has not established.
     """
     if ref["kind"] == "device":
         if ref["id"] in device_registry:
@@ -170,16 +212,33 @@ def _classify(ref: dict, states: dict, entity_registry: dict, device_registry: d
 
     state = states.get(ref["id"])
     if state is not None:
-        if state["state"] not in ("unavailable", "unknown"):
-            return None
-        return {**ref, "outcome": "unavailable", "severity": "warning", "detail": (
-            f"{ref['id']} is registered and has a state, but that state "
-            f"is currently {state['state']!r} — its own integration is "
-            "reporting it as not answering right now (an offline device, "
-            "a degraded connection, mid-reconnect). The reference itself "
-            "is correct; investigate the integration, not this "
-            "automation."
-        )}
+        if state["state"] == "unavailable":
+            return {**ref, "outcome": "unavailable", "severity": "warning", "detail": (
+                f"{ref['id']} is registered and has a state, but that "
+                "state is currently \"unavailable\" — its own integration "
+                "is reporting it as not answering right now (an offline "
+                "device, a degraded connection, mid-reconnect). Nothing "
+                "in Home Assistant reports \"unavailable\" as an entity's "
+                "normal resting state, so this is a real signal. The "
+                "reference itself is correct; investigate the "
+                "integration, not this automation."
+            )}
+        if state["state"] == "unknown":
+            return {**ref, "outcome": "unknown", "severity": "info", "detail": (
+                f"{ref['id']} is registered and has a state, but that "
+                "state is currently \"unknown\". Unlike \"unavailable\", "
+                "this is the ordinary resting state for whole classes of "
+                "entities until they have something to report - a button "
+                "or event entity before it is first triggered, a scene, "
+                "several helper and voice-pipeline entities (person, "
+                "conversation, notify, tts, stt) - so it is not, on its "
+                "own, evidence that anything is wrong. It can also mean "
+                "an integration has not yet reported this entity's real "
+                "value; this module cannot distinguish the two from the "
+                "state alone, so it reports only what is established, "
+                "not a diagnosis. The reference itself is correct."
+            )}
+        return None
 
     if ref["id"] in entity_registry:
         return {**ref, "outcome": "restored", "severity": "error", "detail": (
@@ -251,6 +310,7 @@ def _validate_config(automation_id: str | None, entity_id: str, name: str, confi
             "dead_references": sum(1 for i in issues if i["outcome"] == "dead_reference"),
             "restored": sum(1 for i in issues if i["outcome"] == "restored"),
             "unavailable": sum(1 for i in issues if i["outcome"] == "unavailable"),
+            "unknown": sum(1 for i in issues if i["outcome"] == "unknown"),
             "fail_open_waits": len(waits),
         },
     }
@@ -266,8 +326,13 @@ def validate_automation(entity_id: str) -> dict:
     full reasoning — in short: a reference can be dead_reference
     (does not exist anywhere — fix the automation), restored (exists in
     the registry but has no state — its integration is not loaded, fix
-    THAT instead) or unavailable (has a state, but it is "unavailable"/
-    "unknown" — also an integration problem, not this automation's).
+    THAT instead), unavailable (has a state, and it is currently
+    "unavailable" — always a real integration problem, not this
+    automation's) or unknown (has a state, and it is currently
+    "unknown" — often the ordinary resting state for a whole class of
+    entity, not necessarily a problem at all; see this module's own
+    docstring for why it is kept separate from unavailable rather than
+    folded in).
 
     The single most important thing this tool reports is a dead
     reference found INSIDE A TEMPLATE: in Home Assistant the state of an
@@ -300,7 +365,7 @@ def validate_automation(entity_id: str) -> dict:
       {automation_id, entity_id, name, issues: [...],
        fail_open_waits: [...],
        summary: {refs_checked, dead_references, restored, unavailable,
-                 fail_open_waits}}
+                 unknown, fail_open_waits}}
 
     `issues` and `fail_open_waits` are TWO SEPARATE LISTS, and `summary`
     counts both — deliberately kept apart rather than merged into one
@@ -322,13 +387,15 @@ def validate_automation(entity_id: str) -> dict:
     - id/kind/where/source: exactly as extract_refs() (tools/_refs.py)
       reported them — `where` is the dotted config path the reference
       was found at, `source` is "field" or "template".
-    - outcome: "dead_reference" | "restored" | "unavailable".
-    - severity: "error" for dead_reference/restored, "warning" for
-      unavailable — the two errors mean the automation is currently
-      wrong right now; the warning means something to keep an eye on.
+    - outcome: "dead_reference" | "restored" | "unavailable" | "unknown".
+    - severity: "error" for dead_reference/restored (the automation is
+      currently wrong right now), "warning" for unavailable (a real
+      integration problem to keep an eye on), "info" for unknown (often
+      not a problem at all — see this module's own docstring).
     - detail: the sentence explaining what was found and what to do
       about it — see this module's own docstring for why the
-      dead-reference-inside-a-template case spells out the mechanism.
+      dead-reference-inside-a-template case spells out the mechanism,
+      and why the unknown case deliberately does NOT.
 
     Each `fail_open_waits` entry is exactly find_fail_open_waits()'s
     (tools/_refs.py) own shape: {wait_where, timeout, action_where,
@@ -388,7 +455,7 @@ def validate_all_automations(only_issues: bool = True, limit: int = 0, offset: i
 
     Returns: {total, returned, offset, note?, results: [...],
     summary: {checked, with_issues, read_errors, dead_references,
-    restored, unavailable, fail_open_waits}}.
+    restored, unavailable, unknown, fail_open_waits}}.
 
     `total`/`returned`/`offset`/`note` describe `results` exactly the
     way every other paginated tool in this codebase does (see
@@ -493,6 +560,8 @@ def validate_all_automations(only_issues: bool = True, limit: int = 0, offset: i
             r["summary"]["restored"] for r in results if "summary" in r),
         "unavailable": sum(
             r["summary"]["unavailable"] for r in results if "summary" in r),
+        "unknown": sum(
+            r["summary"]["unknown"] for r in results if "summary" in r),
         "fail_open_waits": sum(
             r["summary"]["fail_open_waits"] for r in results if "summary" in r),
     }

@@ -43,9 +43,9 @@ without a human in the loop, so that is the one thing this script commits
 to keeping honest:
 
 - exit 0  - the sweep ran, and found zero dead references and zero
-            fail-open waits (there may still be `restored`/`unavailable`
-            warnings or unreadable configs printed above - see below for
-            why those do not fail the build on their own).
+            fail-open waits (there may still be `restored`/`unavailable`/
+            `unknown` findings or unreadable configs printed above - see
+            below for why those do not fail the build on their own).
 - exit 1  - the sweep ran and found at least one dead reference or
             fail-open wait - see the printed report for exactly which
             automation and which one.
@@ -54,15 +54,20 @@ to keeping honest:
             set, or the sweep itself failed outright (a transport or
             WebSocket failure reading the registry/states).
 
-`restored` and `unavailable` outcomes (see tools/validation.py's own
-docstring for what each means) are printed for visibility but deliberately
-do NOT affect the exit code: both describe an INTEGRATION problem on this
-instance right now (not loaded, or reporting itself offline), not a defect
-in the automation's own config - failing a build over that would make this
-script noisy about something a config change cannot fix, which is exactly
-the kind of false alarm that trains people to stop reading it. A config a
-config change CAN fix - a stale id, a fail-open wait ahead of something
-destructive - is what exits non-zero.
+`restored`, `unavailable` and `unknown` outcomes (see tools/validation.py's
+own docstring for what each means) are printed for visibility but
+deliberately do NOT affect the exit code. `restored` and `unavailable` each
+describe an INTEGRATION problem on this instance right now (not loaded, or
+reporting itself offline), not a defect in the automation's own config -
+failing a build over that would make this script noisy about something a
+config change cannot fix, which is exactly the kind of false alarm that
+trains people to stop reading it. `unknown` is weaker still: on a vanilla
+instance with nothing wrong at all, several entity types (buttons, event
+entities, scenes, some helper and voice-pipeline entities) sit in
+`unknown` as their ordinary resting state, so it is frequently not a
+problem of any kind - see tools/validation.py's own docstring for the
+measurement. A config a config change CAN fix - a stale id, a fail-open
+wait ahead of something destructive - is what exits non-zero.
 """
 import argparse
 import sys
@@ -129,9 +134,9 @@ def _print_report(result: dict) -> int:
 
     Returns the count of dead_reference issues plus fail_open_waits across
     every automation printed - the number main() uses to decide the exit
-    code. restored/unavailable issues and read_error entries are printed
-    (so nothing found is hidden), but are not counted here - see this
-    module's own docstring for why only dead references and fail-open
+    code. restored/unavailable/unknown issues and read_error entries are
+    printed (so nothing found is hidden), but are not counted here - see
+    this module's own docstring for why only dead references and fail-open
     waits are what fails the build.
     """
     blocking = 0
@@ -196,6 +201,8 @@ def main(argv: list[str] | None = None) -> int:
         f"{summary['dead_references']} dead reference(s), "
         f"{summary['restored']} restored (integration not loaded), "
         f"{summary['unavailable']} unavailable, "
+        f"{summary['unknown']} unknown (often normal - see the tool's "
+        "own docstring), "
         f"{summary['fail_open_waits']} fail-open wait(s), "
         f"{summary['read_errors']} config(s) could not be read."
     )

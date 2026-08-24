@@ -273,11 +273,17 @@ Four tools exist to catch both shapes before they cause damage:
 
 - **`validate_automation`** / **`validate_all_automations`** — check every
   entity/device an automation references against this instance's live
-  registries and state machine (`dead_reference`, `restored`,
-  `unavailable`), and separately report any `wait_for_trigger` that can
+  registries and state machine (`dead_reference`, `restored`, `unavailable`,
+  `unknown`), and separately report any `wait_for_trigger` that can
   silently carry a timeout into a destructive action. These are reported as
   two separate lists (`issues` and `fail_open_waits`) because the incident
   needed both faults to cause damage — reading only one undercounts.
+  `unknown` is kept separate from `unavailable` and reported at a lower
+  severity: on a vanilla instance with nothing wrong, several entity types
+  (buttons, event entities, scenes, some helper and voice-pipeline
+  entities) sit in `unknown` as their ordinary resting state, while
+  `unavailable` never happens as a resting state — see `tools/validation.py`'s
+  own docstring for the measurement.
 - **`find_entity_usages`** — "if I rename or remove this entity, what
   breaks?", searched across automations and scripts only (not dashboards,
   template entities or helpers).
@@ -291,12 +297,13 @@ a schedule:
 HA_URL=https://your-instance:8123 HA_TOKEN=… python3 scripts/lint_automations.py
 ```
 
-It prints every dead reference, restored reference, unavailable reference and
-fail-open wait it finds, and exits:
+It prints every dead reference, restored reference, unavailable reference,
+unknown reference and fail-open wait it finds, and exits:
 
 - `0` — no dead references and no fail-open waits found (there may still be
-  `restored`/`unavailable` warnings printed above — an integration problem,
-  not a config defect, so it does not fail the build).
+  `restored`/`unavailable`/`unknown` findings printed above — an integration
+  problem, or often nothing at all for `unknown` — not a config defect, so
+  none of the three fail the build).
 - `1` — at least one dead reference or fail-open wait was found — see the
   printed report for which automation and which one.
 - `2` — the sweep could not run at all (missing `HA_URL`/`HA_TOKEN`, or a

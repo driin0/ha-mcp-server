@@ -542,12 +542,17 @@ both, before either did damage.
   `hassio.host_*`, `lock.*`, `alarm_control_panel.alarm_arm_*`/
   `alarm_disarm`), not every domain's `turn_off` or every switch service:
   turning a light off after a timeout is what automations are for. A
-  reference resolves to one of three outcomes:
+  reference resolves to one of four outcomes:
   `dead_reference` (absent from both the registry and the state machine —
   fix the automation), `restored` (in the registry but has no state — its
-  integration is not loaded, fix that instead), or `unavailable` (has a
-  state, but it is currently `"unavailable"`/`"unknown"` — also an
-  integration problem, not the automation's). A dead reference found inside
+  integration is not loaded, fix that instead), `unavailable` (has a
+  state, and it is currently `"unavailable"` — always a real integration
+  problem, not the automation's), or `unknown` (has a state, and it is
+  currently `"unknown"` — often the ordinary resting state for a whole
+  class of entity rather than a problem; kept separate from `unavailable`
+  and reported at a lower severity rather than folded in — see
+  `tools/validation.py`'s own docstring for the measurement that showed
+  why). A dead reference found inside
   a template explains the exact failure mechanism above in its own `detail`
   text, not just the bare fact that the id is missing. Findings come back
   as **two separate lists** — `issues` (reference problems) and
