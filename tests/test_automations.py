@@ -323,6 +323,99 @@ def test_update_automation_reports_home_assistants_write_time_rejection(fake_ha)
     assert fake_ha.automation_configs["1684270733500"]["alias"] == "NAS shutdown"
 
 
+# ---- update_automation() lost-update protection ---------------------------
+#
+# Home Assistant's config-write endpoint offers no compare-and-swap (see
+# _refuse_if_changed_since()'s own module-level comment in tools/
+# automations.py for what was actually verified live, against a throwaway
+# instance, and where). update_automation() re-reads the config immediately
+# before its own write (_refuse_if_changed_since()) and reads it back
+# immediately after a successful one (_verify_write()) to shrink - not
+# close - the window in which a second writer's change is silently
+# discarded while both calls report success. These two tests simulate that
+# second writer by mutating fake_ha's store from inside a wrapped
+# fake_ha.handle, timed to land exactly between the calls this tool itself
+# makes - the closest a synchronous fake can get to the live interleaving
+# proven separately against a real throwaway instance (see this module's
+# own investigation notes / the task report for that live proof and the
+# measured residual window).
+
+def test_update_automation_refuses_when_config_changed_since_read(fake_ha):
+    """A second writer's change lands between update_automation()'s initial
+    read (_resolve_and_fetch()) and its own pre-write recheck
+    (_refuse_if_changed_since()) - the second GET to the same config path.
+    This must be refused before anything is written, naming the race
+    explicitly, not silently overwritten the way it would be with no check
+    at all."""
+    from tools.automations import update_automation
+
+    real_handle = fake_ha.handle
+    config_gets = {"count": 0}
+
+    def handle_with_race(request):
+        if (request.method == "GET"
+                and request.url.path == "/api/config/automation/config/1684270733500"):
+            config_gets["count"] += 1
+            if config_gets["count"] == 2:
+                # A second writer's change, landing after this call's own
+                # initial read but before its pre-write recheck.
+                fake_ha.automation_configs["1684270733500"]["alias"] = (
+                    "Raced by someone else")
+        return real_handle(request)
+
+    fake_ha.handle = handle_with_race
+
+    result = update_automation("automation.nas_shutdown", name="My rename")
+
+    assert result["error"] == "concurrent_modification"
+    assert result["entity_id"] == "automation.nas_shutdown"
+    assert result["updated"] == ["name"]
+    # Nothing was written by this call - the racer's alias stands untouched,
+    # not "My rename" and not silently reverted either.
+    assert fake_ha.automation_configs["1684270733500"]["alias"] == "Raced by someone else"
+    assert not any(c.method == "POST" for c in fake_ha.rest_calls)
+    # Exactly two config GETs were sent (the read, and the recheck that
+    # caught the race) - no write-time GET is reached after a refusal.
+    assert config_gets["count"] == 2
+
+
+def test_update_automation_reports_unverified_write_when_readback_differs(fake_ha):
+    """This call's own write succeeds and lands - but a second writer's
+    change overwrites it again immediately afterward, in the residual
+    window _refuse_if_changed_since() cannot close. The post-write
+    read-back (_verify_write()) must catch that and say so - the write DID
+    happen here, unlike every other error() this module returns, and the
+    detail must not claim otherwise."""
+    from tools.automations import update_automation
+
+    real_handle = fake_ha.handle
+    config_gets = {"count": 0}
+
+    def handle_with_race(request):
+        if (request.method == "GET"
+                and request.url.path == "/api/config/automation/config/1684270733500"):
+            config_gets["count"] += 1
+            if config_gets["count"] == 3:
+                # A second writer's change, landing after this call's own
+                # write but before its own post-write read-back.
+                fake_ha.automation_configs["1684270733500"]["alias"] = (
+                    "Overwritten right after")
+        return real_handle(request)
+
+    fake_ha.handle = handle_with_race
+
+    result = update_automation("automation.nas_shutdown", name="My rename")
+
+    assert result["error"] == "config_write_unverified"
+    assert result["entity_id"] == "automation.nas_shutdown"
+    assert result["updated"] == ["name"]
+    # This call's own write DID land (visible if nobody had raced it) -
+    # the racer's alias is what is left standing, not "My rename", proving
+    # the write happened and was then overwritten, not merely rejected.
+    assert fake_ha.automation_configs["1684270733500"]["alias"] == "Overwritten right after"
+    assert config_gets["count"] == 3
+
+
 def test_update_automation_no_fields_passed_writes_nothing(fake_ha):
     """A fully no-op call must not resubmit the config - see the module
     docstring's caveat that Home Assistant's own write endpoint renames
@@ -598,3 +691,76 @@ def test_patch_automation_reports_home_assistants_write_time_rejection(fake_ha):
     assert "does not match format" in result["detail"]
     assert result["path"] == "actions.0.action"
     assert fake_ha.automation_configs["1684270733500"] == before
+
+
+# ---- patch_automation() lost-update protection -----------------------------
+# Same protection, same reasoning as update_automation()'s own tests above -
+# patch_automation() is the other read-modify-write edit tool sharing
+# _refuse_if_changed_since()/_verify_write().
+
+def test_patch_automation_refuses_when_config_changed_since_read(fake_ha):
+    """The realistic scenario this whole check exists for: a model
+    correcting two different fields of the same automation with two
+    patch_automation() calls issued in parallel. Simulated here as one
+    call whose own initial read is immediately followed by a second
+    writer's change, landing before this call's pre-write recheck - which
+    must catch it and refuse, writing nothing."""
+    from tools.automations import patch_automation
+
+    real_handle = fake_ha.handle
+    config_gets = {"count": 0}
+
+    def handle_with_race(request):
+        if (request.method == "GET"
+                and request.url.path == "/api/config/automation/config/1684270733500"):
+            config_gets["count"] += 1
+            if config_gets["count"] == 2:
+                fake_ha.automation_configs["1684270733500"]["action"][0]["target"] = {
+                    "entity_id": "button.raced_elsewhere"}
+        return real_handle(request)
+
+    fake_ha.handle = handle_with_race
+
+    result = patch_automation(
+        "automation.nas_shutdown", "conditions.0.value_template", "{{ true }}")
+
+    assert result["error"] == "concurrent_modification"
+    assert result["entity_id"] == "automation.nas_shutdown"
+    assert result["path"] == "conditions.0.value_template"
+    # Nothing was written by this call - the racer's target stands, and the
+    # condition template this call tried to set was never applied.
+    assert (fake_ha.automation_configs["1684270733500"]["action"][0]["target"]
+           == {"entity_id": "button.raced_elsewhere"})
+    assert (fake_ha.automation_configs["1684270733500"]["condition"][0]["value_template"]
+           != "{{ true }}")
+    assert not any(c.method == "POST" for c in fake_ha.rest_calls)
+
+
+def test_patch_automation_reports_unverified_write_when_readback_differs(fake_ha):
+    """This call's own write lands, but a second writer's change overwrites
+    it again immediately afterward - the post-write read-back must catch
+    the mismatch and say so, explicitly not claiming nothing was written."""
+    from tools.automations import patch_automation
+
+    real_handle = fake_ha.handle
+    config_gets = {"count": 0}
+
+    def handle_with_race(request):
+        if (request.method == "GET"
+                and request.url.path == "/api/config/automation/config/1684270733500"):
+            config_gets["count"] += 1
+            if config_gets["count"] == 3:
+                fake_ha.automation_configs["1684270733500"]["action"][0]["target"] = {
+                    "entity_id": "button.overwritten_right_after"}
+        return real_handle(request)
+
+    fake_ha.handle = handle_with_race
+
+    result = patch_automation(
+        "automation.nas_shutdown", "conditions.0.value_template", "{{ true }}")
+
+    assert result["error"] == "config_write_unverified"
+    assert result["entity_id"] == "automation.nas_shutdown"
+    assert result["path"] == "conditions.0.value_template"
+    assert (fake_ha.automation_configs["1684270733500"]["action"][0]["target"]
+           == {"entity_id": "button.overwritten_right_after"})

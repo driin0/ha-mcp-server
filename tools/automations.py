@@ -126,6 +126,220 @@ def _resolve_and_fetch(entity_id: str, slug: str) -> tuple[str, str | None, dict
     return automation_id, resolved_id, raw, state, None
 
 
+# ---------------------------------------------------------------------------
+# Concurrent-write protection for update_automation()/patch_automation()
+# (and create_automation()'s own collision check - see _check_collision()
+# below). Both edit tools are read-modify-write: fetch the stored config,
+# change one or more fields in memory, POST the whole object back. Between
+# that read and that write there is a window in which a second caller - a
+# parallel MCP tool call, a person in the Home Assistant UI, another client
+# entirely - can write its own change to the same automation; this call's
+# POST then silently overwrites it, and BOTH calls report success. Verified
+# there is no better tool available for this than shrinking that window:
+# read live against a throwaway instance (see this module's own tests for
+# the interleaving), and from Home Assistant's own source
+# (homeassistant/components/config/view.py's BaseEditConfigView, and
+# homeassistant/components/automation/__init__.py) -
+#   - the config-write GET response carries no ETag or Last-Modified header
+#     at all;
+#   - a POST sent with If-Match or If-Unmodified-Since is silently ignored -
+#     ignored, not rejected - the write still lands 200 and clobbers
+#     whatever changed underneath it;
+#   - the only WebSocket command this integration registers for automation
+#     config is `automation/config`, which is read-only (decorated with no
+#     write handler, keyed by entity_id rather than the REST endpoint's own
+#     config id) - there is no WebSocket write counterpart, so the REST
+#     endpoint above is the only way to persist an automation's config at
+#     all, and it is exactly the one with no conditional-write support.
+# Home Assistant offers nothing here to build a real compare-and-swap on.
+# What follows is an approximation: detected, not prevented.
+# ---------------------------------------------------------------------------
+
+def _refuse_if_changed_since(automation_id: str, slug: str, expected_raw: dict,
+                             entity_id: str) -> dict | None:
+    """Re-read entity_id's stored config immediately before a write and
+    refuse the write outright if it no longer matches `expected_raw` - the
+    same object the caller (update_automation(), patch_automation()) read
+    at the very start of its own call, before building the payload it is
+    about to post.
+
+    This is a compare-and-swap APPROXIMATION, not a guarantee - see this
+    section's module-level comment above for why Home Assistant's config
+    API offers nothing better to build on. It shrinks the unguarded window
+    from "however long the caller's own modify step takes" (arbitrarily
+    long - a model reasoning between reading a config and deciding what to
+    change) down to one extra HTTP round trip immediately before the POST.
+    It does NOT close that remaining round trip: a write from elsewhere
+    landing between this check returning and the POST that follows it is
+    still a silent lost update. Measured live against a throwaway
+    instance, that residual window is on the order of single-digit
+    milliseconds - see this module's own tests for the live interleaving
+    this was proven against, and the actual number.
+
+    Compares the raw, unnormalised config dicts directly (not through
+    to_modern()): when nothing has changed, a second read of the same
+    stored file returns the identical structure the first read did, so a
+    plain `!=` is exactly as sensitive as this check needs to be - it only
+    has to notice "did the stored bytes change at all", not classify how.
+
+    Returns None when unchanged (safe to proceed with the write), or an
+    error() envelope - "concurrent_modification" when the re-read config
+    differs from `expected_raw` (nothing is written by this call), or
+    "config_read_failed" when the re-read itself failed outright (a
+    transient 500, a revoked token) - not the same as "someone else wrote
+    in between", and reported differently so a caller does not retry a
+    network blip as though it were a genuine collision.
+    """
+    try:
+        with httpx.Client() as client:
+            _, raw_now = _fetch_config(automation_id, slug, client)
+    except httpx.HTTPStatusError as exc:
+        return error(
+            "config_read_failed",
+            f"Could not re-read {entity_id!r}'s stored config immediately "
+            f"before writing - the check itself failed ({exc.response.status_code}), "
+            "which is not the same as a concurrent change. Nothing was "
+            "written.",
+            entity_id=entity_id, status=exc.response.status_code,
+        )
+    if raw_now != expected_raw:
+        return error(
+            "concurrent_modification",
+            f"{entity_id}'s stored config changed since it was read at the "
+            "start of this call - something else (another tool call issued "
+            "in parallel, another MCP client, a person in the Home "
+            "Assistant UI) wrote to it in between. Nothing was written by "
+            "this call; re-read the automation with get_automation() and "
+            "retry against its current config. This is a compare-and-swap "
+            "approximation, not a guarantee of no lost update - see "
+            "_refuse_if_changed_since()'s own docstring for the residual "
+            "window it does not close.",
+            entity_id=entity_id,
+        )
+    return None
+
+
+def _verify_write(automation_id: str, slug: str, intended_config: dict,
+                  entity_id: str) -> dict | None:
+    """Read a just-written config back and confirm it matches what this
+    call intended to write - the best available confirmation that the
+    write actually landed as requested, given that _refuse_if_changed_since()
+    above only ever shrinks the lost-update window, never closes it.
+
+    Normalises both sides through to_modern() before comparing, rather
+    than comparing raw bytes: Home Assistant's own config-write endpoint
+    renames the root keys and an action step's `service:` on every save,
+    regardless of what was posted (measured live, and see
+    update_automation()'s own docstring for the full breakdown) - so even
+    an uncontested write of this call's own payload reads back different
+    bytes than it sent. to_modern() on both sides removes exactly that
+    rewrite and nothing else, so a genuine mismatch - this call's write
+    landing differently than intended, or being overwritten by someone
+    else in the residual window right after it - is not masked by Home
+    Assistant's own normalisation being mistaken for a real difference.
+
+    Returns None when the read-back matches (this call's own write is
+    confirmed on disk as intended). Returns an error() envelope otherwise -
+    but unlike every other error() in this module, the write has already
+    happened by the time this runs, so this is never "nothing was
+    written"; the detail says so explicitly. "config_write_unverified"
+    when the read-back does not match what was intended (`intended` and
+    `observed` are both included, normalised, for a caller to compare
+    directly), or "config_read_failed" when the read-back itself failed
+    outright.
+    """
+    try:
+        with httpx.Client() as client:
+            _, raw_after = _fetch_config(automation_id, slug, client)
+    except httpx.HTTPStatusError as exc:
+        return error(
+            "config_read_failed",
+            f"{entity_id}'s write was accepted by Home Assistant, but "
+            f"reading it back to confirm failed outright ({exc.response.status_code}) "
+            "- the write itself may or may not have landed as intended; "
+            "the write was NOT rolled back. Check manually.",
+            entity_id=entity_id, status=exc.response.status_code,
+        )
+    if raw_after is None:
+        return error(
+            "config_write_unverified",
+            f"{entity_id}'s write was accepted by Home Assistant, but no "
+            "stored config could be read back afterward to confirm it - "
+            "the write was NOT rolled back. Check manually.",
+            entity_id=entity_id,
+        )
+    observed, _ = to_modern(raw_after)
+    expected, _ = to_modern(intended_config)
+    if observed != expected:
+        return error(
+            "config_write_unverified",
+            f"{entity_id}'s write was accepted by Home Assistant, but the "
+            "config read back immediately afterward does not match what "
+            "this call intended to write - either the write landed "
+            "differently than requested, or another write overwrote it in "
+            "the residual window right after this call's own POST (see "
+            "_refuse_if_changed_since()'s docstring for why that window "
+            "cannot be closed, only shrunk). Detected, not prevented: this "
+            "call's write was NOT rolled back - re-read the automation "
+            "with get_automation() to see what is actually stored before "
+            "deciding what to do next.",
+            entity_id=entity_id, intended=expected, observed=observed,
+        )
+    return None
+
+
+def _check_collision(automation_id: str, entity_id: str, name: str) -> dict | None:
+    """Check whether automation_id already holds a DIFFERENT automation
+    than the one `name` would create - create_automation()'s own
+    pre-write guard against its lossy name->id slug (see its own
+    docstring's `overwrite` paragraph), factored out so it can be called
+    twice: once up front for a fast, clear refusal, and again immediately
+    before the write itself to catch the same race
+    _refuse_if_changed_since() above exists for - something else creating
+    an automation under this exact id in the window between the first
+    check and the write landing. create_automation() has no fetched config
+    to compare byte-for-byte the way update_automation()/patch_automation()
+    do (it builds its payload from scratch, not by editing what it read),
+    so the check re-run here is the collision check itself, not a raw
+    equality comparison - see create_automation()'s own docstring for why
+    that is the right invariant for this tool specifically.
+
+    Returns None when there is no collision (automation_id is free, or
+    already holds this exact `name`), or an error() envelope -
+    "id_collision" (a different automation already there) or
+    "collision_check_failed" (the check itself failed outright - a
+    transient error, not evidence either way).
+    """
+    try:
+        with httpx.Client() as client:
+            _, existing = _fetch_config(automation_id, automation_id, client)
+    except httpx.HTTPStatusError as exc:
+        return error(
+            "collision_check_failed",
+            f"Could not confirm whether {entity_id!r} already holds a "
+            "different automation - the collision check itself failed "
+            f"({exc.response.status_code}), so nothing was created. "
+            "Pass overwrite=True to proceed deliberately without this "
+            "check, if you are sure no other automation occupies this id.",
+            automation_id=automation_id, entity_id=entity_id,
+            status=exc.response.status_code,
+        )
+    if existing is not None:
+        existing_alias = existing.get("alias", "")
+        if existing_alias != name:
+            return error(
+                "id_collision",
+                f"{entity_id!r} already holds a different automation "
+                f"({existing_alias!r}) - {name!r} slugs to the same id "
+                "and would silently replace its definition. Pass "
+                "overwrite=True to replace it deliberately, or choose a "
+                "name that slugs differently.",
+                automation_id=automation_id, entity_id=entity_id,
+                existing_alias=existing_alias, requested_name=name,
+            )
+    return None
+
+
 def _set_and_verify_enabled(entity_id: str, enabled: bool, *,
                             arm_when_enabling: bool = True) -> dict:
     """Send automation.turn_on/turn_off and confirm the entity's state
@@ -337,6 +551,16 @@ def create_automation(
       own slug scheme already owns - never a UI-created automation, whose
       id this tool has no way to derive or address (see above).
 
+      When overwrite=False, this check runs twice - once up front, and
+      again immediately before the write - to shrink (not close) the
+      window in which something else creates an automation under this
+      same id between the two: see _check_collision()'s own docstring.
+      Both runs can produce "id_collision"/"collision_check_failed"; the
+      second is not a promise nothing can still slip through, only a
+      narrower window than checking once. overwrite=True skips the check
+      entirely, both times - that path never promised collision
+      protection to begin with.
+
     Example — turn on a light at sunset:
       name: "Turn on light at sunset"
       trigger: [{"platform": "sun", "event": "sunset"}]
@@ -396,8 +620,8 @@ def create_automation(
 
     if not overwrite:
         # automation_id doubles as its own slug here (nothing exists yet
-        # to read a different config id from), so this is a single GET
-        # with no fallback attempt: automation_id == slug, so
+        # to read a different config id from), so _check_collision()'s own
+        # single GET has no fallback attempt: automation_id == slug, so
         # _fetch_config()'s `if automation_id != slug` guard never fires
         # and no second, identical request is sent - see its own
         # docstring. A 404 (no such id) still falls through as "no
@@ -411,39 +635,14 @@ def create_automation(
         # and a check that cannot run and proceeds anyway has re-enabled
         # exactly the silent replacement it guards against - the same
         # shape of fault as an is_state() read on a renamed entity, in a
-        # different costume. It is not a fallthrough any more:
-        # _fetch_config() raises via its own raise_for_status() for
-        # anything but a 404, and that is caught here and reported as
-        # its own named error() - "the check could not be performed" -
-        # instead of either silently vouching for a state it never
-        # confirmed, or escaping as a bare, uncaught HTTPStatusError.
-        try:
-            with httpx.Client() as client:
-                _, existing = _fetch_config(automation_id, automation_id, client)
-        except httpx.HTTPStatusError as exc:
-            return error(
-                "collision_check_failed",
-                f"Could not confirm whether {entity_id!r} already holds a "
-                "different automation - the collision check itself failed "
-                f"({exc.response.status_code}), so nothing was created. "
-                "Pass overwrite=True to proceed deliberately without this "
-                "check, if you are sure no other automation occupies this id.",
-                automation_id=automation_id, entity_id=entity_id,
-                status=exc.response.status_code,
-            )
-        if existing is not None:
-            existing_alias = existing.get("alias", "")
-            if existing_alias != name:
-                return error(
-                    "id_collision",
-                    f"{entity_id!r} already holds a different automation "
-                    f"({existing_alias!r}) - {name!r} slugs to the same id "
-                    "and would silently replace its definition. Pass "
-                    "overwrite=True to replace it deliberately, or choose a "
-                    "name that slugs differently.",
-                    automation_id=automation_id, entity_id=entity_id,
-                    existing_alias=existing_alias, requested_name=name,
-                )
+        # different costume. _check_collision() raises via its own
+        # _fetch_config()'s raise_for_status() for anything but a 404, and
+        # that is caught there and reported as its own named error() -
+        # "the check could not be performed" - instead of either silently
+        # vouching for a state it never confirmed, or escaping as a bare,
+        # uncaught HTTPStatusError.
+        if collision_err := _check_collision(automation_id, entity_id, name):
+            return collision_err
 
     payload = {
         "alias": name,
@@ -453,6 +652,27 @@ def create_automation(
         "action": action,
         "mode": mode,
     }
+    if not overwrite:
+        # Same check, run again immediately before the write: the first
+        # call above only ever proves there was no collision AT THE TIME
+        # IT RAN. Something else - another create_automation() call issued
+        # in parallel with the exact same name, another MCP client, a
+        # person in the HA UI - can create an automation under this same
+        # id in the window between that check returning and the POST
+        # below landing; without this second call, this call's POST would
+        # silently replace it, the exact failure the check above exists to
+        # prevent, just arriving one HTTP round trip later than the first
+        # check could see. This is the same compare-and-swap
+        # APPROXIMATION update_automation()/patch_automation() use via
+        # _refuse_if_changed_since() - it shrinks the window to one round
+        # trip, it does not close it - see that function's own module-level
+        # comment for why Home Assistant's config API offers nothing
+        # better to build on. Not run when overwrite=True: that path never
+        # promised collision protection in the first place (see this
+        # tool's own docstring), so there is no assumption here to have
+        # gone stale.
+        if collision_err := _check_collision(automation_id, entity_id, name):
+            return collision_err
     with httpx.Client() as client:
         r = client.post(
             f"{HA_URL}/api/config/automation/config/{automation_id}",
@@ -855,16 +1075,42 @@ def update_automation(
     envelope ("not_found") mentioning YAML, the same distinction
     get_automation() and delete_automation() already draw.
 
+    This is read-modify-write against a Home Assistant config API that has
+    no conditional write of its own - no ETag, no If-Match, no version
+    check (verified live: see _refuse_if_changed_since()'s own module-level
+    comment for what was actually checked and where). Two calls editing
+    different fields of the same automation, run in parallel - two
+    patch_automation() calls from one model correcting two fields, or this
+    tool racing a person in the HA UI - can otherwise both report success
+    while the second silently discards the first's change. When a field is
+    actually being written (`updated` is non-empty), this call re-reads
+    the config immediately before its own POST and refuses with
+    "concurrent_modification" if it no longer matches what was read at the
+    start - and after a successful write, reads it back and refuses with
+    "config_write_unverified" if that does not semantically match what was
+    intended. Both are approximations, not guarantees: they shrink the
+    unguarded window to one HTTP round trip each, they do not close it.
+    See _refuse_if_changed_since() and _verify_write()'s own docstrings for
+    exactly what each does and does not catch, and this module's own tests
+    for a live interleaving proving the window is where this describes.
+
     Returns: {automation_id, entity_id, updated: [...], stored_format,
     enabled?, verified?, state?} on success - `updated` lists which of
     name/triggers/conditions/actions/mode/description were actually
     written; `enabled`/`verified`/`state` are present only when `enabled`
     was passed. Or an error() envelope: "not_found"; "config_read_failed"
-    when the read itself failed outright rather than answering "no such
-    config" (see _resolve_and_fetch()); "home_assistant_error" when Home
-    Assistant rejects the write itself - its own validation message is
-    reported directly (see rest_error()), and nothing is written, the same
-    as any other refusal here; or "automation_not_registered"/
+    when either the initial read or the pre-write/post-write re-read failed
+    outright rather than answering "no such config" (see
+    _resolve_and_fetch(), _refuse_if_changed_since(), _verify_write());
+    "concurrent_modification" when the config changed between the initial
+    read and the write (nothing was written by this call - see
+    _refuse_if_changed_since()); "home_assistant_error" when Home Assistant
+    rejects the write itself - its own validation message is reported
+    directly (see rest_error()), and nothing is written, the same as any
+    other refusal here; "config_write_unverified" when the write was
+    accepted but the read-back afterward does not match what was intended
+    - unlike every other error() here, the write DID happen in this case
+    (see _verify_write()); or "automation_not_registered"/
     "automation_not_disabled"/"automation_state_unverified" when `enabled`
     was requested and could not be confirmed.
     """
@@ -900,6 +1146,15 @@ def update_automation(
         updated.append("description")
 
     if updated:
+        # Compare-and-swap approximation, immediately before the write -
+        # see _refuse_if_changed_since()'s own docstring (and the
+        # module-level comment above it) for what this does and does not
+        # guarantee against a second writer racing this same call between
+        # the read above and the POST below.
+        if cas_err := _refuse_if_changed_since(resolved_id, slug, raw, entity_id):
+            cas_err["updated"] = updated
+            return cas_err
+
         payload = to_stored(config, restore)
         with httpx.Client() as client:
             r = client.post(
@@ -920,6 +1175,15 @@ def update_automation(
                 write_err["entity_id"] = entity_id
                 write_err["updated"] = updated
                 return write_err
+
+        # Read the write back and confirm it landed as intended - see
+        # _verify_write()'s own docstring. Unlike every other error()
+        # return in this function, the write already happened by the time
+        # this can fail; _verify_write()'s own detail text says so.
+        if verify_err := _verify_write(resolved_id, slug, config, entity_id):
+            verify_err["updated"] = updated
+            verify_err["stored_format"] = fmt
+            return verify_err
 
     result = {
         "automation_id": resolved_id,
@@ -1020,15 +1284,43 @@ def patch_automation(
     YAML-defined automation returns an error() envelope ("not_found")
     mentioning YAML, the same as update_automation() and get_automation().
 
+    Read-modify-write against a Home Assistant config API with no
+    conditional write of its own (no ETag, no If-Match, no version check -
+    see _refuse_if_changed_since()'s module-level comment for what was
+    actually verified live, and where). The realistic failure this
+    protects against is not exotic: a model correcting two different
+    fields of the same automation with two patch_automation() calls issued
+    in parallel, or this tool racing a person editing the same automation
+    in the HA UI - both calls read the same starting config, both write,
+    and without this check the second call's write silently discards the
+    first's, while BOTH report success. Immediately before its own write,
+    this call re-reads the config and refuses with "concurrent_modification"
+    if it no longer matches what was read at the start of this call
+    (nothing is written in that case); after a successful write, it reads
+    the result back and refuses with "config_write_unverified" if that does
+    not semantically match what was intended. Both are compare-and-swap
+    APPROXIMATIONS: they shrink the unguarded window to one HTTP round trip
+    each, they do not eliminate it. See _refuse_if_changed_since() and
+    _verify_write()'s own docstrings for exactly what each does and does
+    not catch, and this module's own tests for a live interleaving proving
+    the window is where this describes.
+
     Returns: {automation_id, entity_id, path, old, new, stored_format} on
     success, or an error() envelope - "not_found" (no such automation, or
     YAML-defined), "protected_path" (`path` is "id" - see above),
-    "config_read_failed" (the read itself failed outright, rather than
-    answering "no such config" - see _resolve_and_fetch()), "bad_path"
-    (the path resolved against nothing - nothing was written), or
-    "home_assistant_error" when Home Assistant rejects the write itself -
-    its own validation message is reported directly (see rest_error()),
-    and nothing was written, the same as "bad_path".
+    "config_read_failed" (the initial read, or the pre-write/post-write
+    re-read, failed outright, rather than answering "no such config" - see
+    _resolve_and_fetch(), _refuse_if_changed_since(), _verify_write()),
+    "concurrent_modification" (the config changed between the initial read
+    and the write - nothing was written by this call - see
+    _refuse_if_changed_since()), "bad_path" (the path resolved against
+    nothing - nothing was written), "home_assistant_error" when Home
+    Assistant rejects the write itself - its own validation message is
+    reported directly (see rest_error()), and nothing was written, the same
+    as "bad_path" - or "config_write_unverified" when the write was
+    accepted but the read-back afterward does not match what was intended -
+    unlike every other error() here, the write DID happen in this case (see
+    _verify_write()).
     """
     if path.split(".", 1)[0] in _PROTECTED_PATCH_ROOT_PATHS:
         return error(
@@ -1070,6 +1362,15 @@ def patch_automation(
         # with. exc.args[0] is the message itself, unwrapped.
         return error("bad_path", exc.args[0], entity_id=entity_id, path=path)
 
+    # Compare-and-swap approximation, immediately before the write - see
+    # _refuse_if_changed_since()'s own docstring (and the module-level
+    # comment above it) for what this does and does not guarantee against
+    # a second writer racing this same call between the read above and the
+    # POST below.
+    if cas_err := _refuse_if_changed_since(resolved_id, slug, raw, entity_id):
+        cas_err["path"] = path
+        return cas_err
+
     payload = to_stored(config, restore)
     with httpx.Client() as client:
         r = client.post(
@@ -1087,6 +1388,16 @@ def patch_automation(
             write_err["entity_id"] = entity_id
             write_err["path"] = path
             return write_err
+
+    # Read the write back and confirm it landed as intended - see
+    # _verify_write()'s own docstring. Unlike every other error() return
+    # in this function, the write already happened by the time this can
+    # fail; _verify_write()'s own detail text says so.
+    if verify_err := _verify_write(resolved_id, slug, config, entity_id):
+        verify_err["path"] = path
+        verify_err["old"] = old
+        verify_err["new"] = value
+        return verify_err
 
     return {
         "automation_id": resolved_id,

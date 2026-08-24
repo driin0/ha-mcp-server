@@ -265,11 +265,19 @@ def test_create_automation_calling_again_with_the_same_name_is_not_a_collision(f
     assert fake_ha.automation_configs["morning_lights"]["trigger"] == ["updated"]
 
 
-def test_create_automation_collision_check_sends_exactly_one_request_when_absent(fake_ha):
-    """_fetch_config()'s slug-fallback is a no-op here: create_automation()
-    passes automation_id as both its own id and its own slug, so a 404 on
-    the first GET must never trigger a second, identical one - see
-    _fetch_config()'s own `if automation_id != slug` guard."""
+def test_create_automation_collision_check_sends_exactly_two_requests_when_absent(fake_ha):
+    """_fetch_config()'s slug-fallback is a no-op on each individual check:
+    create_automation() passes automation_id as both its own id and its own
+    slug, so a 404 on either GET must never trigger a second, identical one
+    of its own - see _fetch_config()'s own `if automation_id != slug` guard.
+
+    Exactly two GETs overall, not one: create_automation() (overwrite=False)
+    runs _check_collision() twice by design - once up front, and again
+    immediately before the write - to shrink the window in which something
+    else could create an automation under this same id between the two (see
+    _check_collision()'s own docstring, and this module's lost-update fix).
+    Neither of those two calls triggers its own extra slug-fallback request,
+    which is what this test actually guards - two, not four."""
     from tools.automations import create_automation
 
     create_automation("Morning lights", trigger=[], action=[])
@@ -279,7 +287,51 @@ def test_create_automation_collision_check_sends_exactly_one_request_when_absent
         if c.method == "GET"
         and c.url.path == "/api/config/automation/config/morning_lights"
     ]
-    assert len(config_gets) == 1
+    assert len(config_gets) == 2
+
+
+def test_create_automation_refuses_a_collision_created_between_check_and_write(fake_ha):
+    """The race the second _check_collision() call exists for: nothing
+    occupies this id at the time of the up-front check, but something else
+    (another create_automation() call for the exact same name, issued in
+    parallel; another MCP client; a person in the HA UI) creates one under
+    the same slug before this call's own write lands. The pre-write
+    recheck must catch that and refuse - the id_collision it reports is
+    exactly as real as one caught by the up-front check, just discovered
+    one round trip later. Without this second check, this call's write
+    would have silently replaced the racer's automation instead."""
+    import httpx
+
+    from tools.automations import create_automation
+
+    real_handle = fake_ha.handle
+    config_gets = {"count": 0}
+
+    def handle_with_race(request):
+        if (request.method == "GET"
+                and request.url.path == "/api/config/automation/config/morning_lights"):
+            config_gets["count"] += 1
+            if config_gets["count"] == 2:
+                # Something else creates a DIFFERENTLY-named automation
+                # under this exact slug between the two checks.
+                fake_ha.automation_configs["morning_lights"] = {
+                    "alias": "Raced by someone else", "trigger": [], "action": []}
+                return httpx.Response(200, json={
+                    "id": "morning_lights",
+                    **fake_ha.automation_configs["morning_lights"]})
+        return real_handle(request)
+
+    fake_ha.handle = handle_with_race
+
+    result = create_automation("Morning lights", trigger=[], action=[])
+
+    assert result["error"] == "id_collision"
+    assert result["existing_alias"] == "Raced by someone else"
+    assert result["requested_name"] == "Morning lights"
+    assert config_gets["count"] == 2
+    # Nothing was written by this call - the racer's automation stands.
+    assert not any(c.method == "POST" for c in fake_ha.rest_calls)
+    assert fake_ha.automation_configs["morning_lights"]["alias"] == "Raced by someone else"
 
 
 def test_create_automation_reports_a_failed_collision_check_instead_of_raising(fake_ha):
