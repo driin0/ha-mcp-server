@@ -575,23 +575,29 @@ both, before either did damage.
   same population `validate_automation()`'s `restored`/`disabled` outcomes
   each draw a single row from when an automation happens to reference one.
 - **`tools/_refs.py`** — the pure, dependency-free extraction the four tools
-  above and the script below all share, so the definition of "what this
-  config references" lives in exactly one place. `extract_refs(config)`
-  walks an automation or script config for every `entity_id`/`device_id`
-  field and every template reference (`is_state`, `is_state_attr`,
-  `states`, `state_attr`, `expand`, `has_value`, and the bare
-  `states.<domain>.<id>` attribute form, both quote styles);
-  `find_fail_open_waits(config)` finds the wait-then-destructive-action
-  shape directly, with no reference resolution involved at all. No httpx,
-  no WebSocket, no import from the rest of this project — safe to run
-  against a bare YAML file on a machine with no Home Assistant on it.
+  above share directly, so the definition of "what this config references"
+  lives in exactly one place. `scripts/lint_automations.py` below reaches
+  it only indirectly, through `validate_all_automations()` — it does not
+  import `tools/_refs.py` itself. `extract_refs(config)` walks an
+  automation or script config for every `entity_id`/`device_id` field and
+  every template reference (`is_state`, `is_state_attr`, `states`,
+  `state_attr`, `expand`, `has_value`, and the bare `states.<domain>.<id>`
+  attribute form, both quote styles); `find_fail_open_waits(config)` finds
+  the wait-then-destructive-action shape directly, with no reference
+  resolution involved at all. No httpx, no WebSocket, no import from the
+  rest of this project — what that purity buys is a module testable with
+  no mocks and no network, not an offline mode for the script below: see
+  it for why "no Home Assistant instance needed" is not actually true of
+  it.
 - **`scripts/lint_automations.py`** — a CLI over `validate_all_automations()`
   for CI or a schedule. Prints every dead reference, restored reference,
-  unavailable reference and fail-open wait found, and exits `0` (clean),
-  `1` (at least one dead reference or fail-open wait — the two fault kinds
-  that actually need fixing), or `2` (the sweep could not run at all —
-  missing `HA_URL`/`HA_TOKEN`, or a transport/WebSocket failure). No
-  offline mode: resolving a reference needs the live registry, which a
+  disabled reference, unavailable reference, unknown reference and
+  fail-open wait found, and exits `0` (clean), `1` (at least one dead
+  reference or fail-open wait — the two fault kinds that actually need
+  fixing), or `2` (the sweep could not run at all — missing
+  `HA_URL`/`HA_TOKEN`, an expired/revoked token, an unreachable instance,
+  or a transport/WebSocket failure). No offline mode: resolving a
+  reference needs the live registry, which a
   YAML file cannot answer about itself.
 
 Validation is deliberately **static** throughout: nothing here evaluates a

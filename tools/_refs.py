@@ -3,11 +3,23 @@ failure shape that has nothing to do with what it references at all.
 
 Pure: no httpx, no `_ws`, nothing imported from `tools._base` or anywhere
 else in this project. extract_refs() and find_fail_open_waits() take a
-plain dict and return plain data. That is what lets a validator tool
-(`tools/validation.py`, resolving against a live registry) and a CI script
-(`scripts/lint_automations.py`, pointed at a YAML file on a machine with no
-Home Assistant on it) share the exact same extraction code, and what lets
-this module be tested with no mocks and no network at all.
+plain dict and return plain data. That is what lets every test in
+tests/test_refs.py construct a plain dict and assert on a plain return
+value with no fake Home Assistant, no mocks and no network involved at
+all — the honest reason this module stays pure. It is also what lets a
+validator tool (`tools/validation.py`, resolving against a live registry)
+reuse this exact extraction code rather than a second copy that could
+silently drift from it.
+
+What this purity does NOT do: let `scripts/lint_automations.py` run
+without a live Home Assistant instance. That script never imports this
+module at all — it reaches extract_refs()/find_fail_open_waits() only
+indirectly, through `tools.validation.validate_all_automations()`, which
+resolves every reference against a live registry and state machine before
+this module's own checks ever run. See that script's own docstring
+("No offline mode, on purpose") for why a YAML-file-only mode was
+deliberately not built, and CHANGELOG.md for where an earlier version of
+this docstring claimed the opposite.
 
 ## Why this module exists
 

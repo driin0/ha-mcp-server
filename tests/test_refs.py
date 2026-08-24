@@ -5,9 +5,11 @@ fail closed ahead of a destructive action.
 No fake_ha fixture anywhere in this file: extract_refs() and
 find_fail_open_waits() take a plain dict and return plain data — no
 network, no live Home Assistant, nothing evaluated. That purity is the
-point: it is what lets a future CLI (scripts/lint_automations.py) point
-this exact code at a YAML file on a machine with no Home Assistant
-running on it at all.
+point: it is what lets every test below construct a plain dict and assert
+on a plain return value, with no mocks and no network required at all -
+see tools/_refs.py's own module docstring for why this does NOT mean
+scripts/lint_automations.py can run without a live instance (it still
+needs one; it does not even import this module directly).
 """
 from tools._refs import extract_refs, find_fail_open_waits
 
