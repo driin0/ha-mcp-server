@@ -1,11 +1,15 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _slug
+from tools._base import mcp, HA_URL, HEADERS, _slug, confirm_entity_exists, envelope, error
 
 
 @mcp.tool()
-def list_scripts() -> list:
-    """List all scripts with their state (on = running, off = idle)."""
+def list_scripts() -> dict:
+    """
+    List all scripts with their state (on = running, off = idle).
+
+    Returns: {total, returned, offset, note?, scripts: [...]}
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -18,7 +22,7 @@ def list_scripts() -> list:
             for s in r.json()
             if s["entity_id"].startswith("script.")
         ]
-        return sorted(scripts, key=lambda x: x["name"])
+        return envelope(sorted(scripts, key=lambda x: x["name"]), key="scripts")
 
 
 @mcp.tool()
@@ -26,7 +30,19 @@ def run_script(entity_id: str, variables: dict = None) -> dict:
     """
     Run a script by entity_id (e.g. 'script.restart_mqtt_broker').
     Optionally pass variables as a dict.
+
+    ⚠️ Runs whatever the script's own sequence does - this tool has no way
+    to know that in advance; a script can call any service, including a
+    destructive one, the same as call_service() can.
+
+    Returns: {entity_id, accepted: true, verified: null, detail} once Home
+    Assistant accepts the call, or {error: "entity_not_found", ...} when
+    entity_id has no state at all. A script's own state ("on" while
+    running, "off" once finished) confirms only whether it is still
+    executing, not what its actions did - check the entities it acts on.
     """
+    if missing := confirm_entity_exists(entity_id):
+        return missing
     data = {"entity_id": entity_id}
     if variables:
         data["variables"] = variables
@@ -38,19 +54,68 @@ def run_script(entity_id: str, variables: dict = None) -> dict:
             timeout=15,
         )
         r.raise_for_status()
-        return {"triggered": entity_id}
+    return {
+        "entity_id": entity_id,
+        "accepted": True,
+        "verified": None,
+        "detail": "Home Assistant accepted the call; a script's state "
+                  "confirms only whether it is still running, not what "
+                  "its actions did - check the entities it acts on.",
+    }
 
 
 @mcp.tool()
-def create_script(name: str, sequence: list, description: str = "") -> dict:
+def create_script(name: str, sequence: list, description: str = "", overwrite: bool = False) -> dict:
     """
     Create or update a script.
+
+    overwrite: the script id is derived from `name` through a lossy slug
+      (see _slug()) - "Turn everything off" and "Turn, everything off!"
+      both become "turn_everything_off", so two different names can
+      collide on one id. By default a name that collides with an existing
+      script under a *different* alias is refused ("id_collision") rather
+      than silently replacing its definition - the id cannot be made
+      unique without changing the scheme, so refusing is the honest
+      default. Pass overwrite=True to replace it deliberately. Calling
+      again with the exact same `name` is treated as an intentional
+      update, not a collision, and always succeeds without this flag.
 
     Example — script that turns off all lights:
       name: "Turn everything off"
       sequence: [{"service": "light.turn_off", "target": {"entity_id": "all"}}]
+
+    Returns: {script_id, entity_id, result} once Home Assistant accepts
+    the config - `result` is its own JSON response, passed through
+    unexamined - or an error() envelope ("id_collision", see `overwrite`
+    above).
     """
     script_id = _slug(name)
+    entity_id = f"script.{script_id}"
+
+    if not overwrite:
+        # A transient failure reading the existing config should not block
+        # a legitimate create, so this check only acts on a confirmed 200 -
+        # anything else (404 "no such id" included) falls through as "no
+        # collision" rather than raising.
+        with httpx.Client() as client:
+            existing = client.get(
+                f"{HA_URL}/api/config/script/config/{script_id}",
+                headers=HEADERS, timeout=10,
+            )
+        if existing.status_code == 200:
+            existing_alias = existing.json().get("alias", "")
+            if existing_alias != name:
+                return error(
+                    "id_collision",
+                    f"{entity_id!r} already holds a different script "
+                    f"({existing_alias!r}) - {name!r} slugs to the same id "
+                    "and would silently replace its definition. Pass "
+                    "overwrite=True to replace it deliberately, or choose a "
+                    "name that slugs differently.",
+                    script_id=script_id, entity_id=entity_id,
+                    existing_alias=existing_alias, requested_name=name,
+                )
+
     payload = {
         "alias": name,
         "description": description,
@@ -65,12 +130,20 @@ def create_script(name: str, sequence: list, description: str = "") -> dict:
             timeout=15,
         )
         r.raise_for_status()
-        return {"script_id": script_id, "entity_id": f"script.{script_id}", "result": r.json()}
+        return {"script_id": script_id, "entity_id": entity_id, "result": r.json()}
 
 
 @mcp.tool()
 def delete_script(entity_id: str) -> dict:
-    """Delete a script by entity_id (e.g. 'script.turn_everything_off')."""
+    """Delete a script by entity_id (e.g. 'script.turn_everything_off').
+
+    ⚠️ This is irreversible. Any automation calling this script starts
+    calling a nonexistent entity.
+
+    Returns: {deleted: entity_id, status: <HTTP status code>}. A non-2xx
+    response raises rather than returning a value, like every other REST
+    config write in this codebase.
+    """
     script_id = entity_id.removeprefix("script.")
     with httpx.Client() as client:
         r = client.delete(

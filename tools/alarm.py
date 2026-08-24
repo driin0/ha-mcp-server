@@ -1,6 +1,39 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS
+from tools._base import (
+    mcp, HA_URL, HEADERS, envelope, error, observe_actuation,
+    verified_allowing_transit,
+)
+
+# The transient state each arm_* command passes through before landing on
+# its target ("arming", not "armed_home" yet — measured live, a panel with
+# a short exit delay took about five seconds to settle). "disarm" has no
+# entry here: measured live on this project's own test instance, disarm
+# was instantaneous every time — no "disarming" state was ever observed —
+# so it keeps the plain True/False result rather than getting a None it
+# has never actually needed. A real installation with a longer entry delay
+# on disarm would not match that; there is nothing in the API response to
+# tell the two apart in advance.
+_ALARM_TRANSITIONAL_STATES = {
+    "arm_home": {"arming"},
+    "arm_away": {"arming"},
+    "arm_night": {"arming"},
+    "arm_vacation": {"arming"},
+    "arm_custom_bypass": {"arming"},
+}
+
+# HA service names (alarm_disarm, alarm_arm_home, ...) already match
+# f"alarm_{command}"; the state each settles into is not the same string
+# for "disarm" (service alarm_disarm, state "disarmed") but is for every
+# arm_* command (service alarm_arm_home, state "armed_home").
+_ALARM_EXPECTED_STATE = {
+    "disarm": "disarmed",
+    "arm_home": "armed_home",
+    "arm_away": "armed_away",
+    "arm_night": "armed_night",
+    "arm_vacation": "armed_vacation",
+    "arm_custom_bypass": "armed_custom_bypass",
+}
 
 
 @mcp.tool()
@@ -13,10 +46,35 @@ def alarm_control(entity_id: str, command: str, code: str = "") -> dict:
 
     ⚠️ SAFETY: This controls a physical alarm system. Always confirm the entity and
     command with the user before executing.
+
+    Returns: {entity_id, command, verified, state} on a call Home Assistant
+    accepted, or {error: "entity_not_found", ...} when entity_id has no
+    state at all.
+
+    `verified` is true only when the panel's own state, read back after the
+    call, matches the command (e.g. arm_home -> "armed_home"). Arming
+    passes through a transient "arming" state first — measured live, a
+    panel with a short exit delay took about five seconds to settle (an
+    earlier version of this docstring claimed "within about a second",
+    measured on a since-changed instance — re-measure on your own panel
+    rather than trusting either number). The read-back retries twice more
+    (three reads total, roughly three seconds) — short of what that exit
+    delay needs, deliberately: blocking a tool call for five-plus seconds
+    has its own cost. When the budget runs out and the panel is still
+    "arming", `verified` is `None` — not `False` — since that is honestly
+    still in progress, not a denial that arming will complete; `state`
+    alongside it says "arming" so the reason is visible. A real mismatch
+    (disarmed again, a different mode, "pending" from a triggered sensor)
+    still reports `False`. "disarm" has no transient state of its own —
+    measured live, it was instantaneous every time — so it keeps a plain
+    True/False `verified` with no `None` case. A wrong or missing code
+    raises rather than returning a value (Home Assistant answers it with a
+    non-2xx status), which surfaces the same way any other refused call in
+    this codebase does.
     """
-    valid = {"disarm", "arm_home", "arm_away", "arm_night", "arm_vacation", "arm_custom_bypass"}
-    if command not in valid:
-        return {"error": f"Invalid command. Use one of: {sorted(valid)}"}
+    if command not in _ALARM_EXPECTED_STATE:
+        return error("invalid_command",
+                     f"Invalid command. Use one of: {sorted(_ALARM_EXPECTED_STATE)}")
     service = f"alarm_{command}"  # HA service names: alarm_disarm, alarm_arm_home, etc.
     data: dict = {"entity_id": entity_id}
     if code:
@@ -29,12 +87,27 @@ def alarm_control(entity_id: str, command: str, code: str = "") -> dict:
             timeout=15,
         )
         r.raise_for_status()
-    return {"entity_id": entity_id, "command": command, "ok": True}
+    expected = _ALARM_EXPECTED_STATE[command]
+    obs = observe_actuation(entity_id, lambda s: s["state"] == expected, retries=3, delay=1.0)
+    if not obs["exists"]:
+        return error("entity_not_found",
+                     f"{entity_id} does not exist on this Home Assistant instance.",
+                     entity_id=entity_id, command=command)
+    return {
+        "entity_id": entity_id,
+        "command": command,
+        "verified": verified_allowing_transit(obs, _ALARM_TRANSITIONAL_STATES.get(command, frozenset())),
+        "state": obs["state"]["state"],
+    }
 
 
 @mcp.tool()
-def get_alarm_state() -> list:
-    """Get the current state of all alarm control panels (Alarmo and others)."""
+def get_alarm_state() -> dict:
+    """
+    Get the current state of all alarm control panels (Alarmo and others).
+
+    Returns: {total, returned, offset, note?, alarms: [...]}
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -53,4 +126,4 @@ def get_alarm_state() -> list:
                 "bypassed_sensors": attrs.get("bypassed_sensors", []),
                 "last_changed": s.get("last_changed", ""),
             })
-        return sorted(alarms, key=lambda x: x["name"])
+        return envelope(sorted(alarms, key=lambda x: x["name"]), key="alarms")

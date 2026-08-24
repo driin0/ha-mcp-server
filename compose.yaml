@@ -14,10 +14,15 @@ services:
       - HA_TOKEN=${HA_TOKEN:?serve un long-lived access token di Home Assistant}
       - MCP_SECRET=${MCP_SECRET:-}
       - MCP_ALLOW_NO_AUTH=${MCP_ALLOW_NO_AUTH:-}
+      - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-}
       - UI_SECRET=${UI_SECRET:-}
+      - UI_ALLOW_NO_AUTH=${UI_ALLOW_NO_AUTH:-}
       - HA_DEFAULT_LANGUAGE=${HA_DEFAULT_LANGUAGE:-}
       - HA_ALEXA_KEYWORDS=${HA_ALEXA_KEYWORDS:-}
       - HA_REMOTE_PREFIXES=${HA_REMOTE_PREFIXES:-}
+      - MCP_ENABLE_USER_MANAGEMENT=${MCP_ENABLE_USER_MANAGEMENT:-}
+      - MCP_ENABLE_PHYSICAL_SECURITY=${MCP_ENABLE_PHYSICAL_SECURITY:-}
+      - MCP_ENABLE_ADDON_API=${MCP_ENABLE_ADDON_API:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:47822/api/status', timeout=5)\" || exit 1"]

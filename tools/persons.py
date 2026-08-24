@@ -1,12 +1,14 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws
+from tools._base import mcp, HA_URL, HEADERS, _ws, envelope, ws_error
 
 
 @mcp.tool()
-def list_persons() -> list:
+def list_persons() -> dict:
     """
     List all person entities with their state (home/away/zone) and GPS coordinates.
+
+    Returns: {total, returned, offset, note?, persons: [...]}
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -26,7 +28,7 @@ def list_persons() -> list:
             "source": attrs.get("source"),
             "last_changed": s.get("last_changed"),
         })
-    return sorted(persons, key=lambda x: x["name"])
+    return envelope(sorted(persons, key=lambda x: x["name"]), key="persons")
 
 
 @mcp.tool()
@@ -43,6 +45,9 @@ def create_person(
                      (use list_users via WS or leave empty for persons without accounts)
     device_trackers: list of device_tracker entity_ids to track this person's location,
                      e.g. ['device_tracker.jane_phone', 'device_tracker.jane_tablet']
+
+    Returns the created person object from Home Assistant, or an error()
+    envelope on failure.
     """
     msg: dict = {"type": "person/create", "name": name}
     if user_id:
@@ -50,10 +55,9 @@ def create_person(
     if device_trackers:
         msg["device_trackers"] = device_trackers
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", result)
+    if err := ws_error(result):
+        return err
+    return result["result"]
 
 
 @mcp.tool()
@@ -71,6 +75,9 @@ def update_person(
     name:            new display name (leave empty to keep current)
     user_id:         HA user ID to link (pass empty string to unlink)
     device_trackers: new list of device_tracker entity_ids (replaces current list)
+
+    Returns the updated person object from Home Assistant, or an error()
+    envelope on failure.
     """
     msg: dict = {"type": "person/update", "person_id": person_id}
     if name:
@@ -80,10 +87,9 @@ def update_person(
     if device_trackers is not None:
         msg["device_trackers"] = device_trackers
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", result)
+    if err := ws_error(result):
+        return err
+    return result["result"]
 
 
 @mcp.tool()
@@ -95,9 +101,15 @@ def delete_person(person_id: str) -> dict:
                Use list_persons() to find entity_ids, then strip 'person.' prefix.
 
     Note: only persons created via the UI (not imported from HA user accounts) can be deleted.
+
+    ⚠️ This is irreversible. Any zone/presence automation keyed on this
+    person stops matching it.
+
+    Returns: {deleted: person_id, success: true} on success, or an
+    error() envelope with Home Assistant's actual error code/message on
+    failure.
     """
     result = _ws({"type": "person/delete", "person_id": person_id})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
+    if err := ws_error(result):
+        return err
     return {"deleted": person_id, "success": True}

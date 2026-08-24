@@ -1,0 +1,329 @@
+import pytest
+
+from tools._base import (
+    confirm_entity_exists, entity_area_map, envelope, error, observe_actuation, ws_error,
+)
+
+
+def test_wraps_a_collection_under_a_named_key():
+    result = envelope([{"a": 1}, {"a": 2}], key="lights")
+
+    assert result == {"total": 2, "returned": 2, "offset": 0,
+                      "lights": [{"a": 1}, {"a": 2}]}
+
+
+def test_empty_collection_says_so_instead_of_vanishing():
+    result = envelope([], key="repairs")
+
+    assert result["total"] == 0
+    assert result["repairs"] == []
+    assert result["note"] == "no repairs found"
+
+
+def test_truncation_is_announced():
+    rows = [{"n": n} for n in range(140)]
+
+    result = envelope(rows, key="automations", limit=3)
+
+    assert result["total"] == 140
+    assert result["returned"] == 3
+    assert [row["n"] for row in result["automations"]] == [0, 1, 2]
+    assert "3 of 140" in result["note"]
+
+
+def test_truncation_note_does_not_advise_advancing_an_offset_by_default():
+    """Most callers of envelope() with a `limit` have no `offset` parameter
+    at all - offset is always 0 for them, since they never pass one through.
+    Advising "advance offset" there tells the caller to turn a knob the
+    tool does not expose."""
+    rows = [{"n": n} for n in range(140)]
+
+    result = envelope(rows, key="automations", limit=3)
+
+    assert "advance offset" not in result["note"]
+    assert "raise limit" in result["note"]
+
+
+def test_truncation_note_advises_advancing_an_offset_when_the_tool_has_one():
+    rows = [{"n": n} for n in range(140)]
+
+    result = envelope(rows, key="automations", limit=3, offset_paginated=True)
+
+    assert "advance offset" in result["note"]
+
+
+def test_offset_pages_without_losing_the_total():
+    rows = [{"n": n} for n in range(10)]
+
+    result = envelope(rows, key="rows", limit=3, offset=6)
+
+    assert result["total"] == 10
+    assert result["offset"] == 6
+    assert [row["n"] for row in result["rows"]] == [6, 7, 8]
+
+
+def test_limit_zero_means_no_limit():
+    rows = [{"n": n} for n in range(10)]
+
+    result = envelope(rows, key="rows", limit=0)
+
+    assert result["returned"] == 10
+    assert "note" not in result
+
+
+def test_explicit_total_means_the_caller_already_paginated():
+    """Home Assistant sometimes applies the limit server-side."""
+    result = envelope([{"n": 1}], key="rows", total=99)
+
+    assert result["total"] == 99
+    assert result["returned"] == 1
+    assert "1 of 99" in result["note"]
+
+
+def test_a_caller_supplied_note_wins():
+    result = envelope([], key="rows", note="the Scheduler component is absent")
+
+    assert result["note"] == "the Scheduler component is absent"
+
+
+def test_error_has_no_collection_key():
+    result = error("not_found", "No such automation")
+
+    assert result == {"error": "not_found", "detail": "No such automation"}
+
+
+def test_error_carries_extra_context():
+    result = error("not_found", "gone", entity_id="automation.x")
+
+    assert result["entity_id"] == "automation.x"
+
+
+def test_ws_error_passes_a_successful_frame_through():
+    frame = {"id": 1, "type": "result", "success": True, "result": [1, 2]}
+
+    assert ws_error(frame) is None
+
+
+def test_ws_error_reports_a_home_assistant_failure():
+    frame = {"id": 1, "type": "result", "success": False,
+             "error": {"code": "not_found", "message": "Unknown command"}}
+
+    assert ws_error(frame) == {"error": "not_found", "detail": "Unknown command"}
+
+
+def test_ws_error_reports_a_transport_failure():
+    """_base._ws returns this shape when authentication fails."""
+    frame = {"error": "Auth failed: {'type': 'auth_invalid'}"}
+
+    result = ws_error(frame)
+
+    assert result["error"] == "websocket_error"
+    assert "auth_invalid" in result["detail"]
+
+
+def test_ws_error_reports_a_missing_frame():
+    """ws_error defends against a malformed or absent response."""
+    result = ws_error(None)
+
+    assert result["error"] == "bad_response"
+
+
+def test_the_last_page_is_not_reported_as_truncated():
+    rows = [{"n": n} for n in range(10)]
+
+    result = envelope(rows, key="rows", limit=5, offset=8)
+
+    assert result["returned"] == 2
+    assert result["total"] == 10
+    assert "note" not in result
+
+
+def test_offset_past_the_end_is_announced():
+    """An offset beyond the collection used to fall through both note
+    branches: count != 0 skips "no {key} found", and offset + len(page) <
+    count is false once page is empty (offset + 0 is not less than count).
+    The result was an empty page with no note at all - indistinguishable
+    from a bug rather than a caller-supplied offset with nothing left."""
+    rows = [{"n": n} for n in range(3)]
+
+    result = envelope(rows, key="rows", offset=10)
+
+    assert result["total"] == 3
+    assert result["returned"] == 0
+    assert result["rows"] == []
+    assert "note" in result
+    assert "offset 10" in result["note"]
+
+
+def test_total_and_limit_together_are_refused():
+    with pytest.raises(ValueError):
+        envelope([{"n": 1}], key="rows", total=99, limit=10)
+
+
+def test_success_without_result_key_is_an_error():
+    frame = {"id": 1, "type": "result", "success": True}
+
+    result = ws_error(frame)
+
+    assert result["error"] == "bad_response"
+    assert "result" in result["detail"]
+
+
+# ---- entity_area_map() ------------------------------------------------------
+# An entity's area is its own area_id when set, and otherwise its device's -
+# reading only the entity registry misses the second case, which on a real
+# installation is most entities.
+
+def test_entity_area_map_prefers_the_entitys_own_area(fake_ha):
+    fake_ha.registry = [
+        {"entity_id": "light.kitchen", "area_id": "kitchen", "device_id": "dev1"},
+    ]
+    fake_ha.devices = [{"id": "dev1", "area_id": "some_other_area"}]
+
+    area_map, err = entity_area_map()
+
+    assert err is None
+    assert area_map["light.kitchen"] == "kitchen"
+
+
+def test_entity_area_map_falls_back_to_the_devices_area(fake_ha):
+    fake_ha.registry = [
+        {"entity_id": "light.garage", "area_id": None, "device_id": "dev1"},
+    ]
+    fake_ha.devices = [{"id": "dev1", "area_id": "garage"}]
+
+    area_map, err = entity_area_map()
+
+    assert err is None
+    assert area_map["light.garage"] == "garage"
+
+
+def test_entity_area_map_reports_no_area_for_an_entity_with_neither(fake_ha):
+    fake_ha.registry = [
+        {"entity_id": "light.attic", "area_id": None, "device_id": None},
+    ]
+    fake_ha.devices = []
+
+    area_map, err = entity_area_map()
+
+    assert err is None
+    assert area_map["light.attic"] is None
+
+
+def test_entity_area_map_reports_an_entity_registry_failure(fake_ha):
+    fake_ha.fail_ws("config/entity_registry/list", code="unauthorized",
+                    message="Admin required")
+
+    area_map, err = entity_area_map()
+
+    assert area_map == {}
+    assert err["error"] == "unauthorized"
+
+
+def test_entity_area_map_reports_a_device_registry_failure(fake_ha):
+    fake_ha.fail_ws("config/device_registry/list", code="unauthorized",
+                    message="Admin required")
+
+    area_map, err = entity_area_map()
+
+    assert area_map == {}
+    assert err["error"] == "unauthorized"
+
+
+def test_entity_area_map_accepts_pre_fetched_entities_and_skips_that_call(fake_ha):
+    """A caller that already fetched the entity registry for its own
+    purposes (labels, platform, ...) can pass the rows through to avoid a
+    second WS round trip for the same data."""
+    fake_ha.devices = [{"id": "dev1", "area_id": "office"}]
+
+    entities = [{"entity_id": "sensor.plug", "area_id": None, "device_id": "dev1"}]
+    area_map, err = entity_area_map(entities=entities)
+
+    assert err is None
+    assert area_map["sensor.plug"] == "office"
+    assert [c["type"] for c in fake_ha.ws_calls] == ["config/device_registry/list"]
+
+
+# ---- confirm_entity_exists() ------------------------------------------------
+# Guards a call with nothing to read back afterward: Home Assistant accepts
+# and 200s a service call aimed at an entity_id that does not exist, so this
+# is the only way such a tool learns the target was never real.
+
+def test_confirm_entity_exists_is_silent_for_a_real_entity(fake_ha):
+    assert confirm_entity_exists("light.kitchen") is None
+
+
+def test_confirm_entity_exists_reports_a_missing_entity(fake_ha):
+    result = confirm_entity_exists("light.ghost")
+
+    assert result["error"] == "entity_not_found"
+    assert result["entity_id"] == "light.ghost"
+
+
+def test_confirm_entity_exists_raises_on_a_transport_failure(fake_ha):
+    """A failed check must surface as an exception, not be folded into
+    "does not exist" - the two are different claims."""
+    import httpx
+
+    fake_ha.fail_rest("/api/states/light.kitchen", status=401, message="Unauthorized")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        confirm_entity_exists("light.kitchen")
+
+
+# ---- observe_actuation() ----------------------------------------------------
+# The discriminator between "Home Assistant accepted the call" and "the call
+# did what it said" - always re-reads the entity's own state rather than
+# trusting the service call's own (possibly empty, possibly stale) response.
+
+def test_observe_actuation_reports_a_matched_read_back(fake_ha):
+    result = observe_actuation("light.kitchen", lambda s: s["state"] == "on")
+
+    assert result == {"exists": True, "verified": True,
+                      "state": {"entity_id": "light.kitchen", "state": "on",
+                                "attributes": {"friendly_name": "Kitchen", "brightness": 200}}}
+
+
+def test_observe_actuation_reports_accepted_but_unverified(fake_ha):
+    """The entity exists but never reaches the expected state within
+    `retries` - accepted, but the effect was not observed (a jammed lock,
+    an offline device)."""
+    result = observe_actuation("light.study", lambda s: s["state"] == "on")
+
+    assert result["exists"] is True
+    assert result["verified"] is False
+    assert result["state"]["state"] == "off"
+
+
+def test_observe_actuation_reports_a_missing_entity(fake_ha):
+    """The service call was still accepted - Home Assistant does not
+    reject a call aimed at a nonexistent entity_id - so this is the only
+    way to learn the target never existed."""
+    result = observe_actuation("light.ghost", lambda s: s["state"] == "on")
+
+    assert result == {"exists": False, "verified": False, "state": None}
+
+
+def test_observe_actuation_retries_before_giving_up(fake_ha):
+    """A lock or a cover with simulated travel time may not have settled by
+    the first read - the retry exists for exactly this."""
+    fake_ha.sequence_states("lock.front_door", [
+        {"entity_id": "lock.front_door", "state": "locking", "attributes": {}},
+        {"entity_id": "lock.front_door", "state": "locked", "attributes": {}},
+    ])
+
+    result = observe_actuation("lock.front_door", lambda s: s["state"] == "locked")
+
+    assert result["verified"] is True
+    assert result["state"]["state"] == "locked"
+
+
+def test_observe_actuation_never_trusts_an_empty_service_response(fake_ha):
+    """Home Assistant returns only the states that changed, so an
+    idempotent call (turning on an already-on light) legitimately returns
+    200 [] - that must never be read as failure. observe_actuation() does
+    not even look at the service call's response; it goes back to the
+    entity's own state."""
+    result = observe_actuation("light.kitchen", lambda s: s["state"] == "on")
+
+    assert result["verified"] is True

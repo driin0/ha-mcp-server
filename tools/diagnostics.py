@@ -1,7 +1,10 @@
 import httpx
 from datetime import datetime, timedelta, timezone
 
-from tools._base import mcp, HA_URL, HEADERS, default_language, _ws, _ws_multi
+from tools._base import (
+    mcp, HA_URL, HEADERS, default_language, entity_area_map, _ws, _ws_multi,
+    envelope, ws_error,
+)
 
 
 @mcp.tool()
@@ -23,7 +26,12 @@ def get_config() -> dict:
 
 @mcp.tool()
 def get_entity(entity_id: str) -> dict:
-    """Get the current state and attributes of a single entity by entity_id."""
+    """Get the current state and attributes of a single entity by entity_id.
+
+    ⚠️ third-party-settable: `attributes.friendly_name` is settable by any
+    integration that names its own entities, not just this installation's
+    owner - see tools/_base.py's "Third-party-settable fields" note.
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states/{entity_id}", headers=HEADERS, timeout=10)
         r.raise_for_status()
@@ -38,16 +46,23 @@ def get_entity(entity_id: str) -> dict:
 
 
 @mcp.tool()
-def get_states_by_domain(domain: str) -> list:
+def get_states_by_domain(domain: str) -> dict:
     """
     Get all entity states for a given domain.
     Examples: 'light', 'switch', 'sensor', 'binary_sensor', 'climate',
               'media_player', 'automation', 'script', 'scene', 'person'
+
+    Returns: {total, returned, offset, note?, entities: [{entity_id, name,
+             state, attributes, last_changed}]}
+
+    ⚠️ third-party-settable: `name` is an entity's `friendly_name`, settable
+    by any integration that names its own entities - see tools/_base.py's
+    "Third-party-settable fields" note.
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
-        return [
+        out = [
             {
                 "entity_id": s["entity_id"],
                 "name": s.get("attributes", {}).get("friendly_name", ""),
@@ -58,11 +73,19 @@ def get_states_by_domain(domain: str) -> list:
             for s in r.json()
             if s["entity_id"].startswith(f"{domain}.")
         ]
+    return envelope(out, key="entities")
 
 
 @mcp.tool()
-def get_history(entity_id: str, hours: int = 24) -> list:
-    """Get state history for an entity over the last N hours (default 24)."""
+def get_history(entity_id: str, hours: int = 24) -> dict:
+    """
+    Get state history for an entity over the last N hours (default 24).
+
+    Returns: {total, returned, note?, history: [...]}
+
+    A series is not paginated by offset - if it is too short or too long,
+    narrow it with `hours` instead.
+    """
     start = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     with httpx.Client() as client:
         r = client.get(
@@ -73,14 +96,19 @@ def get_history(entity_id: str, hours: int = 24) -> list:
         )
         r.raise_for_status()
         result = r.json()
-        return result[0] if result else []
+        series = result[0] if result else []
+    return envelope(series, key="history",
+                    note="" if series else "no history in the window - widen `hours`")
 
 
 @mcp.tool()
-def get_logbook(hours: int = 6, entity_id: str = "") -> list:
+def get_logbook(hours: int = 6, entity_id: str = "") -> dict:
     """
     Get the logbook (events and state changes) for the last N hours (default 6).
     Optionally filter by entity_id to reduce output size.
+
+    Returns: {total, returned, offset, note?, events: [{when, domain, name,
+             message, entity_id}]}
     """
     start = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     params = {}
@@ -95,17 +123,18 @@ def get_logbook(hours: int = 6, entity_id: str = "") -> list:
         )
         r.raise_for_status()
         entries = r.json()
-        return [
-            {
-                "when": e.get("when", "")[:16],
-                "domain": e.get("domain", ""),
-                "name": e.get("name", ""),
-                "message": e.get("message", ""),
-                "entity_id": e.get("entity_id", ""),
-            }
-            for e in entries
-            if e.get("domain")
-        ]
+    events = [
+        {
+            "when": e.get("when", "")[:16],
+            "domain": e.get("domain", ""),
+            "name": e.get("name", ""),
+            "message": e.get("message", ""),
+            "entity_id": e.get("entity_id", ""),
+        }
+        for e in entries
+        if e.get("domain")
+    ]
+    return envelope(events, key="events")
 
 
 @mcp.tool()
@@ -181,7 +210,16 @@ def process_conversation(text: str, language: str = "") -> dict:
     text: natural language command, e.g. "turn on the living room lights"
     language: language code; defaults to the language configured in Home Assistant
 
-    The response contains the agent's reply and any actions taken.
+    ⚠️ This can execute anything Home Assistant's conversation agent
+    understands as a command - "turn off the lights" and "unlock the front
+    door" are both plausible `text` values, and this tool has no
+    confirmation step of its own between accepting `text` and acting on it.
+
+    Returns: {speech, response_type, language} - the agent's spoken reply
+    and what kind of response it was ("action_done", "query_answer",
+    "error", ...), not a structured list of what changed. Check the
+    affected entities' own state afterward to confirm what actually
+    happened, the same way any call_service()-shaped action is verified.
     """
     language = language or default_language()
     with httpx.Client() as client:
@@ -210,7 +248,16 @@ def trigger_webhook(webhook_id: str, data: dict = None, method: str = "post") ->
     data: optional JSON payload to send with the webhook
     method: 'post' (default) or 'get'
 
-    Note: the webhook must be configured in HA to allow external access.
+    Returns: {webhook_id, status_code, accepted, detail}. Home Assistant
+    answers a registered and an unregistered webhook_id with an identical
+    2xx response — measured live, a nonexistent webhook_id gets the same
+    200 as a real one — so `accepted` (status_code < 300) confirms only
+    that the HTTP request reached Home Assistant, never that this
+    webhook_id exists or that anything it triggers actually ran. This tool
+    used to report a `triggered: true` field computed the same way, which
+    claimed exactly the thing a 2xx here cannot establish; check the
+    webhook's actual effect (an automation's last_triggered, a script's
+    state) to confirm it fired.
     """
     with httpx.Client() as client:
         url = f"{HA_URL}/api/webhook/{webhook_id}"
@@ -218,8 +265,15 @@ def trigger_webhook(webhook_id: str, data: dict = None, method: str = "post") ->
             r = client.get(url, headers=HEADERS, params=data or {}, timeout=10)
         else:
             r = client.post(url, headers=HEADERS, json=data or {}, timeout=10)
-        # Webhooks return 200 with empty body or 200 with JSON — both are valid
-        return {"webhook_id": webhook_id, "status_code": r.status_code, "triggered": r.status_code < 300}
+        return {
+            "webhook_id": webhook_id,
+            "status_code": r.status_code,
+            "accepted": r.status_code < 300,
+            "detail": "Home Assistant returns an identical response for a "
+                      "registered and an unregistered webhook_id, so this "
+                      "confirms only that the request was accepted - not "
+                      "that the webhook exists or that anything happened.",
+        }
 
 
 @mcp.tool()
@@ -256,6 +310,29 @@ def fire_event(event_type: str, event_data: dict = None) -> dict:
 
     Useful for triggering automations that listen on custom events, or for testing
     event-based automations.
+
+    ⚠️ Any automation listening on `event_type` runs whatever it is
+    configured to do - this tool has no way to know what that is, and
+    firing a system event Home Assistant itself relies on (rather than a
+    custom one) can trigger built-in behaviour, not just user automations.
+
+    Returns: {fired: true, event_type, event_data}. Confirms only that
+    Home Assistant accepted the event onto its bus, not that any listener
+    ran or what it did - check the affected entities/automations
+    afterward, the same way any call_service()-shaped action is verified.
+
+    `fired` is a bespoke key rather than this codebase's usual
+    `accepted`/`verified` shape - deliberately, not an oversight. That pair
+    exists for a claim that is genuinely uncertain (Home Assistant accepts
+    and 200s a service call aimed at an entity that does not exist, so
+    "accepted" and "worked" have to be told apart - see
+    confirm_entity_exists()/observe_actuation() in tools/_base.py).
+    POST /api/events/<type> has no equivalent ambiguity: there is no
+    registry of valid event types to be silently accepted-but-ignored
+    against, so a 200 response is a fully confirmed fact - the event did
+    reach the bus - not a hedge. `fired: true` says exactly that and no
+    more; folding it into `accepted`/`verified: null` would understate a
+    claim this call can actually back up.
     """
     with httpx.Client() as client:
         r = client.post(
@@ -269,7 +346,7 @@ def fire_event(event_type: str, event_data: dict = None) -> dict:
 
 
 @mcp.tool()
-def list_entities_by_integration(integration: str, search: str = "", limit: int = 0) -> list:
+def list_entities_by_integration(integration: str, search: str = "", limit: int = 0) -> dict:
     """
     List all entities belonging to a specific integration (platform).
 
@@ -277,13 +354,32 @@ def list_entities_by_integration(integration: str, search: str = "", limit: int 
     search: optional substring filter on entity_id or name (case-insensitive)
     limit: max results to return (0 = no limit)
 
-    Returns entity_id, name, area_id for each matching entity.
+    Returns: {total, returned, offset, note?, entities: [{entity_id, name,
+             platform, area_id, disabled}]}
     Useful to discover which entities come from a specific integration or remote HA instance.
     """
     result = _ws({"type": "config/entity_registry/list"})
-    entities = result.get("result", [])
+    if err := ws_error(result):
+        return err
+
+    # area_id below is enrichment, not a filter - this tool has no area_id
+    # parameter - so a failed device-registry read degrades to the
+    # entity-registry-only view (area_map stays empty, area_map.get() then
+    # falls back to the raw, own-area-only value) rather than aborting the
+    # whole call. It still has to say so: a silently empty/wrong area_id on
+    # every row is the same class of fault entity_area_map() exists to fix.
+    area_map, area_err = entity_area_map(entities=result["result"])
+    degraded_note = ""
+    if area_err:
+        area_map = {}
+        degraded_note = (
+            "device registry unavailable - area_id reflects only entities "
+            "with their own area assignment, not those inheriting one from "
+            "their device"
+        )
+
     out = []
-    for e in entities:
+    for e in result["result"]:
         if e.get("platform") != integration:
             continue
         name = e.get("name") or e.get("original_name", "")
@@ -293,12 +389,16 @@ def list_entities_by_integration(integration: str, search: str = "", limit: int 
             "entity_id": e["entity_id"],
             "name": name,
             "platform": e.get("platform"),
-            "area_id": e.get("area_id"),
+            "area_id": area_map.get(e["entity_id"], e.get("area_id")),
             "disabled": e.get("disabled_by") is not None,
         })
-        if limit and len(out) >= limit:
-            break
-    return out
+    out.sort(key=lambda x: x["entity_id"])
+    out_result = envelope(out, key="entities", limit=limit)
+    if degraded_note:
+        out_result["note"] = (
+            f"{out_result['note']} {degraded_note}" if out_result.get("note") else degraded_note
+        )
+    return out_result
 
 
 @mcp.tool()
@@ -309,6 +409,15 @@ def get_live_context() -> dict:
     Includes: who's home, lights on, alarm state, active media players,
     open covers, climate summary, and any active alerts/warnings.
     Useful as a quick situational overview before issuing commands.
+
+    ⚠️ third-party-settable: every `name` field here is an entity's
+    `friendly_name` - settable by any integration that names its own
+    entities (a guest's phone, a Chromecast), not just this installation's
+    owner. `media_title`/`media_artist` are settable by anyone who can cast
+    to a speaker, no Home Assistant account or LAN credentials required.
+    Both channels can carry arbitrary text into a model's context; see
+    tools/_base.py's "Third-party-settable fields" note for what this means
+    and why this server does not try to detect or filter it.
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -399,6 +508,9 @@ def get_live_context() -> dict:
     }
 
 
+_MAX_DEPENDENCY_PROBES = 200
+
+
 @mcp.tool()
 def get_entity_dependencies(entity_id: str) -> dict:
     """
@@ -407,8 +519,17 @@ def get_entity_dependencies(entity_id: str) -> dict:
     Searches through the full config of each automation and script (triggers,
     conditions, actions). Useful before renaming or deleting an entity.
 
-    Returns: {entity_id, automations: [...], scripts: [...], total_searched}
-    Note: searches up to 200 automations and 200 scripts in parallel.
+    Returns: {entity_id, automations: [...], scripts: [...],
+             total_automations_searched, total_scripts_searched,
+             failed_checks, note?}
+    Note: searches up to 200 automations and 200 scripts in parallel. An
+    instance with more than that gets a note saying the search was capped -
+    even when every probe that ran succeeded and found nothing, since a
+    clean empty result and an incomplete search look identical otherwise.
+    failed_checks counts probes that could not be completed (an
+    authorisation failure, a deleted config entry, a network error) - those
+    are not evidence the entity is unreferenced, and a non-zero count comes
+    with a note saying the result may be incomplete.
     """
     import concurrent.futures
     import json as _json
@@ -422,79 +543,126 @@ def get_entity_dependencies(entity_id: str) -> dict:
     scripts = [s for s in all_states if s["entity_id"].startswith("script.")]
 
     def _check_automation(state):
+        """Returns (match_or_None, ok). ok is False when the probe itself
+        could not be completed - a non-200 or a raised exception - which
+        must not be read as "this automation does not reference the
+        entity"."""
         slug = state["entity_id"].removeprefix("automation.")
         auto_id = state.get("attributes", {}).get("id") or slug
         try:
             with httpx.Client() as c:
                 r = c.get(f"{HA_URL}/api/config/automation/config/{auto_id}", headers=HEADERS, timeout=5)
                 if r.status_code != 200:
-                    return None
+                    return None, False
                 if entity_id in _json.dumps(r.json()):
                     return {
                         "entity_id": state["entity_id"],
                         "name": state.get("attributes", {}).get("friendly_name", state["entity_id"]),
                         "type": "automation",
-                    }
+                    }, True
         except Exception:
-            pass
-        return None
+            # Broad on purpose: one unreadable automation config must not
+            # crash the whole dependency search. The failure is no longer
+            # discarded, though - it is counted as a failed check below.
+            return None, False
+        return None, True
 
     def _check_script(state):
+        """See _check_automation: same (match_or_None, ok) contract."""
         slug = state["entity_id"].removeprefix("script.")
         try:
             with httpx.Client() as c:
                 r = c.get(f"{HA_URL}/api/config/script/config/{slug}", headers=HEADERS, timeout=5)
                 if r.status_code != 200:
-                    return None
+                    return None, False
                 if entity_id in _json.dumps(r.json()):
                     return {
                         "entity_id": state["entity_id"],
                         "name": state.get("attributes", {}).get("friendly_name", state["entity_id"]),
                         "type": "script",
-                    }
+                    }, True
         except Exception:
-            pass
-        return None
+            return None, False
+        return None, True
 
     dep_automations, dep_scripts = [], []
+    failed_checks = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
-        for res in pool.map(_check_automation, automations[:200]):
+        for res, ok in pool.map(_check_automation, automations[:_MAX_DEPENDENCY_PROBES]):
             if res:
                 dep_automations.append(res)
-        for res in pool.map(_check_script, scripts[:200]):
+            if not ok:
+                failed_checks += 1
+        for res, ok in pool.map(_check_script, scripts[:_MAX_DEPENDENCY_PROBES]):
             if res:
                 dep_scripts.append(res)
+            if not ok:
+                failed_checks += 1
 
-    return {
+    capped = (len(automations) > _MAX_DEPENDENCY_PROBES
+              or len(scripts) > _MAX_DEPENDENCY_PROBES)
+
+    result = {
         "entity_id": entity_id,
         "automations": sorted(dep_automations, key=lambda x: x["name"]),
         "scripts": sorted(dep_scripts, key=lambda x: x["name"]),
-        "total_automations_searched": len(automations),
-        "total_scripts_searched": len(scripts),
+        "total_automations_searched": min(len(automations), _MAX_DEPENDENCY_PROBES),
+        "total_scripts_searched": min(len(scripts), _MAX_DEPENDENCY_PROBES),
+        "failed_checks": failed_checks,
     }
+    # This tool is typically called right before renaming or deleting an
+    # entity, so an instance with more automations/scripts than the probe
+    # limit must say so even when every probe that did run succeeded - a
+    # clean empty result with no note here used to look like a confirmed
+    # "nothing references this entity" when it was really "not everything
+    # was checked."
+    notes = []
+    if capped:
+        notes.append(
+            f"only the first {_MAX_DEPENDENCY_PROBES} automations and "
+            f"{_MAX_DEPENDENCY_PROBES} scripts were searched, out of "
+            f"{len(automations)} automation(s) and {len(scripts)} script(s) "
+            "that exist - references beyond that limit would be missed"
+        )
+    if failed_checks:
+        notes.append(
+            f"{failed_checks} probe(s) could not be completed - the result "
+            "may be incomplete"
+        )
+    if notes:
+        result["note"] = " ".join(notes)
+    return result
 
 
 @mcp.tool()
-def get_entity_exposure() -> list:
+def get_entity_exposure() -> dict:
     """
     List which entities are exposed to Home Assistant voice assistants
     (Assist, Alexa, Google Assistant, etc.).
 
-    Returns: [{entity_id, assistants: {assist: bool, amazon_alexa: bool, google_assistant: bool}}]
+    Returns: {total, returned, offset, note?, entities: [{entity_id,
+             assistants: {<assistant_id>: bool, ...}}]}
     Only returns entities with at least one exposure setting configured.
+    assistant_id is whatever Home Assistant itself calls that integration -
+    typically "conversation" for Assist, "cloud.alexa" and
+    "cloud.google_assistant" for the Nabu Casa cloud integrations - passed
+    through unchanged rather than remapped to a fixed set of names, since
+    that set is not part of any stable API.
+    Home Assistant does not support filtering this list by entity_id: it
+    always reports every exposed entity.
     Useful to audit what the voice assistant can control.
     """
-    result = _ws({"type": "conversation/expose_entity/list"})
-    exposed = (result.get("result") or {}).get("exposed_entities", [])
-    out = []
-    for e in exposed:
-        assistants = e.get("assistants", {})
-        if assistants:
-            out.append({
-                "entity_id": e.get("entity_id"),
-                "assistants": assistants,
-            })
-    return sorted(out, key=lambda x: x["entity_id"])
+    result = _ws({"type": "homeassistant/expose_entity/list"})
+    if err := ws_error(result):
+        return err
+    exposed = (result["result"] or {}).get("exposed_entities", {})
+    out = [
+        {"entity_id": entity_id, "assistants": assistants}
+        for entity_id, assistants in exposed.items()
+        if assistants
+    ]
+    out.sort(key=lambda x: x["entity_id"])
+    return envelope(out, key="entities")
 
 
 @mcp.tool()
@@ -505,7 +673,7 @@ def search_entities(
     label: str = "",
     state: str = "",
     limit: int = 50,
-) -> list:
+) -> dict:
     """
     Search for entities across all domains using multiple filters simultaneously.
 
@@ -517,7 +685,11 @@ def search_entities(
     state:   filter by exact state value, e.g. 'on', 'off', 'unavailable', '23.5'
     limit:   max results to return (default 50)
 
-    Returns: [{entity_id, name, domain, state, area_id, labels}]
+    Returns: {total, returned, offset, note?, entities: [{entity_id, name,
+             domain, state, area_id, labels}]}
+
+    `total` counts every entity that matched the filters, not just the page
+    returned - raise `limit` or narrow the filters when it exceeds `returned`.
 
     Examples:
       Find all temperature sensors in the living room:
@@ -526,10 +698,26 @@ def search_entities(
         domain='light', state='on'
       Find entities carrying a given label:
         label='outdoor'
+
+    ⚠️ third-party-settable: `name` is an entity's `friendly_name`, settable
+    by any integration that names its own entities - see tools/_base.py's
+    "Third-party-settable fields" note.
     """
     # Fetch states and entity registry in parallel
     ws_result = _ws({"type": "config/entity_registry/list"})
-    registry = {e["entity_id"]: e for e in ws_result.get("result", [])}
+    if err := ws_error(ws_result):
+        return err
+    registry = {e["entity_id"]: e for e in ws_result["result"]}
+
+    # A registry read failure has always been fatal here, regardless of
+    # which filters were passed - the `labels` field on every output row
+    # depends on it too. The device registry backs the same area_id (both
+    # the filter below and the field reported on each row), so a failure
+    # reading it is treated the same way rather than silently falling back
+    # to the entity-only, device-inheritance-blind value.
+    area_map, err = entity_area_map(entities=ws_result["result"])
+    if err:
+        return err
 
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -549,7 +737,7 @@ def search_entities(
             continue
         if state and s["state"] != state:
             continue
-        if area_id and reg_entry.get("area_id") != area_id:
+        if area_id and area_map.get(eid) != area_id:
             continue
         if label and label not in reg_entry.get("labels", []):
             continue
@@ -561,13 +749,12 @@ def search_entities(
             "name": name,
             "domain": eid_domain,
             "state": s["state"],
-            "area_id": reg_entry.get("area_id"),
+            "area_id": area_map.get(eid),
             "labels": list(reg_entry.get("labels", [])),
         })
-        if len(out) >= limit:
-            break
 
-    return out
+    out.sort(key=lambda x: x["entity_id"])
+    return envelope(out, key="entities", limit=limit)
 
 
 @mcp.tool()
@@ -581,19 +768,31 @@ def get_system_health() -> dict:
     Useful for diagnosing connectivity issues with specific integrations.
     """
     result = _ws({"type": "system_health/info"})
-    if result.get("success", True) and result.get("result"):
+    if err := ws_error(result):
+        # An add-on/Supervisor-proxied connection can reject this command
+        # outright rather than just returning an empty result for it; any
+        # other failure (auth, permissions, timeout-shaped) is a different
+        # problem and must not be reported as a proxy limitation — see
+        # tools/hacs.py's _hacs_check for the same distinction made for HACS.
+        if err.get("error") not in ("unknown_command", "not_found"):
+            return err
+    else:
         data = result["result"]
-        # Flatten nested structure: {domain: {info: {key: value|{type,error}}}}
-        out = {}
-        for domain, section in data.items():
-            info = section.get("info", {}) if isinstance(section, dict) else {}
-            out[domain] = {
-                k: v if not isinstance(v, dict) else f"[{v.get('type', 'error')}] {v.get('error', '')}"
-                for k, v in info.items()
-            }
-        return out
+        if data:
+            # Flatten nested structure: {domain: {info: {key: value|{type,error}}}}
+            out = {}
+            for domain, section in data.items():
+                info = section.get("info", {}) if isinstance(section, dict) else {}
+                out[domain] = {
+                    k: v if not isinstance(v, dict) else f"[{v.get('type', 'error')}] {v.get('error', '')}"
+                    for k, v in info.items()
+                }
+            return out
+        # success but no data — the same Supervisor-proxy limitation the
+        # unknown_command branch above handles, just shaped differently.
 
-    # Fallback: WS returns null via Supervisor proxy — return basic info from REST config
+    # Fallback: system_health/info unavailable on this connection — return
+    # basic info from REST config instead.
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/config", headers=HEADERS, timeout=10)
         r.raise_for_status()
@@ -610,7 +809,7 @@ def get_system_health() -> dict:
 
 
 @mcp.tool()
-def call_service(domain: str, service: str, entity_id: str = "", service_data: dict = None) -> list:
+def call_service(domain: str, service: str, entity_id: str = "", service_data: dict = None) -> dict:
     """
     Call any Home Assistant service.
 
@@ -619,6 +818,25 @@ def call_service(domain: str, service: str, entity_id: str = "", service_data: d
     - Set brightness:  domain='light', service='turn_on', entity_id='light.living_room',
                        service_data={'brightness_pct': 80}
     - Reload config:   domain='homeassistant', service='reload_config_entry'
+
+    ⚠️ This reaches every service Home Assistant exposes, including every
+    one of the named, safety-warned tools elsewhere in this codebase -
+    domain='lock', service='unlock' is exactly lock_control(entity_id,
+    'unlock'), reached directly and without lock_control's own read-back
+    verification. The env-gated registration filter documented in
+    tools/_base.py (list_disabled_tools()) does not and cannot cover this
+    tool for that reason: gating a named tool while leaving call_service
+    enabled would not remove the capability, only the friendlier name for
+    it. Treat this tool as carrying the safety weight of whatever service
+    it is pointed at, not the weight of "call a service".
+
+    Returns: {result: ...} - the service's own JSON response, passed through
+    unexamined. Home Assistant services do not share one response shape (most
+    return the list of changed states, some return nothing, a few return a
+    service-specific payload), so this tool does not wrap, count, or sort
+    what comes back. A non-2xx response is still raised as an error like any
+    other tool - "opaque passthrough" only covers the shape of a successful
+    call, not whether the call succeeded at all.
     """
     data = dict(service_data) if service_data else {}
     if entity_id:
@@ -631,4 +849,4 @@ def call_service(domain: str, service: str, entity_id: str = "", service_data: d
             timeout=15,
         )
         r.raise_for_status()
-        return r.json()
+        return {"result": r.json()}

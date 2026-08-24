@@ -1,23 +1,30 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws
+from tools._base import mcp, HA_URL, HEADERS, _ws, envelope, ws_error
 
 
 @mcp.tool()
-def list_users() -> list:
+def list_users() -> dict:
     """
     List all Home Assistant user accounts.
 
-    Returns: [{id, name, is_admin, is_active, local_only, system_generated}]
+    Returns: {total, returned, offset, note?, users: [{id, name, is_admin,
+             is_active, local_only, system_generated}]}
     Requires admin privileges.
+
+    Always registered, unlike its three write counterparts
+    (create_user/update_user/delete_user), which are gated off by default
+    — see list_disabled_tools() for why and how to enable them. Listing
+    accounts is a read with no privilege-escalation shape of its own; it
+    stays available so a caller can still discover a user's id (needed by
+    update_user/delete_user) once that gate is turned on.
     """
     # WS config/auth/list — the correct command used by the HA frontend
     result = _ws({"type": "config/auth/list"})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return [{"error": err.get("code", "unknown"), "detail": err.get("message", "")}]
-    users = result.get("result", [])
-    return [
+    if err := ws_error(result):
+        return err
+    users = result["result"]
+    rows = [
         {
             "id": u.get("id"),
             "name": u.get("name"),
@@ -29,6 +36,7 @@ def list_users() -> list:
         for u in sorted(users, key=lambda x: (x.get("system_generated", False), (x.get("name") or "").lower()))
         if not u.get("system_generated")  # hide internal system accounts
     ]
+    return envelope(rows, key="users")
 
 
 @mcp.tool()
@@ -54,10 +62,9 @@ def create_user(
         "group_ids": ["system-admin"] if is_admin else ["system-users"],
         "local_only": local_only,
     })
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", {}).get("user", result.get("result", {}))
+    if err := ws_error(result):
+        return err
+    return result["result"].get("user", result["result"])
 
 
 @mcp.tool()
@@ -78,6 +85,9 @@ def update_user(
     local_only: restrict to local network only
 
     Only non-None fields are updated.
+
+    Returns the updated user object from Home Assistant, or an error()
+    envelope with Home Assistant's actual error code/message on failure.
     """
     msg: dict = {"type": "config/auth/update", "user_id": user_id}
     if name:
@@ -89,10 +99,9 @@ def update_user(
     if local_only is not None:
         msg["local_only"] = local_only
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", {}).get("user", result.get("result", {}))
+    if err := ws_error(result):
+        return err
+    return result["result"].get("user", result["result"])
 
 
 @mcp.tool()
@@ -103,9 +112,11 @@ def delete_user(user_id: str) -> dict:
     user_id: user ID (use list_users() to find it).
     ⚠️ This is irreversible. The user will lose access immediately.
     Cannot delete the owner account or your own account.
+
+    Returns: {deleted: user_id, success: true} on success, or an error()
+    envelope with Home Assistant's actual error code/message on failure.
     """
     result = _ws({"type": "config/auth/delete", "user_id": user_id})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
+    if err := ws_error(result):
+        return err
     return {"deleted": user_id, "success": True}

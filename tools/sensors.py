@@ -1,15 +1,18 @@
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, REMOTE_PREFIXES, _ws
+from tools._base import mcp, HA_URL, HEADERS, REMOTE_PREFIXES, entity_area_map, _ws, envelope
 
 
 @mcp.tool()
-def get_energy(include_zero: bool = False) -> list:
+def get_energy(include_zero: bool = False) -> dict:
     """
     Get current power consumption (W) for all power-measuring sensor entities,
     sorted from highest to lowest consumption.
 
     include_zero: if True, also include devices reporting 0W (default: False)
+
+    Returns: {total, returned, offset, note?, consumers: [{entity_id, name,
+             power_w, unit}]}
 
     Useful to answer "what is consuming the most power right now?"
     Requires smart plugs or energy monitors with power (W) sensors.
@@ -40,7 +43,8 @@ def get_energy(include_zero: bool = False) -> list:
             "unit": attrs.get("unit_of_measurement", "W"),
         })
 
-    return sorted(results, key=lambda x: x["power_w"], reverse=True)
+    results.sort(key=lambda x: x["power_w"], reverse=True)
+    return envelope(results, key="consumers")
 
 
 @mcp.tool()
@@ -85,11 +89,19 @@ def get_energy_summary() -> dict:
     area_result = _ws({"type": "config/area_registry/list"})
     areas = {a["area_id"]: a["name"] for a in area_result.get("result", [])}
 
-    entity_area_result = _ws({"type": "config/entity_registry/list"})
-    entity_area_map = {
-        e["entity_id"]: e.get("area_id")
-        for e in entity_area_result.get("result", [])
-    }
+    # The map is only used to group sensors, not to filter - this tool has
+    # no area_id parameter - so a failed read degrades to "other" for every
+    # sensor rather than aborting the whole summary. It still has to say
+    # so: a silently-empty grouping is the same class of fault this map
+    # exists to fix.
+    entity_areas, area_map_err = entity_area_map()
+    degraded_note = ""
+    if area_map_err:
+        entity_areas = {}
+        degraded_note = (
+            "entity/device registry unavailable - power sensors could not "
+            "be matched to an area and were placed under 'other'"
+        )
 
     # Configured remote prefixes (empty unless HA_REMOTE_PREFIXES is set)
     remote_prefixes = REMOTE_PREFIXES
@@ -109,7 +121,7 @@ def get_energy_summary() -> dict:
 
         # Local: look up area
         if group is None:
-            area_id = entity_area_map.get(eid)
+            area_id = entity_areas.get(eid)
             group = areas.get(area_id, "other") if area_id else "other"
 
         if group not in groups:
@@ -123,17 +135,27 @@ def get_energy_summary() -> dict:
 
     result = sorted(groups.values(), key=lambda x: x["total_w"], reverse=True)
     total = round(sum(g["total_w"] for g in result), 1)
-    return {"total_w": total, "groups": result}
+    out = {"total_w": total, "groups": result}
+    if degraded_note:
+        out["note"] = degraded_note
+    return out
 
 
 @mcp.tool()
-def list_sensors(domain: str = "sensor", search: str = "", limit: int = 100) -> list:
+def list_sensors(domain: str = "sensor", search: str = "", limit: int = 100) -> dict:
     """
     List sensor or binary_sensor entities.
 
     domain: 'sensor' (default) or 'binary_sensor'
     search: optional substring filter on name or entity_id
     limit: max results (default 100)
+
+    Returns: {total, returned, offset, note?, sensors: [{entity_id, name,
+             state, unit, device_class, state_class}]}
+
+    `total` counts every matching entity, not just the page returned - the
+    loop used to stop collecting at `limit` and so could never report a
+    total larger than it.
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -154,6 +176,5 @@ def list_sensors(domain: str = "sensor", search: str = "", limit: int = 100) -> 
             "device_class": attrs.get("device_class"),
             "state_class": attrs.get("state_class"),
         })
-        if len(results) >= limit:
-            break
-    return sorted(results, key=lambda x: x["name"])
+    results.sort(key=lambda x: x["name"])
+    return envelope(results, key="sensors", limit=limit)

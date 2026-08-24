@@ -1,32 +1,44 @@
-from tools._base import mcp, _ws
+from tools._base import mcp, _ws, envelope, ws_error
 
 
-def _dashboard_id(url_path: str) -> str:
+def _dashboard_id(url_path: str) -> tuple[str, dict | None]:
     """Resolve a dashboard url_path to the id the WebSocket API expects.
 
     The lovelace/dashboards/update and /delete commands are keyed by
     dashboard_id and reject url_path outright, while url_path is what a user
     sees and what list_dashboards() reports — so it is translated here.
+
+    Returns (dashboard_id, error_envelope_or_None). `result.get("result") or
+    []` used to fold a failed lovelace/dashboards/list read into an empty
+    list, so a dead connection looked exactly like "no dashboard has that
+    url_path" to both callers (update_dashboard, delete_dashboard) — they
+    reported not_found for a registry they never actually got to check.
+    Routing the read through ws_error() lets a genuine absence stay
+    not_found while a failure surfaces as itself.
     """
     result = _ws({"type": "lovelace/dashboards/list"})
-    for d in result.get("result") or []:
+    if err := ws_error(result):
+        return "", err
+    for d in result["result"]:
         if d.get("url_path") == url_path:
-            return d.get("id", "")
-    return ""
+            return d.get("id", ""), None
+    return "", None
 
 
 @mcp.tool()
-def list_dashboards() -> list:
+def list_dashboards() -> dict:
     """
     List all Lovelace dashboards configured in Home Assistant.
 
-    Returns: [{url_path, title, mode, icon, show_in_sidebar, require_admin}]
+    Returns: {total, returned, offset, note?, dashboards: [{url_path, title,
+             mode, icon, show_in_sidebar, require_admin}]}
     mode is 'storage' (UI-managed) or 'yaml' (file-based).
     """
     result = _ws({"type": "lovelace/dashboards/list"})
-    dashboards = result.get("result", [])
+    if err := ws_error(result):
+        return err
     out = []
-    for d in dashboards:
+    for d in result["result"]:
         out.append({
             "url_path": d.get("url_path"),
             "title": d.get("title") or d.get("url_path") or "default",
@@ -35,7 +47,8 @@ def list_dashboards() -> list:
             "show_in_sidebar": d.get("show_in_sidebar", True),
             "require_admin": d.get("require_admin", False),
         })
-    return sorted(out, key=lambda x: (x.get("title") or "").lower())
+    out.sort(key=lambda x: (x.get("title") or "").lower())
+    return envelope(out, key="dashboards")
 
 
 @mcp.tool()
@@ -54,10 +67,9 @@ def get_dashboard(url_path: str = "") -> dict:
         msg["url_path"] = url_path
     msg["force"] = False
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", {})
+    if err := ws_error(result):
+        return err
+    return result["result"]
 
 
 @mcp.tool()
@@ -78,6 +90,9 @@ def create_dashboard(
     require_admin:   restrict access to admins only (default: False)
 
     After creating, use update_dashboard_config() to populate views and cards.
+
+    Returns the created dashboard object from Home Assistant, or an
+    error() envelope on failure.
     """
     msg: dict = {
         "type": "lovelace/dashboards/create",
@@ -90,10 +105,9 @@ def create_dashboard(
     if icon:
         msg["icon"] = icon
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", result)
+    if err := ws_error(result):
+        return err
+    return result["result"]
 
 
 @mcp.tool()
@@ -111,8 +125,14 @@ def update_dashboard(
     Only fields with non-None/non-empty values are updated.
 
     To update the actual views and cards content, use update_dashboard_config() instead.
+
+    Returns the updated dashboard object from Home Assistant, or an
+    error() envelope ("not_found" when url_path does not exist, or Home
+    Assistant's own error otherwise) on failure.
     """
-    dashboard_id = _dashboard_id(url_path)
+    dashboard_id, err = _dashboard_id(url_path)
+    if err:
+        return err
     if not dashboard_id:
         return {"error": "not_found", "url_path": url_path,
                 "detail": "No dashboard with that url_path. Use list_dashboards()."}
@@ -126,10 +146,9 @@ def update_dashboard(
     if require_admin is not None:
         msg["require_admin"] = require_admin
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", result)
+    if err := ws_error(result):
+        return err
+    return result["result"]
 
 
 @mcp.tool()
@@ -154,15 +173,19 @@ def update_dashboard_config(url_path: str, config: dict) -> dict:
     }
 
     ⚠️ This REPLACES the entire dashboard config. Call get_dashboard() first
-    to read the current config if you want to make incremental changes.
+    to read the current config if you want to make incremental changes -
+    this is not undoable once saved, other than by writing the previous
+    config back.
+
+    Returns: {saved: true, url_path} on success, or an error() envelope
+    with Home Assistant's actual error code/message on failure.
     """
     msg: dict = {"type": "lovelace/config/save", "config": config}
     if url_path:
         msg["url_path"] = url_path
     result = _ws(msg)
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
+    if err := ws_error(result):
+        return err
     return {"saved": True, "url_path": url_path or "default"}
 
 
@@ -173,42 +196,50 @@ def delete_dashboard(url_path: str) -> dict:
 
     url_path: dashboard URL path (use list_dashboards() to find url_paths).
     Note: the default dashboard cannot be deleted.
+
+    ⚠️ This is irreversible. The dashboard's views and card layout are gone.
+
+    Returns: {deleted: url_path, success: true} on success, or an error()
+    envelope ("not_found" when url_path does not exist, or Home
+    Assistant's own error otherwise) on failure.
     """
-    dashboard_id = _dashboard_id(url_path)
+    dashboard_id, err = _dashboard_id(url_path)
+    if err:
+        return err
     if not dashboard_id:
         return {"error": "not_found", "url_path": url_path,
                 "detail": "No dashboard with that url_path. Use list_dashboards()."}
     result = _ws({"type": "lovelace/dashboards/delete", "dashboard_id": dashboard_id})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
+    if err := ws_error(result):
+        return err
     return {"deleted": url_path, "success": True}
 
 
 # ─── Lovelace frontend resources ─────────────────────────────────────────────
 
 @mcp.tool()
-def list_lovelace_resources() -> list:
+def list_lovelace_resources() -> dict:
     """
     List all Lovelace frontend resources (JavaScript modules and CSS stylesheets).
 
     These are the custom card JS files and theme CSS files loaded by the HA frontend.
     Useful to audit what's installed or to add new custom cards manually.
 
-    Returns: [{id, url, type}]  — type is 'module' (JS) or 'css'
+    Returns: {total, returned, offset, note?, resources: [{id, url, type}]}
+    type is 'module' (JS) or 'css'
     """
     result = _ws({"type": "lovelace/resources/list"})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return [{"error": err.get("code", "unknown"), "detail": err.get("message", "")}]
-    return [
+    if err := ws_error(result):
+        return err
+    out = [
         {
             "id": r.get("id"),
             "url": r.get("url"),
             "type": r.get("res_type", r.get("type", "")),
         }
-        for r in (result.get("result") or [])
+        for r in (result["result"] or [])
     ]
+    return envelope(out, key="resources")
 
 
 @mcp.tool()
@@ -222,23 +253,34 @@ def add_lovelace_resource(url: str, resource_type: str = "module") -> dict:
 
     After adding a JS module, reload the browser to load the new card.
     Note: HACS-installed cards are added automatically — use this for manual installs.
+
+    Returns the created resource object from Home Assistant (or
+    {added: true, url, type} when Home Assistant's response is empty), or
+    an error() envelope on failure.
     """
     result = _ws({"type": "lovelace/resources/create", "url": url, "res_type": resource_type})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
-    return result.get("result", {"added": True, "url": url, "type": resource_type})
+    if err := ws_error(result):
+        return err
+    return result["result"] or {"added": True, "url": url, "type": resource_type}
 
 
 @mcp.tool()
-def remove_lovelace_resource(resource_id: int) -> dict:
+def remove_lovelace_resource(resource_id: str) -> dict:
     """
     Remove a Lovelace frontend resource by its ID.
 
-    resource_id: integer ID (use list_lovelace_resources() to find IDs)
+    resource_id: opaque hex string ID, e.g. '9ed6e7503f1549e6bf3b73f079b7542d'
+                 (use list_lovelace_resources() to find IDs)
+
+    ⚠️ This is irreversible. Any dashboard card relying on this resource
+    (a custom card's JS, a theme's CSS) stops rendering until it is
+    re-added.
+
+    Returns: {deleted: resource_id, success: true} on success, or an
+    error() envelope with Home Assistant's actual error code/message on
+    failure.
     """
-    result = _ws({"type": "lovelace/resources/delete", "id": resource_id})
-    if not result.get("success", True):
-        err = result.get("error", {})
-        return {"error": err.get("code", "unknown"), "detail": err.get("message", "")}
+    result = _ws({"type": "lovelace/resources/delete", "resource_id": resource_id})
+    if err := ws_error(result):
+        return err
     return {"deleted": resource_id, "success": True}

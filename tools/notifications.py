@@ -2,10 +2,10 @@ import re
 
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws
+from tools._base import mcp, HA_URL, HEADERS, _ws, confirm_entity_exists, envelope, error, ws_error
 
 
-def _resolve_telegram_chat_id(entity_id: str) -> int:
+def _resolve_telegram_chat_id(entity_id: str) -> int | None:
     """
     Resolve the Telegram chat_id for a notify entity.
 
@@ -15,7 +15,13 @@ def _resolve_telegram_chat_id(entity_id: str) -> int:
     2. Fallback: regex on friendly_name for "(chat_id)" suffix
        (legacy YAML-configured entities and group chats)
 
-    Raises ValueError if chat_id cannot be determined.
+    Returns None if chat_id cannot be determined - notably for any
+    ordinary, non-Telegram notify target (a mobile app, Alexa, a file
+    notifier): picking the wrong notify service for send_photo() /
+    send_camera_snapshot() is a plausible, ordinary caller mistake, not
+    an exceptional condition, so this reports it with None rather than
+    raising - see _telegram_target_error() below for the error() built
+    from it.
 
     TODO HA 2026.9.0: migrate callers to use 'chat_id' or 'entity_id' parameter
     directly in telegram_bot service calls once the new API is stable.
@@ -38,10 +44,7 @@ def _resolve_telegram_chat_id(entity_id: str) -> int:
             if m:
                 return int(m.group(1))
 
-    raise ValueError(
-        f"Cannot resolve Telegram chat_id for {entity_id}. "
-        "Add the chat_id in parentheses to the entity's friendly name, e.g. 'Name (123456)'."
-    )
+    return None
 
 
 def _telegram_type(chat_id: int | None) -> str:
@@ -53,10 +56,42 @@ def _telegram_type(chat_id: int | None) -> str:
     return "telegram_group"  # negative: group or channel
 
 
-@mcp.tool()
-def list_notify_services() -> list:
+def _telegram_target_error(entity_id: str) -> dict:
+    """error() for a notify target send_photo()/send_camera_snapshot() cannot
+    use because _resolve_telegram_chat_id() returned None for it - not a
+    Telegram entity at all, or a legacy one missing the "(chat_id)"
+    friendly-name suffix these two tools depend on.
+
+    Names what these two tools actually support, and lists the other
+    notify targets that DO look like Telegram ones - list_notify_services()
+    already classifies every notify.* entity this cheaply (one /api/states
+    read, reused here rather than repeated), so a caller does not have to
+    make a second call just to find out what would work.
     """
-    List all available notification services with entity_id, friendly_name and type.
+    targets = [
+        s["entity_id"] for s in list_notify_services().get("services", [])
+        if s["type"] in ("telegram_private", "telegram_group")
+    ]
+    return error(
+        "not_a_telegram_target",
+        f"{entity_id} does not look like a Telegram notify target. "
+        "send_photo() and send_camera_snapshot() only support Telegram - "
+        "they call telegram_bot.send_photo directly - and this entity's "
+        "registry unique_id and friendly name did not resolve a chat_id. "
+        "A legacy YAML-configured Telegram target needs the chat_id in "
+        "parentheses in its friendly name, e.g. 'Name (123456)'.",
+        entity_id=entity_id,
+        telegram_targets=targets,
+    )
+
+
+@mcp.tool()
+def list_notify_services() -> dict:
+    """
+    List all available notification services.
+
+    Returns: {total, returned, offset, note?, services: [{entity_id, name,
+             type, state}]}
     type: 'telegram_private', 'telegram_group', or 'other' (mobile app, Alexa, file, etc.)
     Includes Telegram targets, mobile app, Alexa and other notify entities.
     """
@@ -76,7 +111,8 @@ def list_notify_services() -> list:
                 "type": _telegram_type(chat_id),
                 "state": entity.get("state"),
             })
-        return sorted(results, key=lambda x: x["entity_id"])
+        results.sort(key=lambda x: x["entity_id"])
+    return envelope(results, key="services")
 
 
 @mcp.tool()
@@ -86,8 +122,18 @@ def send_notification(message: str, title: str = "", target: str = "notify.notif
 
     target: entity_id of the notify target (e.g. 'notify.telegram_home', 'notify.mobile_app_myphone').
             Use list_notify_services() to discover available targets.
+
+    Returns: {target, message, accepted: true, verified: null, detail} once
+    Home Assistant accepts the call, or {error: "entity_not_found", ...}
+    when the target entity has no state at all. Delivery to the underlying
+    channel (a push notification actually reaching a phone, a Telegram
+    message actually being delivered) has no state in Home Assistant to
+    read back, so `verified` stays null rather than claiming a delivery
+    this tool cannot observe.
     """
     entity_id = target if target.startswith("notify.") else f"notify.{target}"
+    if missing := confirm_entity_exists(entity_id):
+        return missing
     data: dict = {"message": message}
     if title:
         data["title"] = title
@@ -99,7 +145,14 @@ def send_notification(message: str, title: str = "", target: str = "notify.notif
             timeout=15,
         )
         r.raise_for_status()
-        return {"sent": True, "target": entity_id, "message": message}
+    return {
+        "target": entity_id,
+        "message": message,
+        "accepted": True,
+        "verified": None,
+        "detail": "Home Assistant accepted the notification; delivery to "
+                  "the underlying channel has no state here to confirm it.",
+    }
 
 
 @mcp.tool()
@@ -120,8 +173,15 @@ def send_notification_with_buttons(
     Example:
       buttons: [[{"text": "Open HA", "url": "https://homeassistant.local:8123"}]]
       buttons: [[{"text": "Yes", "callback_data": "/yes"}, {"text": "No", "callback_data": "/no"}]]
+
+    Returns: {target, message, accepted: true, verified: null, detail} once
+    Home Assistant accepts the call, or {error: "entity_not_found", ...}
+    when the target entity has no state at all. See send_notification()
+    for why delivery itself is not verifiable here.
     """
     entity_id = target if target.startswith("notify.") else f"notify.{target}"
+    if missing := confirm_entity_exists(entity_id):
+        return missing
     payload: dict = {
         "entity_id": entity_id,
         "message": message,
@@ -137,7 +197,14 @@ def send_notification_with_buttons(
             timeout=15,
         )
         r.raise_for_status()
-        return {"sent": True, "target": entity_id, "message": message}
+    return {
+        "target": entity_id,
+        "message": message,
+        "accepted": True,
+        "verified": None,
+        "detail": "Home Assistant accepted the message; delivery to "
+                  "Telegram has no state here to confirm it.",
+    }
 
 
 @mcp.tool()
@@ -148,9 +215,22 @@ def send_photo(target: str, photo_url: str, caption: str = "") -> dict:
     target: notify entity_id (e.g. 'notify.telegram_home')
     photo_url: publicly accessible direct URL of the photo (no redirects)
     caption: optional caption text
+
+    Returns: {target, chat_id, photo, accepted: true, verified: null,
+    detail} once Home Assistant accepts the call, or an error() envelope -
+    {error: "entity_not_found", ...} when the target entity has no state
+    at all, or {error: "not_a_telegram_target", telegram_targets: [...],
+    ...} when it exists but is not a Telegram notify entity (this tool
+    only works with Telegram; the error lists the notify targets that
+    are). See send_notification() for why delivery itself is not
+    verifiable here.
     """
     entity_id = target if target.startswith("notify.") else f"notify.{target}"
+    if missing := confirm_entity_exists(entity_id):
+        return missing
     chat_id = _resolve_telegram_chat_id(entity_id)
+    if chat_id is None:
+        return _telegram_target_error(entity_id)
     payload: dict = {"url": photo_url, "target": [chat_id]}
     if caption:
         payload["caption"] = caption
@@ -162,7 +242,15 @@ def send_photo(target: str, photo_url: str, caption: str = "") -> dict:
             timeout=15,
         )
         r.raise_for_status()
-        return {"sent": True, "target": entity_id, "chat_id": chat_id, "photo": photo_url}
+    return {
+        "target": entity_id,
+        "chat_id": chat_id,
+        "photo": photo_url,
+        "accepted": True,
+        "verified": None,
+        "detail": "Home Assistant accepted the photo; delivery to Telegram "
+                  "has no state here to confirm it.",
+    }
 
 
 @mcp.tool()
@@ -177,21 +265,40 @@ def send_camera_snapshot(camera_entity_id: str, target: str, caption: str = "") 
     camera_entity_id: e.g. 'camera.gate_snapshot'
     target: notify entity_id (e.g. 'notify.telegram_home')
     caption: optional caption text
+
+    Returns: {camera, target, chat_id, photo_url, accepted: true,
+    verified: null, detail} once Home Assistant accepts the call, or an
+    error() envelope - {error: "entity_not_found", ...} when either the
+    camera or the notify target has no state at all, or
+    {error: "not_a_telegram_target", telegram_targets: [...], ...} when
+    the notify target exists but is not a Telegram notify entity. See
+    send_notification() for why delivery itself is not verifiable here.
     """
-    # 1. Resolve chat_id
+    # 1. Confirm the notify target exists
     notify_id = target if target.startswith("notify.") else f"notify.{target}"
-    chat_id = _resolve_telegram_chat_id(notify_id)
+    if missing := confirm_entity_exists(notify_id):
+        return missing
 
     with httpx.Client() as client:
-        # 2. Get camera access_token from entity state
+        # 2. Get camera access_token from entity state - checked before
+        # resolving the notify target's chat_id, so a bad camera_entity_id
+        # is reported as itself rather than masked by a chat_id error for
+        # the *other* argument.
         r = client.get(f"{HA_URL}/api/states/{camera_entity_id}", headers=HEADERS, timeout=10)
         if r.status_code == 404:
-            return {"error": "not_found", "entity_id": camera_entity_id, "detail": "Camera entity not found."}
+            return error("entity_not_found",
+                         f"{camera_entity_id} does not exist on this Home Assistant instance.",
+                         entity_id=camera_entity_id)
         r.raise_for_status()
         access_token = r.json().get("attributes", {}).get("access_token")
         if not access_token:
             return {"error": "no_access_token", "entity_id": camera_entity_id,
                     "detail": "Camera entity has no access_token attribute."}
+
+        # 2b. Resolve the notify target's chat_id
+        chat_id = _resolve_telegram_chat_id(notify_id)
+        if chat_id is None:
+            return _telegram_target_error(notify_id)
 
         # 3. Get HA external URL
         cfg = client.get(f"{HA_URL}/api/config", headers=HEADERS, timeout=10)
@@ -219,12 +326,23 @@ def send_camera_snapshot(camera_entity_id: str, target: str, caption: str = "") 
         r.raise_for_status()
 
     return {
-        "sent": True,
         "camera": camera_entity_id,
         "target": notify_id,
         "chat_id": chat_id,
         "photo_url": photo_url,
+        "accepted": True,
+        "verified": None,
+        "detail": "Home Assistant accepted the photo; delivery to Telegram "
+                  "has no state here to confirm it.",
     }
+
+
+def _persistent_notification_ids() -> set | dict:
+    """The set of currently active notification_ids, or a ws_error() dict."""
+    result = _ws({"type": "persistent_notification/get"})
+    if err := ws_error(result):
+        return err
+    return {n.get("notification_id") for n in result["result"]}
 
 
 @mcp.tool()
@@ -234,6 +352,17 @@ def create_persistent_notification(message: str, title: str = "", notification_i
 
     notification_id: optional — if provided, a subsequent call with the same ID
                      will update the existing notification instead of creating a new one.
+
+    Returns: {notification_id, title, message, verified} when
+    notification_id was given — `verified` is true only when that id is
+    present in persistent_notification/get's list after the call, read
+    back rather than assumed. When notification_id is left empty, Home
+    Assistant generates one internally but never returns it from the
+    create service call — the response is an opaque, sometimes-empty list
+    like every other service call in this codebase — so there is nothing
+    stable to look up afterward; that case instead returns
+    {notification_id: null, title, message, accepted: true,
+    verified: null}.
     """
     data: dict = {"message": message}
     if title:
@@ -248,28 +377,78 @@ def create_persistent_notification(message: str, title: str = "", notification_i
             timeout=10,
         )
         r.raise_for_status()
-    return {"created": True, "notification_id": notification_id or None, "title": title, "message": message}
+
+    if not notification_id:
+        return {
+            "notification_id": None,
+            "title": title,
+            "message": message,
+            "accepted": True,
+            "verified": None,
+            "detail": "Home Assistant generates the id internally and does "
+                      "not return it from this call, so there is nothing "
+                      "stable to verify against - pass notification_id "
+                      "explicitly to get a verified result.",
+        }
+
+    ids = _persistent_notification_ids()
+    if isinstance(ids, dict):  # ws_error()
+        return ids
+    return {
+        "notification_id": notification_id,
+        "title": title,
+        "message": message,
+        "verified": notification_id in ids,
+    }
 
 
 @mcp.tool()
-def list_persistent_notifications() -> list:
-    """List all active persistent notifications in Home Assistant."""
+def list_persistent_notifications() -> dict:
+    """
+    List all active persistent notifications in Home Assistant.
+
+    Returns: {total, returned, offset, note?, notifications: [{notification_id,
+             title, message, created_at}]}
+
+    ⚠️ third-party-settable: `title` and `message` come from whatever called
+    persistent_notification.create - any integration, any automation, not
+    necessarily this installation's owner. See tools/_base.py's
+    "Third-party-settable fields" note.
+    """
     result = _ws({"type": "persistent_notification/get"})
-    notifications = result.get("result", [])
-    return [
+    if err := ws_error(result):
+        return err
+    out = [
         {
             "notification_id": n.get("notification_id"),
             "title": n.get("title", ""),
             "message": n.get("message", ""),
             "created_at": n.get("created_at"),
         }
-        for n in notifications
+        for n in result["result"]
     ]
+    return envelope(out, key="notifications")
 
 
 @mcp.tool()
 def dismiss_persistent_notification(notification_id: str) -> dict:
-    """Dismiss a persistent notification by its notification_id."""
+    """Dismiss a persistent notification by its notification_id.
+
+    Returns: {notification_id, verified} once Home Assistant accepts the
+    call, or {error: "entity_not_found", ...} when notification_id was
+    already absent before the call — dismissing something already gone
+    would otherwise report the same success as dismissing something real.
+    `verified` is true only when notification_id no longer appears in
+    persistent_notification/get's list, read back after the call.
+    """
+    before = _persistent_notification_ids()
+    if isinstance(before, dict):  # ws_error()
+        return before
+    if notification_id not in before:
+        return error("entity_not_found",
+                     f"No active persistent notification with id {notification_id!r}.",
+                     notification_id=notification_id)
+
     with httpx.Client() as client:
         r = client.post(
             f"{HA_URL}/api/services/persistent_notification/dismiss",
@@ -278,4 +457,8 @@ def dismiss_persistent_notification(notification_id: str) -> dict:
             timeout=10,
         )
         r.raise_for_status()
-    return {"dismissed": True, "notification_id": notification_id}
+
+    after = _persistent_notification_ids()
+    if isinstance(after, dict):  # ws_error()
+        return after
+    return {"notification_id": notification_id, "verified": notification_id not in after}

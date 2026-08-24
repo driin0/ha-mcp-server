@@ -2,12 +2,16 @@ import base64
 
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS
+from tools._base import mcp, HA_URL, HEADERS, envelope
 
 
 @mcp.tool()
-def list_cameras() -> list:
-    """List all camera entities."""
+def list_cameras() -> dict:
+    """
+    List all camera entities.
+
+    Returns: {total, returned, offset, note?, cameras: [...]}
+    """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -22,7 +26,7 @@ def list_cameras() -> list:
             "state": s["state"],
             "model": attrs.get("model_name") or attrs.get("model"),
         })
-    return sorted(cameras, key=lambda x: x["name"])
+    return envelope(sorted(cameras, key=lambda x: x["name"]), key="cameras")
 
 
 @mcp.tool()
