@@ -17,6 +17,7 @@ adds update_automation()-specific cases (re-enabling a disabled automation,
 the config-write id-resolution edge case) that create_automation() has no
 equivalent of.
 """
+import copy
 
 
 def test_get_automation_resolves_the_numeric_id_and_normalises_the_config(fake_ha):
@@ -310,6 +311,29 @@ def test_update_automation_enable_toggle_reports_not_registered_when_entity_vani
 
 
 # ---- patch_automation() --------------------------------------------------
+
+def test_patch_automation_refuses_to_change_id(fake_ha):
+    """The founding bug for patch_automation() specifically: `id` is the
+    automation's own config id, the same value the config API is keyed by
+    and the entity's unique_id. Changing it does not rename anything - it
+    orphans the current entity_id while the write itself registers a
+    second, independently armed automation under the new id, carrying the
+    same trigger. Verified by reading fake_ha's stored config back
+    directly, not by trusting patch_automation()'s own return, and by
+    confirming no second config id was ever created and not even a read
+    was sent."""
+    from tools.automations import patch_automation
+
+    before = copy.deepcopy(fake_ha.automation_configs)
+
+    result = patch_automation("automation.nas_shutdown", "id", "hijacked_id_value")
+
+    assert result["error"] == "protected_path"
+    assert result["path"] == "id"
+    assert fake_ha.automation_configs == before
+    assert "hijacked_id_value" not in fake_ha.automation_configs
+    assert fake_ha.rest_calls == []
+
 
 def test_patch_automation_changes_one_value_and_reports_old(fake_ha):
     from tools.automations import patch_automation

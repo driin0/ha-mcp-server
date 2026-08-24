@@ -6,6 +6,22 @@ from tools._base import (
     observe_actuation, wait_for_entity, ws_error,
 )
 
+# patch_automation() path segments (root only - not e.g. "actions.0.id",
+# an action step's own optional step id, which is unrelated) that must
+# never be written, because they hold the automation's identity rather
+# than its behaviour - see patch_automation()'s own docstring and
+# _refuse_protected_path() for why "id" specifically is here.
+#
+# "use_blueprint.path" - which blueprint file an automation follows - was
+# deliberately NOT added: swapping the blueprint a caller explicitly asked
+# to swap is a legitimate edit that leaves the automation's own id and
+# entity_id untouched, unlike changing `id` itself, which orphans both. A
+# caller who changes it without also revisiting `use_blueprint.input` may
+# get a broken automation, but not a second, silently armed one under a
+# different id - the specific, structural failure this set exists to
+# prevent.
+_PROTECTED_PATCH_ROOT_PATHS = {"id"}
+
 
 def _resolve_automation_id(entity_id: str, client: httpx.Client) -> str | None:
     """Resolve the config id Home Assistant's automation config API is
@@ -748,6 +764,24 @@ def patch_automation(
     is what makes a targeted patch safe to send blind: it cannot silently
     grow the config with an empty branch nothing will ever read.
 
+    `path="id"` is refused outright, before anything is read or written -
+    see error() "protected_path" below. `id` is not a piece of the
+    automation's behaviour, it is the value Home Assistant's automation
+    config API is keyed by and the entity's own unique_id. Measured live:
+    patching it does not rename anything - the existing entity_id is left
+    pointing at nothing (still in the registry, with its labels and area,
+    but "unavailable") while the same write immediately registers a
+    second, independent automation under the new id, carrying the exact
+    same trigger and already armed. Two armed automations sharing a
+    trigger is the incident this project exists to prevent, so this is
+    refused unconditionally rather than left to "know what you are
+    doing" - there is no supported way to rename an automation's id
+    through this API at all; update_automation() does not expose it as a
+    field either. Patch `name` (or `alias`) to rename the automation
+    itself. `use_blueprint.path` (which blueprint an automation follows)
+    is deliberately NOT protected - unlike `id`, changing it does not
+    orphan the entity or create a second automation.
+
     No dry_run parameter: get_automation() plus this call's own `old`
     field already cover it - inspect first if you want to see the value
     before changing it, or make the change and read `old` back from the
@@ -764,9 +798,28 @@ def patch_automation(
 
     Returns: {automation_id, entity_id, path, old, new, stored_format} on
     success, or an error() envelope - "not_found" (no such automation, or
-    YAML-defined) or "bad_path" (the path did not resolve - nothing was
-    written).
+    YAML-defined), "protected_path" (`path` is "id" - see above), or
+    "bad_path" (the path did not resolve - nothing was written).
     """
+    if path.split(".", 1)[0] in _PROTECTED_PATCH_ROOT_PATHS:
+        return error(
+            "protected_path",
+            f"{path!r} would change this automation's own config id, not "
+            "its behaviour - the value Home Assistant's automation config "
+            "API is keyed by and the entity's unique_id. This is refused "
+            "unconditionally: changing it does not rename anything, it "
+            "orphans the current entity_id (which keeps its labels and "
+            "area but stops resolving to any config) while the write "
+            "itself registers a second, independent automation under the "
+            "new id - still armed, with the same trigger. Two armed "
+            "automations sharing a trigger is the incident this project "
+            "exists to prevent. Nothing was read or written. If you meant "
+            "to rename the automation, patch 'name' (or 'alias') instead "
+            "- an automation's id cannot be changed through this API, by "
+            "either edit tool.",
+            entity_id=entity_id, path=path,
+        )
+
     slug = entity_id.removeprefix("automation.")
     with httpx.Client() as client:
         automation_id = _resolve_automation_id(entity_id, client) or slug
