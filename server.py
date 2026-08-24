@@ -2,6 +2,7 @@ import tools._base  # triggers load_dotenv and mcp init
 import tools.diagnostics
 import tools.automations
 import tools.scripts
+import tools.validation
 import tools.scenes
 import tools.helpers
 import tools.notifications
