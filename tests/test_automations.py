@@ -128,6 +128,23 @@ def test_get_automation_falls_back_to_the_slug_when_the_numeric_id_config_is_gon
     assert result["name"] == "Morning"
 
 
+def test_get_automation_reports_a_failed_read_instead_of_raising(fake_ha):
+    """A transient failure reading the stored config (a 500, a revoked
+    token) is a different thing from "no such automation" and must not
+    raise an uncaught httpx.HTTPStatusError - the same guarantee
+    create_automation()'s own collision check already has for its read."""
+    from tools.automations import get_automation
+
+    fake_ha.fail_rest("/api/config/automation/config/", status=500,
+                      message="Internal Server Error")
+
+    result = get_automation("automation.nas_shutdown")
+
+    assert result["error"] == "config_read_failed"
+    assert result["status"] == 500
+    assert result["entity_id"] == "automation.nas_shutdown"
+
+
 # ---- update_automation() ------------------------------------------------
 
 def test_update_automation_preserves_the_id_and_only_changes_the_requested_field(fake_ha):
@@ -218,6 +235,52 @@ def test_update_automation_yaml_defined_returns_not_found(fake_ha):
     assert result["error"] == "not_found"
     assert "YAML" in result["detail"]
     assert result["entity_id"] == "automation.morning"
+
+
+def test_update_automation_reports_a_failed_read_instead_of_raising(fake_ha):
+    from tools.automations import update_automation
+
+    fake_ha.fail_rest("/api/config/automation/config/", status=500,
+                      message="Internal Server Error")
+
+    result = update_automation("automation.nas_shutdown", name="renamed")
+
+    assert result["error"] == "config_read_failed"
+    assert result["status"] == 500
+
+
+def test_update_automation_reports_home_assistants_write_time_rejection(fake_ha):
+    """Home Assistant validates the whole config on write and answers a
+    rejected one with 400 and a plain-text explanation of what was wrong -
+    exactly what a caller needs to correct itself. That message must be
+    reported, not discarded behind an uncaught httpx.HTTPStatusError - the
+    same way delete_automation() already reports HA's 400 on a rejected
+    delete. Only the POST is broken here (fail_rest() is not method-aware,
+    and the read that must succeed first hits the identical path)."""
+    import httpx
+
+    from tools.automations import update_automation
+
+    real_handle = fake_ha.handle
+
+    def handle_post_rejected(request):
+        if (request.method == "POST"
+                and request.url.path == "/api/config/automation/config/1684270733500"):
+            return httpx.Response(400, text="Service ZZZ does not match format "
+                                             "<domain>.<name> for dictionary value "
+                                             "@ data['actions'][0]['action']")
+        return real_handle(request)
+
+    fake_ha.handle = handle_post_rejected
+
+    result = update_automation("automation.nas_shutdown", name="renamed")
+
+    assert result["error"] == "home_assistant_error"
+    assert result["status"] == 400
+    assert "does not match format" in result["detail"]
+    assert result["entity_id"] == "automation.nas_shutdown"
+    # The alias in the store must be untouched - HA rejected the write.
+    assert fake_ha.automation_configs["1684270733500"]["alias"] == "NAS shutdown"
 
 
 def test_update_automation_no_fields_passed_writes_nothing(fake_ha):
@@ -421,3 +484,47 @@ def test_patch_automation_yaml_defined_returns_not_found(fake_ha):
 
     assert result["error"] == "not_found"
     assert "YAML" in result["detail"]
+
+
+def test_patch_automation_reports_a_failed_read_instead_of_raising(fake_ha):
+    from tools.automations import patch_automation
+
+    fake_ha.fail_rest("/api/config/automation/config/", status=500,
+                      message="Internal Server Error")
+
+    result = patch_automation("automation.nas_shutdown", "conditions.0.value_template", "x")
+
+    assert result["error"] == "config_read_failed"
+    assert result["status"] == 500
+
+
+def test_patch_automation_reports_home_assistants_write_time_rejection(fake_ha):
+    """Measured live: patch_automation() writing an invalid service name
+    ('ZZZ') into an action step got back an uncaught
+    httpx.HTTPStatusError, discarding Home Assistant's own explanation of
+    what was wrong with it. rest_error() must surface that message
+    instead, and the config must be left exactly as it was fetched."""
+    import httpx
+
+    from tools.automations import patch_automation
+
+    real_handle = fake_ha.handle
+
+    def handle_post_rejected(request):
+        if (request.method == "POST"
+                and request.url.path == "/api/config/automation/config/1684270733500"):
+            return httpx.Response(400, text="Service ZZZ does not match format "
+                                             "<domain>.<name> for dictionary value "
+                                             "@ data['actions'][0]['action']")
+        return real_handle(request)
+
+    fake_ha.handle = handle_post_rejected
+    before = dict(fake_ha.automation_configs["1684270733500"])
+
+    result = patch_automation("automation.nas_shutdown", "actions.0.action", "ZZZ")
+
+    assert result["error"] == "home_assistant_error"
+    assert result["status"] == 400
+    assert "does not match format" in result["detail"]
+    assert result["path"] == "actions.0.action"
+    assert fake_ha.automation_configs["1684270733500"] == before

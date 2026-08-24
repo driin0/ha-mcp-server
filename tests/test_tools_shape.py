@@ -406,6 +406,24 @@ def test_delete_automation_reports_a_nonexistent_entity(fake_ha):
     assert result["error"] == "entity_not_found"
 
 
+def test_delete_automation_reports_a_failed_read_instead_of_raising(fake_ha):
+    """Resolving the config id reads the entity's own state first - a
+    transient failure doing that (a 500, a revoked token) is not the same
+    as the entity not existing and must not raise an uncaught
+    httpx.HTTPStatusError - the same guarantee get_automation()/
+    update_automation()/patch_automation() get from _resolve_and_fetch()."""
+    from tools.automations import delete_automation
+
+    fake_ha.fail_rest("/api/states/automation.nas_shutdown", status=500,
+                      message="Internal Server Error")
+
+    result = delete_automation("automation.nas_shutdown")
+
+    assert result["error"] == "config_read_failed"
+    assert result["status"] == 500
+    assert not any(c.method == "DELETE" for c in fake_ha.rest_calls)
+
+
 def test_schedules_wraps_a_success(fake_ha):
     from tools.automations import list_schedules
 

@@ -3,7 +3,7 @@ import httpx
 from tools._aliases import PathError, get_path, set_path, stored_format, to_modern, to_stored
 from tools._base import (
     mcp, HA_URL, HEADERS, _slug, _ws, confirm_entity_exists, envelope, error,
-    observe_actuation, wait_for_entity, ws_error,
+    observe_actuation, rest_error, wait_for_entity, ws_error,
 )
 
 # patch_automation() path segments (root only - not e.g. "actions.0.id",
@@ -71,6 +71,48 @@ def _fetch_config(automation_id: str, slug: str, client: httpx.Client) -> tuple[
             r2.raise_for_status()
             return slug, r2.json()
     return None, None
+
+
+def _resolve_and_fetch(entity_id: str, slug: str) -> tuple[str, str | None, dict | None, dict | None]:
+    """Resolve entity_id's config id and fetch its stored config in one
+    guarded call - the two-step read get_automation(), update_automation()
+    and patch_automation() all start with, before they can do anything
+    else.
+
+    Wraps _resolve_automation_id() and _fetch_config() so a transient
+    failure while reading (a revoked token, a 500 from an overloaded
+    instance) is folded into an error() envelope instead of escaping as an
+    uncaught httpx.HTTPStatusError. create_automation()'s own pre-create
+    collision check already gets this guarantee for its own read (see its
+    "collision_check_failed" branch and the comment explaining why a check
+    that cannot run must not proceed as if it had); until now every OTHER
+    reader of a stored automation config in this module - this one's three
+    callers, and delete_automation()'s own _resolve_automation_id() call,
+    guarded the same way independently in its own code, since it never
+    calls _fetch_config() at all - let that same class of failure raise
+    uncaught instead.
+
+    Returns (automation_id, resolved_id, raw, error). `error` is non-None
+    only when the read itself failed outright - never for an ordinary "no
+    such automation", which is still `raw is None` with `error` None,
+    exactly as before this existed. When `error` is set, the other three
+    elements are meaningless; every caller returns `error` immediately
+    without reading them.
+    """
+    try:
+        with httpx.Client() as client:
+            automation_id = _resolve_automation_id(entity_id, client) or slug
+            resolved_id, raw = _fetch_config(automation_id, slug, client)
+    except httpx.HTTPStatusError as exc:
+        return slug, None, None, error(
+            "config_read_failed",
+            f"Could not read {entity_id!r}'s stored config - the read "
+            f"itself failed ({exc.response.status_code}), which is not "
+            "the same as the automation not existing. Nothing was "
+            "changed.",
+            entity_id=entity_id, status=exc.response.status_code,
+        )
+    return automation_id, resolved_id, raw, None
 
 
 def _set_and_verify_enabled(entity_id: str, enabled: bool) -> dict:
@@ -401,16 +443,34 @@ def delete_automation(entity_id: str) -> dict:
     ⚠️ This is irreversible.
 
     Returns: {deleted: entity_id, status: <HTTP status code>} on success,
-    or an error() envelope ("entity_not_found" or "not_deletable") on
-    failure.
+    or an error() envelope ("entity_not_found", "not_deletable", or
+    "config_read_failed" when resolving the config id itself failed
+    outright - a transient 500, a revoked token - rather than answering
+    "no such entity"; not the same thing, and nothing is deleted either
+    way) on failure.
     """
-    with httpx.Client() as client:
-        automation_id = _resolve_automation_id(entity_id, client)
-        if automation_id is None:
-            return error("entity_not_found",
-                         f"{entity_id} does not exist on this Home Assistant instance.",
-                         entity_id=entity_id)
+    try:
+        with httpx.Client() as client:
+            automation_id = _resolve_automation_id(entity_id, client)
+    except httpx.HTTPStatusError as exc:
+        # Same class of bug create_automation()'s own pre-create collision
+        # check already guards against on its own read (see
+        # "collision_check_failed"), extended here to the read every other
+        # edit tool in this module depends on - see _resolve_and_fetch()'s
+        # own docstring for the fuller account.
+        return error(
+            "config_read_failed",
+            f"Could not resolve {entity_id!r}'s config id - reading its "
+            f"state failed ({exc.response.status_code}), which is not the "
+            "same as the entity not existing. Nothing was deleted.",
+            entity_id=entity_id, status=exc.response.status_code,
+        )
+    if automation_id is None:
+        return error("entity_not_found",
+                     f"{entity_id} does not exist on this Home Assistant instance.",
+                     entity_id=entity_id)
 
+    with httpx.Client() as client:
         r = client.delete(
             f"{HA_URL}/api/config/automation/config/{automation_id}",
             headers=HEADERS,
@@ -525,12 +585,16 @@ def get_automation(entity_id: str) -> dict:
 
     Returns an error() envelope ("not_found") when neither the resolved
     id nor entity_id's own slug has a stored config - a YAML-defined
-    automation, or an entity_id with no corresponding automation at all.
+    automation, or an entity_id with no corresponding automation at all -
+    or ("config_read_failed") when the read itself failed outright (a
+    transient 500, a revoked token) rather than answering "no such
+    config" - not the same thing, and no longer reported the same way;
+    see _resolve_and_fetch().
     """
     slug = entity_id.removeprefix("automation.")
-    with httpx.Client() as client:
-        automation_id = _resolve_automation_id(entity_id, client) or slug
-        resolved_id, raw = _fetch_config(automation_id, slug, client)
+    automation_id, resolved_id, raw, read_err = _resolve_and_fetch(entity_id, slug)
+    if read_err:
+        return read_err
 
     if raw is None:
         return error(
@@ -669,15 +733,19 @@ def update_automation(
     enabled?, verified?, state?} on success - `updated` lists which of
     name/triggers/conditions/actions/mode/description were actually
     written; `enabled`/`verified`/`state` are present only when `enabled`
-    was passed. Or an error() envelope: "not_found", or
-    "automation_not_registered"/"automation_not_disabled"/
-    "automation_state_unverified" when `enabled` was requested and could
-    not be confirmed.
+    was passed. Or an error() envelope: "not_found"; "config_read_failed"
+    when the read itself failed outright rather than answering "no such
+    config" (see _resolve_and_fetch()); "home_assistant_error" when Home
+    Assistant rejects the write itself - its own validation message is
+    reported directly (see rest_error()), and nothing is written, the same
+    as any other refusal here; or "automation_not_registered"/
+    "automation_not_disabled"/"automation_state_unverified" when `enabled`
+    was requested and could not be confirmed.
     """
     slug = entity_id.removeprefix("automation.")
-    with httpx.Client() as client:
-        automation_id = _resolve_automation_id(entity_id, client) or slug
-        resolved_id, raw = _fetch_config(automation_id, slug, client)
+    automation_id, resolved_id, raw, read_err = _resolve_and_fetch(entity_id, slug)
+    if read_err:
+        return read_err
 
     if raw is None:
         return _not_found_for_edit(entity_id, automation_id, slug, "updated")
@@ -714,7 +782,18 @@ def update_automation(
                 json=payload,
                 timeout=15,
             )
-            r.raise_for_status()
+            # Home Assistant validates the whole config on write and
+            # answers a rejected one with 400 and a plain-text explanation
+            # (e.g. "Service ZZZ does not match format <domain>.<name>") -
+            # exactly what a caller needs to correct itself. Letting
+            # r.raise_for_status() raise here discarded that message as an
+            # uncaught httpx.HTTPStatusError; rest_error() reports it
+            # instead, the same way delete_automation()'s own 400 branch
+            # already reports HA's rejection of a delete.
+            if write_err := rest_error(r):
+                write_err["entity_id"] = entity_id
+                write_err["updated"] = updated
+                return write_err
 
     result = {
         "automation_id": resolved_id,
@@ -798,8 +877,13 @@ def patch_automation(
 
     Returns: {automation_id, entity_id, path, old, new, stored_format} on
     success, or an error() envelope - "not_found" (no such automation, or
-    YAML-defined), "protected_path" (`path` is "id" - see above), or
-    "bad_path" (the path did not resolve - nothing was written).
+    YAML-defined), "protected_path" (`path` is "id" - see above),
+    "config_read_failed" (the read itself failed outright, rather than
+    answering "no such config" - see _resolve_and_fetch()), "bad_path"
+    (the path resolved against nothing - nothing was written), or
+    "home_assistant_error" when Home Assistant rejects the write itself -
+    its own validation message is reported directly (see rest_error()),
+    and nothing was written, the same as "bad_path".
     """
     if path.split(".", 1)[0] in _PROTECTED_PATCH_ROOT_PATHS:
         return error(
@@ -821,9 +905,9 @@ def patch_automation(
         )
 
     slug = entity_id.removeprefix("automation.")
-    with httpx.Client() as client:
-        automation_id = _resolve_automation_id(entity_id, client) or slug
-        resolved_id, raw = _fetch_config(automation_id, slug, client)
+    automation_id, resolved_id, raw, read_err = _resolve_and_fetch(entity_id, slug)
+    if read_err:
+        return read_err
 
     if raw is None:
         return _not_found_for_edit(entity_id, automation_id, slug, "patched")
@@ -845,7 +929,15 @@ def patch_automation(
             json=payload,
             timeout=15,
         )
-        r.raise_for_status()
+        # See update_automation()'s identical guard for why this is
+        # rest_error() and not a bare r.raise_for_status(): Home Assistant
+        # validates the whole config on write, and its rejection message
+        # (e.g. "Service ZZZ does not match format <domain>.<name>") is
+        # exactly what a caller needs to correct the value it just sent.
+        if write_err := rest_error(r):
+            write_err["entity_id"] = entity_id
+            write_err["path"] = path
+            return write_err
 
     return {
         "automation_id": resolved_id,
