@@ -70,13 +70,61 @@ _STEP_LEGACY_TO_MODERN = {
     "actions": ("service", "action"),
 }
 
-# Every legacy -> modern rename this module knows, flattened into one table
-# keyed by the legacy spelling alone - used by get_path()/set_path() to
-# accept either spelling for a single path segment, root or step alike,
-# without the caller needing to know which level a given segment names.
-_ALIASES: dict[str, str] = dict(_ROOT_LEGACY_TO_MODERN)
-for _legacy_step, _modern_step in _STEP_LEGACY_TO_MODERN.values():
-    _ALIASES[_legacy_step] = _modern_step
+# get_path()/set_path() alias tables, deliberately kept as TWO separate,
+# position-gated dicts rather than one flat table - see _resolve_segment()
+# for how position decides which one (if either) applies to a given
+# segment. Each maps a segment name to every OTHER spelling that could
+# legitimately be meant at that position; _resolve_segment() tries them in
+# order and takes the first present in the dict actually being resolved
+# against.
+#
+# Why two tables, and why gated by position at all: "action" is both the
+# legacy ROOT key (aliasing to "actions", the modern root list) and,
+# separately, the modern STEP key for an action step - the same string
+# means two different things depending on where it appears, and a single
+# flat table (this module's original shape) cannot hold two different
+# targets for one key. Position resolves the ambiguity the same way a
+# human reading the path would: "action" at the very start of a path
+# means the root list; "action" naming a key inside some step dict means
+# that step's own type key.
+#
+# Root aliases apply only at the very first path segment (get_path()/
+# set_path() pass at_root=True there and nowhere else) - config's root is
+# a single, fixed position, so there is never a reason to alias-resolve
+# "trigger"/"condition"/"action"/"triggers"/"conditions"/"actions"
+# anywhere else in a path.
+_ROOT_ALIASES: dict[str, list[str]] = {
+    "trigger": ["triggers"], "triggers": ["trigger"],
+    "condition": ["conditions"], "conditions": ["condition"],
+    "action": ["actions"], "actions": ["action"],
+}
+
+# Step aliases apply only when the dict being resolved against was itself
+# reached by indexing into a list (get_path()/set_path() pass
+# via_list_index=True there) - which is exactly what every trigger/
+# condition/action step is, in HA's own schema, at any nesting depth: a
+# top-level triggers[i]/actions[i], but equally choose[i].sequence[j],
+# repeat.sequence[j], if.then[j]/else[j], parallel[j], or a
+# wait_for_trigger's own nested trigger list - `sequence`, `then`,
+# `else`, `choose`'s own branches, `parallel` and wait_for_trigger's own
+# list are all always lists of step-shaped dicts, never a keyed dict of
+# their own. Gating on "reached via a list index" therefore reaches every
+# one of those nested positions with no special-casing needed for any of
+# them - the same documented promise patch_automation() already made for
+# a step's own spelling, now actually true past the top level too - while
+# leaving a non-step dict alone: `target`, `data`, `event_data` and the
+# like are always reached by a dict KEY (never a bare list index into
+# their own container), so a coincidental key inside one of them named
+# "trigger" or "action" is never mistaken for a step's own type key. This
+# is a path-resolution concern only, separate from to_modern()'s own,
+# deliberate choice to leave wait_for_trigger's nested steps unrenamed in
+# the config it returns (see this module's own tests) - get_path()/
+# set_path() operate on whatever vocabulary is actually stored there,
+# aliased or not.
+_STEP_ALIASES: dict[str, list[str]] = {
+    "platform": ["trigger"], "trigger": ["platform"],
+    "service": ["action"], "action": ["service"],
+}
 
 
 class PathError(KeyError):
@@ -176,19 +224,31 @@ def stored_format(restore: dict) -> str:
     return "legacy" if root_paths & restore.keys() else "modern"
 
 
-def _resolve_segment(current, segment: str, walked: str):
+def _resolve_segment(current, segment: str, walked: str, *,
+                     at_root: bool, via_list_index: bool):
     """Resolve one dotted-path segment against `current` (a dict or list),
-    accepting a legacy key as an alias for its modern equivalent. Returns
-    the concrete key/index to index `current` with. Raises PathError naming
-    what IS there when the segment resolves to nothing - never creates
-    anything.
+    accepting a legacy key as an alias for its modern equivalent - or a
+    modern key as an alias for a legacy one still on disk - when, and
+    only when, `current`'s own position makes that alias meaningful (see
+    _ROOT_ALIASES/_STEP_ALIASES above). Returns the concrete key/index to
+    index `current` with. Raises PathError naming what IS there when the
+    segment resolves to nothing - never creates anything.
+
+    at_root: True only for the very first segment of the whole path -
+      config's root is the one position _ROOT_ALIASES applies at.
+    via_list_index: True when `current` was itself reached by indexing
+      into a list on the previous segment - the one position
+      _STEP_ALIASES applies at (see its own comment for why this is the
+      right proxy for "this is a step dict" without knowing HA's schema
+      any more specifically than that).
     """
     if isinstance(current, dict):
         if segment in current:
             return segment
-        alias = _ALIASES.get(segment)
-        if alias is not None and alias in current:
-            return alias
+        table = _ROOT_ALIASES if at_root else _STEP_ALIASES if via_list_index else None
+        for candidate in (table.get(segment, []) if table else []):
+            if candidate in current:
+                return candidate
         raise PathError(
             f"{walked!r} has no key {segment!r} - present keys: "
             f"{sorted(current.keys())}"
@@ -212,25 +272,58 @@ def _resolve_segment(current, segment: str, walked: str):
     )
 
 
+def _walk_to(config: dict, path: str) -> tuple:
+    """Walk dot-separated `path` into config (an empty string means "no
+    segments - stay at the root") and return (value_reached, at_root,
+    via_list_index): the last two describe the exact position
+    `value_reached` is AT, which is precisely the context
+    _resolve_segment() needs to resolve one further segment against it.
+
+    Shared by get_path() (which only wants `value_reached`) and
+    set_path() (which walks up to the segment BEFORE the last this way,
+    then resolves the last segment separately against the (position,
+    value) this returns - see set_path()'s own docstring for why the
+    last segment is never folded into this same walk).
+    """
+    if not path:
+        return config, True, False
+    current = config
+    walked = "<root>"
+    at_root = True
+    via_list_index = False
+    for segment in path.split("."):
+        key = _resolve_segment(current, segment, walked,
+                               at_root=at_root, via_list_index=via_list_index)
+        current = current[key]
+        at_root = False
+        via_list_index = isinstance(key, int)
+        walked = segment if walked == "<root>" else f"{walked}.{segment}"
+    return current, at_root, via_list_index
+
+
 def get_path(config: dict, path: str):
     """Walk dot-separated `path` (e.g. `"conditions.0.value_template"`,
     integer segments indexing into a list) into config and return the
     value found there.
 
     Accepts a legacy root or step key (`trigger`, `condition`, `action`,
-    `platform`, `service`) as an alias for its modern equivalent at any
-    segment, so a caller does not need to know which vocabulary this
-    particular config is written in. Raises PathError, naming what IS
-    present at the point resolution failed, rather than a bare
+    `platform`, `service`) as an alias for its modern equivalent, or the
+    modern spelling as an alias for a legacy one still on disk, at any
+    segment where that vocabulary actually applies - the automation's
+    root, and any trigger/condition/action step, however deeply nested
+    (a top-level list item, or one inside `choose`/`if`/`repeat`/
+    `parallel`/`wait_for_trigger` - see _STEP_ALIASES's own comment for
+    why nesting depth does not matter here) - so a caller does not need
+    to know which vocabulary this particular position is written in,
+    root or step, top-level or nested. A coincidentally-named key inside
+    an unrelated payload dict (`data`, `target`, `event_data`) is never
+    aliased, on purpose - see _STEP_ALIASES's own comment for what that
+    would otherwise silently target instead. Raises PathError, naming
+    what IS present at the point resolution failed, rather than a bare
     KeyError/IndexError/TypeError.
     """
-    current = config
-    walked = "<root>"
-    for segment in path.split("."):
-        key = _resolve_segment(current, segment, walked)
-        current = current[key]
-        walked = segment if walked == "<root>" else f"{walked}.{segment}"
-    return current
+    value, _, _ = _walk_to(config, path)
+    return value
 
 
 def set_path(config: dict, path: str, value) -> None:
@@ -238,13 +331,14 @@ def set_path(config: dict, path: str, value) -> None:
 
     Never creates a key: the full path - including its final segment -
     must already resolve, via the same rules get_path() uses (list
-    indices, and a legacy key accepted as an alias for its modern
-    equivalent), or this raises PathError instead of adding one. A
-    mistyped path must fail loudly, not silently grow the config with a
-    new branch nothing else will ever read.
+    indices, and either vocabulary accepted wherever it actually applies
+    - see get_path()'s own docstring), or this raises PathError instead
+    of adding one. A mistyped path must fail loudly, not silently grow
+    the config with a new branch nothing else will ever read.
     """
     parent_path, _, last = path.rpartition(".")
-    parent = get_path(config, parent_path) if parent_path else config
+    parent, at_root, via_list_index = _walk_to(config, parent_path)
     walked = parent_path if parent_path else "<root>"
-    key = _resolve_segment(parent, last, walked)
+    key = _resolve_segment(parent, last, walked,
+                           at_root=at_root, via_list_index=via_list_index)
     parent[key] = value

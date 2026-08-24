@@ -398,13 +398,22 @@ project exists because of.
   before anything is written, naming what IS present at the point
   resolution failed — never a silent creation of a new branch.
 - **`get_automation`'s shape changed**: it now returns `{automation_id,
-  entity_id, name, mode, stored_format, config}` instead of the raw config
-  dict, and resolves a UI-created automation's id (a numeric timestamp
-  unrelated to its name) the same way `delete_automation()` already did.
-  `config` is always normalised to the modern vocabulary
-  (`triggers`/`conditions`/`actions`, `trigger:`/`action:` steps);
-  `stored_format` (`"legacy"` or `"modern"`) names what the root
-  vocabulary actually was on disk at read time.
+  entity_id, name, mode?, stored_format, config}` instead of the raw
+  config dict, and resolves a UI-created automation's id (a numeric
+  timestamp unrelated to its name) the same way `delete_automation()`
+  already did. `config` is normalised to the modern vocabulary
+  (`triggers`/`conditions`/`actions`, `trigger:`/`action:` steps) at the
+  level the vocabulary actually applies - root keys, and the direct
+  trigger/action list items - the same level `update_automation()`/
+  `patch_automation()` write at; a step nested inside `choose`/`if`/
+  `repeat`/`parallel` is carried through in whichever vocabulary it was
+  last stored in, not forced modern. `stored_format` (`"legacy"` or
+  `"modern"`) names what the root vocabulary actually was on disk at read
+  time. `mode` is read from the entity's own state attribute first,
+  falling back to the config's own root key, and omitted entirely when
+  neither has it - not `config.get("mode", "single")`, which invented
+  `"single"` for a blueprint automation (mode comes from the blueprint,
+  not a root key in the automation's own config) and reported it as fact.
 - **Two vocabularies, and who actually controls which one survives.** Home
   Assistant accepts two spellings for the same automation structure — root
   (`trigger`/`condition`/`action` vs. `triggers`/`conditions`/`actions`),

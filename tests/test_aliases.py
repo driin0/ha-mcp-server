@@ -305,3 +305,89 @@ def test_set_path_accepts_a_legacy_spelled_path():
     set_path(config, "action.0.service", "light.turn_off")
 
     assert config["actions"][0]["action"] == "light.turn_off"
+
+
+# ---- get_path() / set_path(): step aliases reach any nesting depth --------------
+# patch_automation()'s own docstring documents the modern spelling and says a
+# caller "does not need to know which one this particular automation is
+# stored in" - but to_modern()/to_stored() only rewrite the top-level
+# triggers/actions list items (see this module's own module docstring), so a
+# step nested inside choose/if/repeat/parallel/wait_for_trigger keeps
+# whatever vocabulary it was last saved in, regardless of the top level.
+# Measured live: `actions.1.choose.0.sequence.0.action` (the documented
+# spelling) failed to resolve against a step that still said `service`,
+# while `...sequence.0.service` worked - get_path()/set_path() must resolve
+# either spelling at any depth, not just the top level, for the documented
+# promise to be true.
+
+NESTED_LEGACY_CHOOSE_CONFIG = {
+    "alias": "Nested choose",
+    "triggers": [{"trigger": "state", "entity_id": "binary_sensor.x"}],
+    "conditions": [],
+    "actions": [
+        {"action": "light.turn_on"},
+        {"choose": [
+            {"conditions": [], "sequence": [
+                {"service": "notify.mobile_app", "data": {"message": "hi"}},
+            ]},
+        ]},
+    ],
+    "mode": "single",
+}
+
+
+def test_get_path_resolves_a_deeply_nested_action_step_by_the_modern_spelling():
+    assert get_path(NESTED_LEGACY_CHOOSE_CONFIG,
+                    "actions.1.choose.0.sequence.0.action") == "notify.mobile_app"
+
+
+def test_get_path_still_resolves_the_same_nested_step_by_its_actual_legacy_spelling():
+    assert get_path(NESTED_LEGACY_CHOOSE_CONFIG,
+                    "actions.1.choose.0.sequence.0.service") == "notify.mobile_app"
+
+
+def test_set_path_resolves_a_deeply_nested_action_step_by_the_modern_spelling():
+    config = copy.deepcopy(NESTED_LEGACY_CHOOSE_CONFIG)
+
+    set_path(config, "actions.1.choose.0.sequence.0.action", "notify.persistent_notification")
+
+    assert (config["actions"][1]["choose"][0]["sequence"][0]["service"]
+           == "notify.persistent_notification")
+
+
+def test_get_path_resolves_a_nested_step_already_modern_by_the_legacy_spelling():
+    """The reverse direction: a nested step already saved in the modern
+    spelling must still resolve when the caller asks for the legacy one -
+    step aliases are bidirectional, not just legacy-to-modern."""
+    config = copy.deepcopy(NESTED_LEGACY_CHOOSE_CONFIG)
+    config["actions"][1]["choose"][0]["sequence"][0] = {
+        "action": "notify.mobile_app", "data": {"message": "hi"},
+    }
+
+    assert get_path(config, "actions.1.choose.0.sequence.0.service") == "notify.mobile_app"
+
+
+def test_get_path_does_not_alias_into_an_unrelated_data_payload():
+    """A `data` payload reached by a dict key (not a list index) is never a
+    step - `_STEP_ALIASES` must not fire there even when a coincidentally-
+    named key ("trigger") exists inside it. Without this, set_path(cfg,
+    "actions.0.data.platform", ...) could silently target an unrelated
+    "trigger" key in someone's own service-call data."""
+    config = {"actions": [{"action": "some.service",
+                           "data": {"trigger": "not a platform field"}}]}
+
+    with pytest.raises(PathError):
+        get_path(config, "actions.0.data.platform")
+
+    # The key that IS there must still resolve directly, unaffected.
+    assert get_path(config, "actions.0.data.trigger") == "not a platform field"
+
+
+def test_set_path_does_not_alias_into_an_unrelated_data_payload():
+    config = {"actions": [{"action": "some.service",
+                           "data": {"trigger": "untouched"}}]}
+
+    with pytest.raises(PathError):
+        set_path(config, "actions.0.data.platform", "clobbered")
+
+    assert config["actions"][0]["data"]["trigger"] == "untouched"

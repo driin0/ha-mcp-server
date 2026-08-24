@@ -490,6 +490,36 @@ def test_patch_automation_a_template_deep_inside_actions_is_reached_and_rewritte
     assert after["mode"] == before["mode"]
 
 
+def test_patch_automation_reaches_a_step_nested_inside_choose_by_the_documented_spelling(fake_ha):
+    """to_modern() only rewrites the top-level triggers/actions list items
+    (see tools/_aliases.py's module docstring) - a step nested inside
+    choose.sequence keeps whatever vocabulary it was last stored in, here
+    still legacy `service`. patch_automation()'s own docstring documents
+    the modern spelling and says a caller does not need to know which
+    vocabulary this particular automation is stored in - this is that
+    promise, exercised at a nesting depth to_modern() itself does not
+    reach."""
+    from tools.automations import patch_automation
+
+    fake_ha.automation_configs["1684270733500"]["action"].append({
+        "choose": [
+            {"conditions": [], "sequence": [
+                {"service": "notify.mobile_app", "data": {"message": "hi"}},
+            ]},
+        ],
+    })
+
+    result = patch_automation("automation.nas_shutdown",
+                              "actions.3.choose.0.sequence.0.action",
+                              "notify.persistent_notification")
+
+    assert result["old"] == "notify.mobile_app"
+    assert result["new"] == "notify.persistent_notification"
+    stored = fake_ha.automation_configs["1684270733500"]
+    assert (stored["action"][3]["choose"][0]["sequence"][0]["service"]
+           == "notify.persistent_notification")
+
+
 def test_patch_automation_mistyped_path_returns_bad_path_and_writes_nothing(fake_ha):
     from tools.automations import patch_automation
 

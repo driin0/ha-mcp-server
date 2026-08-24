@@ -926,14 +926,26 @@ def patch_automation(
 
     entity_id: the automation to patch, e.g. 'automation.nas_shutdown'.
     path: dotted, with integer list indices - e.g.
-      'conditions.0.value_template', 'actions.2.target.entity_id'. Written
-      in the modern vocabulary (triggers/conditions/actions,
-      trigger:/action: steps), but the legacy spelling (trigger/condition/
-      action, platform/service) is also accepted at any segment - a caller
-      does not need to know which one this particular automation is
-      stored in (see tools/_aliases.py's get_path()/set_path()). Exactly
-      one path notation is accepted, on purpose: dotted, not JSON Pointer
-      - supporting both doubles the ways to get a path wrong.
+      'conditions.0.value_template', 'actions.2.target.entity_id',
+      'actions.1.choose.0.sequence.0.action'. Written in the modern
+      vocabulary (triggers/conditions/actions, trigger:/action: steps),
+      but the legacy spelling (trigger/condition/action, platform/
+      service) is also accepted at any position that spelling actually
+      applies to - the root, and any trigger/condition/action step,
+      however deeply nested (a top-level list item, or one inside
+      choose/if/repeat/parallel/wait_for_trigger) - so a caller does not
+      need to know which vocabulary a given position is stored in, root
+      or step, top level or nested (see tools/_aliases.py's
+      get_path()/set_path(), and its own module docstring for why a
+      nested step can be in either vocabulary regardless of the config's
+      own root style: this tool and update_automation() only normalise
+      the top-level trigger/action list items, not further-nested ones).
+      A key inside an unrelated payload (`data`, `target`, `event_data`)
+      is never aliased this way, even if it happens to share a name with
+      the vocabulary (`trigger`, `action`) - only a position the
+      vocabulary is actually defined at is. Exactly one path notation is
+      accepted, on purpose: dotted, not JSON Pointer - supporting both
+      doubles the ways to get a path wrong.
     value: the new value at `path`, replacing whatever was there.
 
     A path that does not resolve against the config actually fetched is an
