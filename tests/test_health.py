@@ -376,3 +376,32 @@ def test_a_partial_outage_ranks_below_a_wholly_down_integration(fake_ha):
 
     order = [g["platform"] for g in result["integrations"]]
     assert order.index("all_gone") < order.index("half_gone")
+
+
+def test_one_broken_entry_decides_the_state_of_a_multi_entry_integration(fake_ha):
+    """Not "whichever came last".
+
+    shelly has many config entries on a real instance, some loaded and some
+    in setup_retry. The join was a dict comprehension, so the state shown
+    was whichever entry Home Assistant happened to return last - a value
+    that could say `loaded` while an entry of the same integration was
+    broken, and that could change between two calls without anything
+    changing on the instance.
+
+    The worst state wins instead: if any entry of this integration is in
+    trouble, the integration has a problem, and a report that averages that
+    away is a report that says all clear about something that is not.
+    """
+    from tools.health import instance_health
+
+    _entries(fake_ha,
+             {"entry_id": "a", "domain": "shelly", "title": "One",
+              "state": "setup_retry"},
+             {"entry_id": "b", "domain": "shelly", "title": "Two",
+              "state": "loaded"})
+    _down(fake_ha, "shelly", 3)
+
+    result = instance_health()
+
+    row = next(g for g in result["integrations"] if g["platform"] == "shelly")
+    assert row["config_entry_state"] == "setup_retry"

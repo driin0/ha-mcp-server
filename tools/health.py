@@ -56,8 +56,25 @@ def _hours_since(timestamp: str | None, now: datetime.datetime) -> float | None:
 # setup_error before not_loaded before setup_retry, by decreasing chance of
 # fixing itself: a retry may recover unattended, setup_error is typically
 # expired authentication and stays broken until a person acts.
+# Read by both _entry_rank() (which entry wins for a multi-entry
+# integration) and _tier() (where the row sorts), so the two cannot
+# disagree about what counts as trouble.
 _ENTRY_TROUBLE = {"setup_error": 0, "migration_error": 0,
                   "not_loaded": 1, "setup_retry": 2}
+
+
+def _entry_rank(state: str | None) -> int:
+    """How much trouble a config entry state means - lower is worse.
+
+    A state this table does not know is ranked just after the ones it does,
+    ahead of `loaded`: an unrecognised state is not evidence of health, and
+    Home Assistant may add one at any time.
+    """
+    if state in _ENTRY_TROUBLE:
+        return _ENTRY_TROUBLE[state]
+    if state == "loaded":
+        return 99
+    return 50
 
 
 def _tier(group: dict) -> int:
@@ -68,6 +85,7 @@ def _tier(group: dict) -> int:
     if trouble is not None:
         return trouble
     return 3 if group["all_unavailable"] else 4
+
 
 
 @mcp.tool()
@@ -110,7 +128,9 @@ def instance_health(unavailable_hours: int = 0, limit: int = 20,
     the signal that carries, and it is the incident's own signature: not
     "some devices are flaky" but "this integration is not working".
     `config_entry_state` joins Home Assistant's own verdict onto the same
-    row, matching the entry's domain to the entity's platform, so the two
+    row, matching the entry's domain to the entity's platform. An
+    integration with several entries reports its WORST one: if any entry is
+    in trouble, the integration has a problem, so the two
     halves of the diagnosis arrive together instead of in two sections a
     reader has to cross-reference by hand. It is null only when the
     integration has no config entry at all - a helper platform such as
@@ -225,7 +245,21 @@ def instance_health(unavailable_hours: int = 0, limit: int = 20,
         # group. One field cannot mean both "Home Assistant considers this
         # healthy" and "this question does not apply here": a reader cannot
         # act on a difference it can no longer see.
-        entry_state = {e["domain"]: e["state"] for e in all_entries if e["domain"]}
+        #
+        # The WORST state wins per domain, not the last one seen. An
+        # integration can own many entries - shelly has a dozen on a real
+        # instance, some loaded and some in setup_retry - and a plain dict
+        # comprehension would report whichever Home Assistant happened to
+        # return last: a value that could say "loaded" with a broken entry
+        # of the same integration sitting right there, and that could
+        # change between two calls with nothing having changed.
+        for entry in all_entries:
+            domain = entry["domain"]
+            if not domain:
+                continue
+            current = entry_state.get(domain)
+            if current is None or _entry_rank(entry["state"]) < _entry_rank(current):
+                entry_state[domain] = entry["state"]
         config_entries = [e for e in all_entries if e["state"] != "loaded"]
     if ws_error(ws_results[1]):
         unreadable.append("repairs")
