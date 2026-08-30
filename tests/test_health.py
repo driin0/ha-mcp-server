@@ -150,3 +150,32 @@ def test_the_core_snapshot_failing_is_an_error_not_a_clean_report(fake_ha):
     result = instance_health()
 
     assert result["error"] == "connection_failed"
+
+
+def test_the_response_stays_bounded_on_a_real_sized_registry(fake_ha):
+    """The 2.1.0 lesson, applied before it can happen again.
+
+    list_orphan_entities shipped unbounded and answered a 3249-entity
+    instance with 678 KB, past what an MCP client accepts - so the finding
+    it had computed correctly never arrived. An aggregate over the same
+    registry repeats that exactly unless every part of it is bounded,
+    including the parts inside each row.
+    """
+    import json
+
+    from tools.health import instance_health
+
+    for n in range(3249):
+        platform = f"integration_{n % 40}"
+        fake_ha.states.append(
+            {"entity_id": f"sensor.e{n}", "state": "unavailable",
+             "attributes": {}, "last_changed": "2026-08-01T00:00:00+00:00"})
+        fake_ha.registry.append(
+            {"entity_id": f"sensor.e{n}", "platform": platform,
+             "area_id": None, "device_id": None, "labels": []})
+
+    result = instance_health(unavailable_hours=0)
+
+    assert result["summary"]["unavailable"] == 3249
+    assert result["returned"] <= 20
+    assert len(json.dumps(result)) < 20_000

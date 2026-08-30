@@ -62,6 +62,11 @@ the empty string, so roughly a hundred tools rendered as
   note, never reported as empty: a health report that quietly omits a check
   it could not run says "all clear" about something it never looked at.
 
+  Every part of the response is bounded, including inside a row: each
+  integration carries at most ten sample entity ids, with the full count in
+  `unavailable`. Verified against a simulated 3249-entity registry — the
+  size the instance that motivated this actually is.
+
 ## 2.1.0
 
 Two tools returned the expected population mixed into the unexpected one,

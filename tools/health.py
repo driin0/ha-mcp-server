@@ -16,6 +16,14 @@ from tools._base import mcp, envelope, _ws_multi, ws_error
 from tools.validation import _live_snapshot
 
 
+# At most this many entity ids per integration. The COUNT is the finding -
+# "40 of this platform's entities are down" - and the ids are there to act
+# on, not to enumerate. Unbounded they are the 678 KB list_orphan_entities
+# shipped in 2.0.0: a correct answer that never reached the caller because
+# it was too large to deliver. `unavailable` always carries the full count.
+_SAMPLE_SIZE = 10
+
+
 def _hours_since(timestamp: str | None, now: datetime.datetime) -> float | None:
     """Hours between `timestamp` and now, or None when it cannot be read.
 
@@ -64,9 +72,15 @@ def instance_health(unavailable_hours: int = 24, limit: int = 20,
 
     Returns: {total, returned, offset, note?, summary, hours_are_a_lower_bound,
     integrations: [{platform, unavailable, unknown, total,
-    oldest_unavailable_hours, entity_ids}], config_entries: [...],
+    oldest_unavailable_hours, sample_entity_ids}], config_entries: [...],
     repairs: [...], sections_unavailable: [...]}, integrations sorted with
     the longest-running outage first.
+
+    `sample_entity_ids` is at most ten ids per integration, not the whole
+    set: the count in `unavailable` is the finding, and the ids are there
+    to act on. Every part of this response is bounded, including the parts
+    inside a row - an unbounded row is how a correct answer comes to be too
+    large to deliver.
 
     `oldest_unavailable_hours` is a LOWER BOUND, never the true duration:
     it derives from the entity's `last_changed`, which a Home Assistant
@@ -108,7 +122,7 @@ def instance_health(unavailable_hours: int = 24, limit: int = 20,
         platform = (entity_registry.get(entity_id) or {}).get("platform") or "unknown"
         group = groups.setdefault(platform, {
             "platform": platform, "unavailable": 0, "unknown": 0, "total": 0,
-            "oldest_unavailable_hours": None, "entity_ids": [],
+            "oldest_unavailable_hours": None, "sample_entity_ids": [],
         })
         group["total"] += 1
 
@@ -116,7 +130,8 @@ def instance_health(unavailable_hours: int = 24, limit: int = 20,
         if value == "unavailable":
             group["unavailable"] += 1
             unavailable_total += 1
-            group["entity_ids"].append(entity_id)
+            if len(group["sample_entity_ids"]) < _SAMPLE_SIZE:
+                group["sample_entity_ids"].append(entity_id)
             hours = _hours_since(row.get("last_changed"), now)
             if hours is not None:
                 current = group["oldest_unavailable_hours"]
