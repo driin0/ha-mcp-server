@@ -269,7 +269,7 @@ and no `continue_on_timeout: false` carried execution past the guard into
 `switch.turn_off` against a machine still writing to disk. Neither fault
 raised an error, wrote a log line, or tripped a repair issue.
 
-Four tools exist to catch both shapes before they cause damage:
+Five tools exist to catch both shapes before they cause damage, and to surface the silence that let them run:
 
 - **`validate_automation`** / **`validate_all_automations`** — check every
   entity/device an automation references against this instance's live
@@ -292,6 +292,13 @@ Four tools exist to catch both shapes before they cause damage:
   template entities or helpers).
 - **`list_orphan_entities`** — registry entries with no current state,
   exactly what a reconfigured integration leaves behind.
+- **`instance_health`** — entities with no usable state grouped by the
+  integration that owns them, plus config entries that are not loaded and
+  open repair issues. The grouping is what makes it a diagnosis: in the
+  incident, every entity of one device had been unavailable for weeks while
+  its own ping still read `on` — a live system with a dead integration —
+  and assembling that took five separate calls. Outage ages are lower
+  bounds, since a restart resets `last_changed`.
 
 **`scripts/lint_automations.py`** is a CLI over the same validator, for CI or
 a schedule:
