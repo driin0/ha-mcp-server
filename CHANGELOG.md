@@ -1,5 +1,85 @@
 # Changelog
 
+## 2.2.0
+
+A write that timed out was reported as a failure while Home Assistant was
+still executing it. Measured live against a real instance: an automation
+whose action sequence ran for twenty seconds completed **ten seconds after
+the caller had been told the tool errored**. The text it got was
+`Error executing tool trigger_automation: timed out` — two words of cause,
+under a prefix whose every natural reading is "it did not happen", which is
+the one thing that was not known.
+
+This is the fault this project was built to remove, with its sign inverted.
+`lock_control` once returned `{"ok": true}` for a lock that did not exist;
+2.0.0 replaced that with a read-back. A timeout is the same defect running
+the other way: an outcome asserted rather than established.
+
+The WebSocket half was worse. `concurrent.futures.TimeoutError`'s `str()` is
+the empty string, so roughly a hundred tools rendered as
+`Error executing tool <name>: ` — an error with no stated cause at all.
+
+### Changed
+
+- **Every tool, both transports.** A timeout is now described by what is
+  actually known about it. A write says the outcome is unknown, that it may
+  already have been applied or may still be running, what to read back, and
+  that calling again may apply it twice. A read says it had no side effect
+  and is safe to repeat.
+
+  Reads are told apart from writes by the request `httpx` attaches to every
+  timeout, and on WebSocket by the command types now carried on the
+  exception — never by a hand-kept list of write tools, which would go
+  stale without failing. An unrecognised WebSocket command counts as a
+  write: a read wrongly called uncertain costs one verification, a write
+  wrongly called safe costs a second actuation.
+
+  **No tool's return contract changes.** A timeout still raises; only its
+  text is different. Converting these into returned envelopes touches ~160
+  tools and is 3.0.0.
+
+### Added
+
+- **`instance_health(unavailable_hours=0, limit=20, offset=0)`.** Entities
+  with no usable state, grouped by the integration that owns them, plus
+  config entries that are not loaded and open repair issues — in one call.
+
+  The grouping is the point. Twenty-five unavailable entities from one
+  integration is one fault; as twenty-five rows it reads as an instance
+  falling apart, and the finding — that they share a platform — is the part
+  a list of rows does not say. In the incident this server was built after,
+  that single distinction was the whole diagnosis, and it took five
+  separate calls to assemble by hand.
+
+  The signal is `all_unavailable` — every entity an integration owns has no
+  state — with Home Assistant's own `config_entry_state` joined onto the
+  same row. Both halves of the diagnosis arrive together instead of in two
+  sections to cross-reference by hand.
+
+  It is deliberately **not** "unavailable for N hours". That was the
+  original design, and the first run against a real instance killed it:
+  `last_changed` resets on every restart, and three hours after one, all 29
+  integrations holding 1857 unavailable entities reported the same 3.1
+  hours. A 24-hour default therefore listed **zero of them**, under the
+  envelope's own "no integrations found" — a checker reporting nothing
+  found about a population it had stopped looking at, which is the fault
+  this project exists to remove. `unavailable_hours` survives as an opt-in
+  filter defaulting to 0, `oldest_unavailable_hours` is documented as
+  collapsing to instance uptime, and `excluded_below_threshold` reports
+  every row the filter holds back.
+
+  `summary` is computed over the whole population before any filter, so
+  narrowing the listing can never make the instance look healthier than it
+  is. A section that could not be read is named in `sections_unavailable`
+  and called out in the note, never reported as empty: a health report that
+  quietly omits a check it could not run says "all clear" about something
+  it never looked at.
+
+  Every part of the response is bounded, including inside a row: each
+  integration carries at most ten sample entity ids, with the full count in
+  `unavailable`. Verified against a simulated 3249-entity registry — the
+  size the instance that motivated this actually is.
+
 ## 2.1.0
 
 Two tools returned the expected population mixed into the unexpected one,

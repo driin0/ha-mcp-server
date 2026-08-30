@@ -3,6 +3,7 @@ import tools.diagnostics
 import tools.automations
 import tools.scripts
 import tools.validation
+import tools.health
 import tools.scenes
 import tools.helpers
 import tools.notifications
@@ -68,7 +69,6 @@ def _host_without_port(value: str) -> str:
 if __name__ == "__main__":
     import hmac
     import sys
-    import time
     import threading
     from urllib.parse import urlsplit
 
@@ -77,23 +77,13 @@ if __name__ == "__main__":
     from starlette.responses import Response as StarletteResponse
     from tools._base import mcp, MCP_ALLOWED_HOSTS, MCP_PORT, MCP_SECRET
     from web import start as start_web_ui
-    import stats
+    from tool_tracking import install_call_tracking
 
-    # Patch tool manager to track call counts, latency and errors
-    _orig_call = mcp._tool_manager.call_tool
-
-    async def _tracked_call(name: str, arguments: dict, *args, **kwargs):
-        t0 = time.monotonic()
-        try:
-            result = await _orig_call(name, arguments, *args, **kwargs)
-            stats.record_call(name, (time.monotonic() - t0) * 1000)
-            return result
-        except Exception as e:
-            stats.record_call(name, (time.monotonic() - t0) * 1000)
-            stats.record_error(name, e)
-            raise
-
-    mcp._tool_manager.call_tool = _tracked_call
+    # Dashboard stats, and the honest description of a timeout. Both live in
+    # tool_tracking so the second one can be tested: it hangs on a private
+    # SDK attribute, and a guard that can stop applying in silence needs a
+    # test that fails loudly when it does. See that module's docstring.
+    install_call_tracking(mcp)
 
     threading.Thread(target=start_web_ui, daemon=True, name="web-ui").start()
 

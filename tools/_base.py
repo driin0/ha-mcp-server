@@ -121,6 +121,7 @@ one that carries the most of them at once, since it is also the tool most
 client integrations call first.
 """
 import asyncio
+import concurrent.futures
 import json
 import os
 import re
@@ -277,16 +278,95 @@ def _run_in_new_loop(coro):
         loop.close()
 
 
+# WebSocket command types this codebase sends that only READ. Anything not
+# listed here is treated as a write when a timeout has to be described.
+#
+# The asymmetry is deliberate. Home Assistant's command names do not
+# classify reliably - config/entity_registry/update announces what it is,
+# backup/generate does not - so a keyword rule would misclassify silently.
+# A read wrongly described as "may have applied" costs the caller one
+# needless verification; a write wrongly described as "safe to repeat"
+# costs a second actuation on real hardware. Unknown therefore means write.
+#
+# test_the_read_list_holds_only_commands_this_codebase_sends() pins every
+# entry to a literal in tools/, so an entry that stops being sent fails
+# loudly instead of quietly describing nothing.
+WS_READ_COMMANDS = frozenset({
+    "assist_pipeline/pipeline/list",
+    "backup/agents/info",
+    "backup/info",
+    "blueprint/list",
+    "config/area_registry/list",
+    "config/auth/list",
+    "config/device_registry/list",
+    "config/entity_registry/get",
+    "config/entity_registry/list",
+    "config/floor_registry/list",
+    "config/label_registry/list",
+    "config_entries/flow/progress",
+    "config_entries/get",
+    "device_automation/action/list",
+    "device_automation/condition/list",
+    "device_automation/trigger/list",
+    "hacs/info",
+    "hacs/repositories/list",
+    "hacs/repository/info",
+    "homeassistant/expose_entity/list",
+    "lovelace/config",
+    "lovelace/dashboards/list",
+    "lovelace/resources/list",
+    "media_player/browse_media",
+    "persistent_notification/get",
+    "recorder/statistics_during_period",
+    "repairs/list_issues",
+    "scheduler/items",
+    "system_health/info",
+    "tag/list",
+    "trace/list",
+})
+
+
+class WsTimeout(TimeoutError):
+    """A WebSocket batch that Home Assistant did not answer in time.
+
+    Carries the command types that were in flight. Without them the caller
+    sees `Error executing tool <name>: ` - measured: the empty string, because
+    concurrent.futures.TimeoutError's str() is empty. That is an error with
+    no stated cause at all, and it is what this class exists to replace.
+    """
+
+    def __init__(self, *, command_types: tuple[str, ...] = ()):
+        self.command_types = tuple(command_types)
+        super().__init__(
+            "Home Assistant did not answer "
+            + (", ".join(self.command_types) if self.command_types
+               else "the WebSocket batch")
+            + " in time")
+
+
 def _ws(msg: dict) -> dict:
     """Send one WS command over a single authenticated connection (sync, thread-safe)."""
     return _ws_multi([msg])[0]
 
 
 def _ws_multi(msgs: list) -> list:
-    """Send multiple WS commands over a single authenticated connection (sync, thread-safe)."""
-    import concurrent.futures
+    """Send multiple WS commands over a single authenticated connection (sync, thread-safe).
+
+    A timeout is re-raised as WsTimeout carrying the command types that were
+    in flight. It still RAISES - no tool's contract changes here - but the
+    exception stops being empty: concurrent.futures.TimeoutError's str() is
+    the empty string, so the SDK rendered `Error executing tool <name>: `
+    with nothing after the colon. See timeout_message() for what the caller
+    is told instead, and the note inside _ws_commands() below for why
+    converting these into error() envelopes is a separate, breaking change.
+    """
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(_run_in_new_loop, _ws_commands(msgs)).result(timeout=30)
+        try:
+            return pool.submit(_run_in_new_loop, _ws_commands(msgs)).result(timeout=30)
+        except concurrent.futures.TimeoutError as exc:
+            raise WsTimeout(
+                command_types=tuple(m.get("type", "?") for m in msgs)
+            ) from exc
 
 
 async def _ws_commands(msgs: list) -> list:
@@ -501,6 +581,58 @@ def rest_error(r: httpx.Response) -> dict | None:
     if r.is_success:
         return None
     return error("home_assistant_error", r.text.strip(), status=r.status_code)
+
+
+def timeout_message(exc: BaseException, tool_name: str) -> str | None:
+    """The honest description of a timeout, or None if `exc` is not one.
+
+    The MCP SDK renders a tool exception as
+    `Error executing tool <name>: <str(exc)>`. For a timeout that prefix is
+    actively wrong: the tool executed, and so did Home Assistant - measured
+    live, an automation ran for 20 s and completed ten seconds after the
+    caller had been told the tool errored. This function supplies the text
+    that replaces it.
+
+    A write says it may already have landed and that repeating it may apply
+    it twice; a read says it had no effect and is safe to repeat. The two
+    are told apart from the request itself (httpx attaches it to every
+    timeout) or from the in-flight WS command types, never from a list of
+    write tools kept by hand - such a list goes stale without failing, which
+    is the failure this repository's own deny-list already documents.
+    """
+    is_write = None
+
+    if isinstance(exc, httpx.TimeoutException):
+        try:
+            is_write = exc.request.method.upper() not in ("GET", "HEAD")
+        except RuntimeError:
+            # httpx raises rather than returning None when no request was
+            # attached. Nothing is known, so fail toward caution.
+            is_write = True
+    elif isinstance(exc, WsTimeout):
+        is_write = (not exc.command_types) or any(
+            c not in WS_READ_COMMANDS for c in exc.command_types)
+    elif isinstance(exc, (concurrent.futures.TimeoutError, asyncio.TimeoutError)):
+        is_write = True
+
+    if is_write is None:
+        return None
+
+    if not is_write:
+        return (
+            f"read_timeout: {tool_name} did not get an answer from Home "
+            "Assistant in time. A read has no side effect, so nothing was "
+            "changed and the call is safe to repeat."
+        )
+
+    return (
+        f"write_outcome_unknown: {tool_name} sent its request, and Home "
+        "Assistant did not answer in time. The write may already have been "
+        "applied, or may still be running: the outcome is genuinely "
+        "unknown, and this is not a rejection. Read the affected entity's "
+        "state back before deciding anything. Calling this tool again may "
+        "apply the write twice."
+    )
 
 
 def entity_area_map(entities: list | None = None) -> tuple[dict, dict | None]:
