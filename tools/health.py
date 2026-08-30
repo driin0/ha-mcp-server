@@ -101,6 +101,11 @@ def instance_health(unavailable_hours: int = 24, limit: int = 20,
     registry and the live states - could not be read at all. Never for
     finding a healthy instance, which is simply `integrations: []`.
 
+    The config-entry read uses `config_entries/get`, the command
+    list_config_entries() has been sending against real instances since
+    1.0 - not `config_entries/list`, which appears in this codebase only
+    as an example inside a docstring and was never sent by anything.
+
     Two WebSocket round trips, not one: the registries come from
     _live_snapshot(), shared with the validation tools, and the two
     sections below are batched separately rather than by widening a helper
@@ -146,7 +151,7 @@ def instance_health(unavailable_hours: int = 24, limit: int = 20,
     repairs: list[dict] = []
 
     ws_results = _ws_multi([
-        {"type": "config_entries/list"},
+        {"type": "config_entries/get"},
         {"type": "repairs/list_issues"},
     ])
     if ws_error(ws_results[0]):

@@ -305,7 +305,6 @@ WS_READ_COMMANDS = frozenset({
     "config/label_registry/list",
     "config_entries/flow/progress",
     "config_entries/get",
-    "config_entries/list",
     "device_automation/action/list",
     "device_automation/condition/list",
     "device_automation/trigger/list",

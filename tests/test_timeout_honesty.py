@@ -131,18 +131,31 @@ def test_something_that_is_not_a_timeout_is_not_described():
 def test_the_read_list_holds_only_commands_this_codebase_sends():
     """A read list naming commands nothing sends would rot without failing.
 
-    Every entry must appear as a `"type": "<command>"` literal somewhere in
-    tools/ - otherwise it is a guess, and a guess in a fail-toward-caution
-    list is the one place a guess is expensive.
+    Read over the AST, not the text. An earlier version searched the source
+    as a string and passed on `config_entries/list` - a command no tool has
+    ever sent, which appears only as an EXAMPLE inside ws_error()'s
+    docstring. instance_health had been written against it. Matching prose
+    is how a check comes to confirm something nobody does.
+
+    A dict literal's `"type": "<command>"` is a command actually sent; a
+    docstring is one string constant, and its contents never parse into a
+    Dict node, so they cannot satisfy this.
     """
+    import ast
     import pathlib
 
-    sources = "\n".join(
-        p.read_text()
-        for p in (pathlib.Path(__file__).resolve().parents[1] / "tools").glob("*.py"))
+    sent = set()
+    for path in (pathlib.Path(__file__).resolve().parents[1] / "tools").glob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Dict):
+                continue
+            for key, value in zip(node.keys, node.values):
+                if (isinstance(key, ast.Constant) and key.value == "type"
+                        and isinstance(value, ast.Constant)
+                        and isinstance(value.value, str)):
+                    sent.add(value.value)
 
-    unsent = [cmd for cmd in WS_READ_COMMANDS if f'"{cmd}"' not in sources]
-    assert unsent == []
+    assert sorted(WS_READ_COMMANDS - sent) == []
 
 
 def test_ws_multi_names_the_commands_that_did_not_come_back(monkeypatch):
