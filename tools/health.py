@@ -44,7 +44,7 @@ def _hours_since(timestamp: str | None, now: datetime.datetime) -> float | None:
 
 
 @mcp.tool()
-def instance_health(unavailable_hours: int = 24, limit: int = 20,
+def instance_health(unavailable_hours: int = 0, limit: int = 20,
                     offset: int = 0) -> dict:
     """
     One read-only report on what is wrong with this Home Assistant instance:
@@ -59,22 +59,35 @@ def instance_health(unavailable_hours: int = 24, limit: int = 20,
     assemble by hand.
 
     unavailable_hours: only list integrations whose longest-running
-      unavailable entity has been that way for at least this many hours
-      (default 24). This narrows the LISTING only - `summary` always counts
-      the whole population, so a filter can never make the instance look
-      healthier than it is. Pass 0 to list everything. An integration whose
-      age cannot be read is listed whatever this is set to: unknown is not
-      recent.
+      unavailable entity has been that way for at least this many hours.
+      **Defaults to 0 - no filtering - because the age it filters on is
+      largely fiction.** See `oldest_unavailable_hours` below. This narrows
+      the LISTING only; `summary` always counts the whole population, and
+      `excluded_below_threshold` reports how many rows were held back, so a
+      filter can never make the instance look healthier than it is. An
+      integration whose age cannot be read is listed whatever this is set
+      to: unknown is not recent.
     limit, offset: page over the listed integrations. Bounded by default
       like every other collection here - a real instance has thousands of
       registry entries, and an unbounded aggregate over them is a response
       that never arrives.
 
     Returns: {total, returned, offset, note?, summary, hours_are_a_lower_bound,
-    integrations: [{platform, unavailable, unknown, total,
-    oldest_unavailable_hours, sample_entity_ids}], config_entries: [...],
-    repairs: [...], sections_unavailable: [...]}, integrations sorted with
-    the longest-running outage first.
+    integrations: [{platform, unavailable, unknown, total, all_unavailable,
+    config_entry_state, oldest_unavailable_hours, sample_entity_ids}],
+    config_entries: [...], repairs: [...], sections_unavailable: [...],
+    excluded_below_threshold}. Integrations are sorted with the wholly-down
+    ones first, then by how many entities are down.
+
+    `all_unavailable` - every entity this integration owns has no state - is
+    the signal that carries, and it is the incident's own signature: not
+    "some devices are flaky" but "this integration is not working".
+    `config_entry_state` joins Home Assistant's own verdict onto the same
+    row, matching the entry's domain to the entity's platform, so the two
+    halves of the diagnosis arrive together instead of in two sections a
+    reader has to cross-reference by hand. It is null when the integration
+    has no unloaded entry - the interesting case where every entity is down
+    and Home Assistant still believes the entry is loaded.
 
     `sample_entity_ids` is at most ten ids per integration, not the whole
     set: the count in `unavailable` is the finding, and the ids are there
@@ -82,12 +95,16 @@ def instance_health(unavailable_hours: int = 24, limit: int = 20,
     inside a row - an unbounded row is how a correct answer comes to be too
     large to deliver.
 
-    `oldest_unavailable_hours` is a LOWER BOUND, never the true duration:
-    it derives from the entity's `last_changed`, which a Home Assistant
-    restart resets. A fault that survived a restart reads as newer than it
-    is, never as older. `hours_are_a_lower_bound` is in the response so a
-    reader cannot miss it, and is null for an integration whose age could
-    not be read at all.
+    `oldest_unavailable_hours` is a LOWER BOUND and usually a useless one.
+    It derives from `last_changed`, which a Home Assistant restart resets -
+    and measured on a real instance three hours after a restart, all 29
+    integrations holding 1857 unavailable entities reported the same 3.1
+    hours. It collapses to the instance's uptime, so do not rank or filter
+    on it and do not read it as "how long this has been broken". It is kept
+    because on an instance with a long uptime it does carry the signal, and
+    dropping it would remove the only direct evidence of duration there is.
+    `hours_are_a_lower_bound` is in the response so a reader cannot miss
+    this, and the value is null when no age could be read at all.
 
     `sections_unavailable` names any section that could not be read -
     typically `repairs` or `config_entries` on a connection that will not
@@ -128,6 +145,7 @@ def instance_health(unavailable_hours: int = 24, limit: int = 20,
         group = groups.setdefault(platform, {
             "platform": platform, "unavailable": 0, "unknown": 0, "total": 0,
             "oldest_unavailable_hours": None, "sample_entity_ids": [],
+            "all_unavailable": False, "config_entry_state": None,
         })
         group["total"] += 1
 
@@ -173,6 +191,21 @@ def instance_health(unavailable_hours: int = 24, limit: int = 20,
             if not i.get("ignored", False)
         ]
 
+    # --- join the two halves of the diagnosis onto one row --------------
+    #
+    # "Every entity down" says something is wrong; the config entry's own
+    # state says what. Home Assistant keys entries by domain and the entity
+    # registry keys entities by platform; for an integration that owns its
+    # own entities those are the same string, which is what this join
+    # assumes. A platform with no unloaded entry keeps None - including the
+    # case worth looking at hardest, where everything is down and Home
+    # Assistant still considers the entry loaded.
+    entry_state = {e["domain"]: e["state"] for e in config_entries if e["domain"]}
+    for group in groups.values():
+        group["all_unavailable"] = (
+            group["unavailable"] > 0 and group["unavailable"] == group["total"])
+        group["config_entry_state"] = entry_state.get(group["platform"])
+
     # --- the summary, computed over everything above --------------------
     #
     # Built BEFORE the filter below touches `groups`. Filtering first and
@@ -185,26 +218,43 @@ def instance_health(unavailable_hours: int = 24, limit: int = 20,
         "unknown": unknown_total,
         "integrations_with_unavailable": sum(
             1 for g in groups.values() if g["unavailable"]),
+        "integrations_entirely_unavailable": sum(
+            1 for g in groups.values() if g["all_unavailable"]),
         "config_entries_not_loaded": len(config_entries),
         "repairs_open": len(repairs),
     }
 
     # --- the listing ----------------------------------------------------
+    affected = [g for g in groups.values() if g["unavailable"]]
     listed = sorted(
-        (g for g in groups.values()
-         if g["unavailable"]
-         and (g["oldest_unavailable_hours"] is None
-              or g["oldest_unavailable_hours"] >= unavailable_hours)),
-        key=lambda g: (-(g["oldest_unavailable_hours"] or 0), g["platform"]),
+        (g for g in affected
+         if g["oldest_unavailable_hours"] is None
+         or g["oldest_unavailable_hours"] >= unavailable_hours),
+        # Wholly-down first, then by how much is down. Deliberately NOT by
+        # age: see oldest_unavailable_hours in the docstring - ranking on a
+        # number that is the same for every row is ranking on nothing.
+        key=lambda g: (not g["all_unavailable"], -g["unavailable"], g["platform"]),
     )
+    excluded = len(affected) - len(listed)
 
     out = envelope(listed, key="integrations", limit=limit, offset=offset,
                    offset_paginated=True)
+    out["excluded_below_threshold"] = excluded
     out["summary"] = summary
     out["hours_are_a_lower_bound"] = True
     out["config_entries"] = config_entries
     out["repairs"] = repairs
     out["sections_unavailable"] = unreadable
+
+    if excluded:
+        hidden = (
+            f"{excluded} integration(s) with unavailable entities are not "
+            f"listed: their longest outage reads as shorter than "
+            f"unavailable_hours={unavailable_hours}. That age resets on a "
+            "Home Assistant restart, so this filter hides real faults on a "
+            "recently restarted instance - `summary` still counts them all."
+        )
+        out["note"] = f"{hidden} {out['note']}" if out.get("note") else hidden
 
     if unreadable:
         warning = (

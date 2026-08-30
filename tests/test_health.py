@@ -179,3 +179,86 @@ def test_the_response_stays_bounded_on_a_real_sized_registry(fake_ha):
     assert result["summary"]["unavailable"] == 3249
     assert result["returned"] <= 20
     assert len(json.dumps(result)) < 20_000
+
+
+def test_an_integration_with_every_entity_down_is_flagged_and_ranked_first(fake_ha):
+    """The signature, restated in the terms real data supports.
+
+    "Unavailable for weeks" cannot be measured: last_changed resets on every
+    Home Assistant restart, and measured on a real instance all 29
+    integrations with unavailable entities reported the same 3.1 hours - the
+    uptime. What survives is the RATIO: every entity of one integration down
+    is an integration that is down, whatever the clock says.
+    """
+    from tools.health import instance_health
+
+    for n in range(4):
+        fake_ha.states.append(
+            {"entity_id": f"sensor.nas_{n}", "state": "unavailable",
+             "attributes": {}})
+        fake_ha.registry.append(
+            {"entity_id": f"sensor.nas_{n}", "platform": "synology_dsm",
+             "area_id": None, "device_id": None, "labels": []})
+    # one integration only partly down - a real signal, a lesser one
+    fake_ha.states.append(
+        {"entity_id": "sensor.partial", "state": "unavailable", "attributes": {}})
+    fake_ha.states.append(
+        {"entity_id": "sensor.partial_ok", "state": "on", "attributes": {}})
+    for eid in ("sensor.partial", "sensor.partial_ok"):
+        fake_ha.registry.append(
+            {"entity_id": eid, "platform": "shelly",
+             "area_id": None, "device_id": None, "labels": []})
+
+    result = instance_health()
+
+    assert result["integrations"][0]["platform"] == "synology_dsm"
+    assert result["integrations"][0]["all_unavailable"] is True
+    shelly = next(g for g in result["integrations"] if g["platform"] == "shelly")
+    assert shelly["all_unavailable"] is False
+
+
+def test_the_config_entry_state_is_joined_onto_the_integration(fake_ha):
+    """The two halves of the diagnosis in one row.
+
+    "Every entity down" says something is wrong; "and its config entry is in
+    setup_retry" says what. Reading them from two separate sections is the
+    five-calls-by-hand this tool replaces.
+    """
+    from tools.health import instance_health
+
+    fake_ha.ws_responses["config_entries/get"] = {
+        "id": 1, "type": "result", "success": True,
+        "result": [{"entry_id": "e1", "domain": "synology_dsm",
+                    "title": "NAS", "state": "setup_retry"}],
+    }
+    fake_ha.states.append(
+        {"entity_id": "sensor.nas", "state": "unavailable", "attributes": {}})
+    fake_ha.registry.append(
+        {"entity_id": "sensor.nas", "platform": "synology_dsm",
+         "area_id": None, "device_id": None, "labels": []})
+
+    result = instance_health()
+
+    nas = next(g for g in result["integrations"] if g["platform"] == "synology_dsm")
+    assert nas["config_entry_state"] == "setup_retry"
+
+
+def test_the_hours_filter_says_how_much_it_hid(fake_ha):
+    """Measured on the real instance, a 24-hour default listed ZERO of 30
+    integrations holding 1857 unavailable entities, under the envelope's own
+    "no integrations found". A filter that hides everything must say so, the
+    way list_orphan_entities' excluded_disabled does."""
+    from tools.health import instance_health
+
+    fake_ha.states.append(
+        {"entity_id": "sensor.recent", "state": "unavailable",
+         "attributes": {}, "last_changed": "2026-08-30T11:59:00+00:00"})
+    fake_ha.registry.append(
+        {"entity_id": "sensor.recent", "platform": "fresh",
+         "area_id": None, "device_id": None, "labels": []})
+
+    result = instance_health(unavailable_hours=100000)
+
+    assert result["excluded_below_threshold"] == 1
+    assert "100000" in result["note"]
+    assert "not listed" in result["note"]

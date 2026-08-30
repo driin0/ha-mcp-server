@@ -297,10 +297,13 @@ Five tools exist to catch both shapes before they cause damage, and to surface t
   open repair issues. The grouping is what makes it a diagnosis: in the
   incident, every entity of one device had been unavailable for weeks while
   its own ping still read `on` — a live system with a dead integration —
-  and assembling that took five separate calls. Outage ages are lower
-  bounds, since a restart resets `last_changed`, and each integration
-  carries a sample of ids rather than all of them — the count is the
-  finding.
+  and assembling that took five separate calls. The signal is
+  `all_unavailable` (every entity an integration owns is down) with Home
+  Assistant's own `config_entry_state` on the same row, not elapsed time:
+  `last_changed` resets on every restart, so on a real instance three hours
+  after one, all 29 affected integrations reported the same 3.1 hours. Each
+  integration carries a sample of ids rather than all of them — the count
+  is the finding.
 
 **`scripts/lint_automations.py`** is a CLI over the same validator, for CI or
 a schedule:

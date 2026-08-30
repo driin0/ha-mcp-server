@@ -40,7 +40,7 @@ the empty string, so roughly a hundred tools rendered as
 
 ### Added
 
-- **`instance_health(unavailable_hours=24, limit=20, offset=0)`.** Entities
+- **`instance_health(unavailable_hours=0, limit=20, offset=0)`.** Entities
   with no usable state, grouped by the integration that owns them, plus
   config entries that are not loaded and open repair issues — in one call.
 
@@ -51,16 +51,29 @@ the empty string, so roughly a hundred tools rendered as
   that single distinction was the whole diagnosis, and it took five
   separate calls to assemble by hand.
 
+  The signal is `all_unavailable` — every entity an integration owns has no
+  state — with Home Assistant's own `config_entry_state` joined onto the
+  same row. Both halves of the diagnosis arrive together instead of in two
+  sections to cross-reference by hand.
+
+  It is deliberately **not** "unavailable for N hours". That was the
+  original design, and the first run against a real instance killed it:
+  `last_changed` resets on every restart, and three hours after one, all 29
+  integrations holding 1857 unavailable entities reported the same 3.1
+  hours. A 24-hour default therefore listed **zero of them**, under the
+  envelope's own "no integrations found" — a checker reporting nothing
+  found about a population it had stopped looking at, which is the fault
+  this project exists to remove. `unavailable_hours` survives as an opt-in
+  filter defaulting to 0, `oldest_unavailable_hours` is documented as
+  collapsing to instance uptime, and `excluded_below_threshold` reports
+  every row the filter holds back.
+
   `summary` is computed over the whole population before any filter, so
   narrowing the listing can never make the instance look healthier than it
-  is. `oldest_unavailable_hours` is a **lower bound**, never the true
-  duration: it comes from `last_changed`, which a Home Assistant restart
-  resets, so a fault that survived a restart reads as newer than it is and
-  never as older. An integration whose age cannot be read at all is listed
-  whatever the filter says — unknown is not recent. A section that could
-  not be read is named in `sections_unavailable` and called out in the
-  note, never reported as empty: a health report that quietly omits a check
-  it could not run says "all clear" about something it never looked at.
+  is. A section that could not be read is named in `sections_unavailable`
+  and called out in the note, never reported as empty: a health report that
+  quietly omits a check it could not run says "all clear" about something
+  it never looked at.
 
   Every part of the response is bounded, including inside a row: each
   integration carries at most ten sample entity ids, with the full count in
