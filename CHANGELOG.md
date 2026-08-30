@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.4.0
 
 - **`list_repairs` reports what the repair actually says.** Home Assistant
   puts the whole content of a repair in `translation_placeholders` — which
