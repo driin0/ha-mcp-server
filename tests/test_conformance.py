@@ -364,3 +364,48 @@ def test_success_defaulted_sites_catches_a_non_literal_default(tmp_path):
     offenders = _success_defaulted_sites(tmp_path)
 
     assert offenders == ["fake_tool.py:4"]
+
+
+def test_the_image_copies_every_root_module_the_server_imports():
+    """The failure no unit test could see.
+
+    2.2.0 shipped with `COPY server.py web.py stats.py ./` in the Dockerfile
+    and tool_tracking.py absent from it. The suite stayed green because
+    every test imports from the source tree; the add-on crashed on startup
+    with ModuleNotFoundError. A green build and a green CI both passed it
+    through.
+
+    This asserts the image would contain every root-level module server.py
+    imports - checked against the Dockerfile's COPY lines, since that is
+    where the omission lives.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    local_modules = {p.stem for p in root.glob("*.py")}
+
+    imported = set()
+    tree = ast.parse((root / "server.py").read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            imported.add(node.module.split(".")[0])
+    needed = (imported & local_modules) | {"server"}
+
+    copy_lines = [
+        line for line in (root / "Dockerfile").read_text().splitlines()
+        if line.startswith("COPY") and not line.lstrip("COPY ").startswith("--from=builder")
+    ]
+    copied = " ".join(copy_lines)
+
+    missing = sorted(
+        m for m in needed
+        if "*.py" not in copied and f"{m}.py" not in copied
+    )
+    assert missing == [], (
+        f"server.py imports {missing}, which the Dockerfile does not copy "
+        "into the image - the add-on would crash on startup with "
+        "ModuleNotFoundError, past a green suite."
+    )

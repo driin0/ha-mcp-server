@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.2.1
+
+2.2.0 did not start. The Dockerfile copied the root-level modules by name -
+`COPY server.py web.py stats.py ./` - and `tool_tracking.py`, added in
+2.2.0, was never added to that list. The add-on crashed on startup with
+`ModuleNotFoundError: No module named 'tool_tracking'`.
+
+Nothing caught it. The build was green, CI was green, and all 652 tests
+passed - because every test imports from the source tree, never from the
+image. A packaging list that has to be updated by hand is a check that
+stops checking the moment someone forgets, which is the failure this
+repository's own deny-list documents.
+
+The line is now a glob, so there is nothing left to forget, and a test
+parses the Dockerfile and fails when a module `server.py` imports would
+not reach the image.
+
 ## 2.2.0
 
 A write that timed out was reported as a failure while Home Assistant was

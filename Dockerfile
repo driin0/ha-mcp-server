@@ -24,7 +24,12 @@ COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/pytho
 
 WORKDIR /app
 
-COPY server.py web.py stats.py ./
+# A glob, not a list of names. An earlier version enumerated the modules
+# here; tool_tracking.py was added in 2.2.0, this line was not updated, and
+# the add-on crashed on startup with ModuleNotFoundError - past a green
+# build, a green CI and 652 passing tests, every one of which imports from
+# the source tree rather than from this image.
+COPY *.py ./
 COPY tools/ tools/
 COPY requirements.txt LICENSE ./
 
