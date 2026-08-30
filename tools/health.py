@@ -164,6 +164,13 @@ def instance_health(unavailable_hours: int = 0, limit: int = 20,
     `hours_are_a_lower_bound` is in the response so a reader cannot miss
     this, and the value is null when no age could be read at all.
 
+    `repairs` here is a compact roll-call - issue id, who raised it,
+    severity, type - deliberately without Home Assistant's
+    `translation_placeholders`, which is where a repair says which entities
+    or which blueprint it is about and which one real repair filled with
+    1424 entity ids. Call list_repairs() when a row needs acting on; this
+    tool answers "how much is open", not "what exactly".
+
     `sections_unavailable` names any section that could not be read -
     typically `repairs` or `config_entries` on a connection that will not
     forward those commands, the same Supervisor-proxy limitation

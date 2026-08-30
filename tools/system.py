@@ -68,13 +68,67 @@ def list_config_entries(domain: str = "") -> dict:
     return envelope(out, key="entries")
 
 
+# At most this many items from a placeholder that turns out to be a list,
+# and the length past which a placeholder is examined for one at all.
+#
+# One real repair carried 1424 entity ids in a single placeholder. Passed
+# through whole that is the 678 KB list_orphan_entities shipped in 2.0.0,
+# in a different field: an answer too large to be delivered. The count is
+# the finding; the ids are a sample to act on.
+_PLACEHOLDER_ITEMS = 10
+_PLACEHOLDER_CHARS = 300
+
+
+def _bounded_placeholder(value):
+    """One translation placeholder, bounded without losing what it said.
+
+    Home Assistant writes the long ones as a markdown bullet list - entity
+    ids, statistic ids, dashboard resource urls - so a value over the
+    length above is split back into its items and reported as
+    {count, sample}: the full length stays visible even though the rows do
+    not. A value that is long but not a list is truncated with an ellipsis
+    rather than silently cut, so a reader can tell.
+
+    Short values - a blueprint name, a label, a token's owner - are passed
+    through untouched. Nothing here knows which placeholder keys exist:
+    Home Assistant and its integrations invent them freely, and a list of
+    known keys kept here would go stale without ever failing.
+    """
+    if not isinstance(value, str) or len(value) <= _PLACEHOLDER_CHARS:
+        return value
+    items = [
+        line.strip().removeprefix("-").strip().strip("`")
+        for line in value.splitlines() if line.strip()
+    ]
+    if len(items) > 1:
+        return {"count": len(items), "sample": items[:_PLACEHOLDER_ITEMS]}
+    return value[:_PLACEHOLDER_CHARS] + "…"
+
+
 @mcp.tool()
 def list_repairs() -> dict:
     """
     List active repair issues in Home Assistant.
 
     Returns: {total, returned, offset, note?, repairs: [{issue_id, domain,
-             severity, title, ignored, created}]}
+             issue_domain, severity, title, is_fixable, ignored, created,
+             details}]}
+
+    `details` is Home Assistant's own `translation_placeholders`, and it is
+    where the repair actually says anything: which entities are dead, which
+    blueprint is unused, which token is stale, which service is missing.
+    Without it a caller gets `title: "dead_entities"` and no way to learn
+    what is dead - measured on a real instance, answering "are these 38
+    repairs real?" meant querying the WebSocket by hand. A long value (Home
+    Assistant writes those as a markdown list) is reported as
+    {count, sample} rather than in full: one repair carried 1424 entity ids.
+
+    `title` is Home Assistant's `translation_key`, a slug like
+    "dead_entities" - the repair's TYPE, not its rendered text, which lives
+    only in the frontend's translation files. `domain` is who raised the
+    repair (spook raises many); `issue_domain` is what it is about, which is
+    usually the actionable half. `is_fixable` says whether Home Assistant
+    offers a guided fix flow, as opposed to the repair only being a notice.
 
     An empty `repairs` with total 0 means there are no open, non-ignored
     issues. A failed call returns {error, detail} instead.
@@ -87,10 +141,16 @@ def list_repairs() -> dict:
         {
             "issue_id": i.get("issue_id"),
             "domain": i.get("domain"),
+            "issue_domain": i.get("issue_domain"),
             "severity": i.get("severity"),
             "title": i.get("translation_key"),
+            "is_fixable": i.get("is_fixable", False),
             "ignored": i.get("ignored", False),
             "created": i.get("created"),
+            "details": {
+                k: _bounded_placeholder(v)
+                for k, v in (i.get("translation_placeholders") or {}).items()
+            },
         }
         for i in issues
         if not i.get("ignored", False)

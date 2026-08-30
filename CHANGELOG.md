@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **`list_repairs` reports what the repair actually says.** Home Assistant
+  puts the whole content of a repair in `translation_placeholders` — which
+  entities are dead, which blueprint is unused, which token is stale, and
+  its own suggestion (`did you mean <a similarly named entity>?`,
+  `deleted on 2025-06-14`). All of it was discarded, leaving
+  `title: "dead_entities"` and no way to learn what was dead. Answering
+  "are these 38 repairs real?" on a real instance meant querying the
+  WebSocket by hand.
+
+  A long placeholder is reported as `{count, sample}` rather than in full:
+  one repair carried 1424 entity ids, another 416 orphaned statistics.
+  Nothing here knows which placeholder keys exist — integrations invent
+  them freely, and a list of known keys kept here would go stale without
+  ever failing.
+
+  Also added: `is_fixable`, which says whether Home Assistant offers a
+  guided fix rather than only a notice — 17 of 33 repairs on the instance
+  this was measured against — and `issue_domain`, what the repair is
+  *about*, as opposed to `domain`, which is who raised it.
+
 ## 2.3.0
 
 `instance_health` shipped in 2.2.0 ranking by how many entities an
