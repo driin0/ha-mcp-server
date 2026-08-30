@@ -37,6 +37,19 @@ COPY requirements.txt LICENSE ./
 # avvio: senza questa riga l'immagine si costruirebbe comunque.
 RUN python3 -c "import mcp, httpx, websockets, dotenv, pydantic_core, cryptography"
 
+# The dependency check above proves the libraries load. This one proves the
+# APPLICATION does - inside the image, which is the only place the question
+# is actually asked. 2.2.0 shipped without tool_tracking.py and crashed on
+# its first line, past a green build, a green CI and 652 passing tests: all
+# of them import from the source tree, and none had ever executed anything
+# in here.
+#
+# The dependency check above proves the libraries load. This proves the
+# APPLICATION does, inside the image - the only place the question is
+# actually asked. See build_check.py for why it takes two passes and why
+# `import server` alone is not one of them.
+RUN python3 build_check.py
+
 RUN adduser -u 10001 -D -H -s /sbin/nologin app && chown -R app:app /app
 USER app
 

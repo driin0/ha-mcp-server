@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **The image now proves it can start, at build time.** `build_check.py`
+  runs inside the image and imports every module `server.py` names —
+  reading them from the AST, so the ones inside `if __name__ ==
+  "__main__":` count too — plus every module actually present. The build
+  fails instead of the first start.
+
+  Two weaker versions were written and discarded first, and both looked
+  right: `import server` passes on the tree that crashed, because the
+  import that fails lives in the `__main__` block an import never runs;
+  and importing every `/app/*.py` present also passes, because a glob over
+  what is there cannot notice what is missing. Both were verified to fail
+  against the broken tree before this one was kept.
+
 ## 2.2.1
 
 2.2.0 did not start. The Dockerfile copied the root-level modules by name -
