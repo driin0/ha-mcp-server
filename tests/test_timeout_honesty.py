@@ -181,3 +181,103 @@ def test_ws_multi_names_the_commands_that_did_not_come_back(monkeypatch):
 
     assert caught.value.command_types == ("config/area_registry/create",)
     assert str(caught.value) != ""
+
+
+class _FakeToolManager:
+    def __init__(self, raises=None):
+        self._raises = raises
+        self.calls = []
+
+    async def call_tool(self, name, arguments, *args, **kwargs):
+        self.calls.append(name)
+        if self._raises is not None:
+            raise self._raises
+        return {"ok": True}
+
+
+class _FakeMcp:
+    def __init__(self, raises=None):
+        self._tool_manager = _FakeToolManager(raises)
+
+
+def test_the_net_is_actually_installed():
+    """The guard that must fail loudly.
+
+    The net lives on a monkeypatch of mcp._tool_manager.call_tool, a
+    PRIVATE SDK attribute. If a future SDK version renames it, the patch
+    stops applying in silence - and a correctness guarantee that can stop
+    applying without saying so is exactly the failure this repository's
+    deny-list documents. This test asserts the installation itself, not
+    only that the message reads well once installed.
+    """
+    import tool_tracking
+
+    fake = _FakeMcp()
+    original = fake._tool_manager.call_tool
+
+    installed = tool_tracking.install_call_tracking(fake)
+
+    assert fake._tool_manager.call_tool is installed
+    assert fake._tool_manager.call_tool is not original
+
+
+def test_the_sdk_still_exposes_the_attribute_the_net_hangs_on():
+    """If this fails, the SDK moved and the net is no longer installed
+    anywhere - regardless of what the rest of this file asserts."""
+    from tools._base import mcp
+
+    assert hasattr(mcp, "_tool_manager")
+    assert callable(getattr(mcp._tool_manager, "call_tool", None))
+
+
+@pytest.mark.anyio
+async def test_a_timed_out_write_reaches_the_caller_with_the_honest_text():
+    import tool_tracking
+
+    fake = _FakeMcp(raises=_httpx_timeout(
+        "POST", "http://ha.test/api/services/lock/unlock"))
+    tool_tracking.install_call_tracking(fake)
+
+    with pytest.raises(Exception) as caught:
+        await fake._tool_manager.call_tool("lock_control", {})
+
+    text = str(caught.value)
+    assert "write_outcome_unknown" in text
+    assert "may already have been applied" in text
+    assert text != "timed out"
+
+
+@pytest.mark.anyio
+async def test_a_websocket_timeout_reaches_the_caller_with_something_to_read():
+    """The case that used to arrive as an empty string."""
+    import tool_tracking
+
+    fake = _FakeMcp(raises=WsTimeout(
+        command_types=("config/area_registry/create",)))
+    tool_tracking.install_call_tracking(fake)
+
+    with pytest.raises(Exception) as caught:
+        await fake._tool_manager.call_tool("create_area", {})
+
+    assert "write_outcome_unknown" in str(caught.value)
+
+
+@pytest.mark.anyio
+async def test_a_non_timeout_error_passes_through_unchanged():
+    import tool_tracking
+
+    fake = _FakeMcp(raises=ValueError("something else entirely"))
+    tool_tracking.install_call_tracking(fake)
+
+    with pytest.raises(ValueError, match="something else entirely"):
+        await fake._tool_manager.call_tool("some_tool", {})
+
+
+@pytest.mark.anyio
+async def test_a_successful_call_is_returned_untouched():
+    import tool_tracking
+
+    fake = _FakeMcp()
+    tool_tracking.install_call_tracking(fake)
+
+    assert await fake._tool_manager.call_tool("some_tool", {}) == {"ok": True}
