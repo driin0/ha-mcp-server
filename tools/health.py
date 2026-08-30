@@ -43,6 +43,33 @@ def _hours_since(timestamp: str | None, now: datetime.datetime) -> float | None:
     return (now - when).total_seconds() / 3600.0
 
 
+# How urgent an integration's trouble is, most urgent first. The verdict is
+# Home Assistant's own - the config entry's state - not a guess made here
+# from how many entities are involved.
+#
+# Size is how loud a fault is, not how wrong it is. Measured on a real
+# instance: ibeacon had 1424 of 1424 entities unavailable with a healthy
+# entry, which for beacons out of range is their ordinary resting state,
+# and ranking by count put it above reolink 32/32 in setup_retry - an
+# actual camera that had stopped working.
+#
+# setup_error before not_loaded before setup_retry, by decreasing chance of
+# fixing itself: a retry may recover unattended, setup_error is typically
+# expired authentication and stays broken until a person acts.
+_ENTRY_TROUBLE = {"setup_error": 0, "migration_error": 0,
+                  "not_loaded": 1, "setup_retry": 2}
+
+
+def _tier(group: dict) -> int:
+    """0-2: Home Assistant says the entry is in trouble.
+    3: every entity is down but Home Assistant considers the entry fine.
+    4: only some entities are down."""
+    trouble = _ENTRY_TROUBLE.get(group["config_entry_state"])
+    if trouble is not None:
+        return trouble
+    return 3 if group["all_unavailable"] else 4
+
+
 @mcp.tool()
 def instance_health(unavailable_hours: int = 0, limit: int = 20,
                     offset: int = 0) -> dict:
@@ -85,9 +112,20 @@ def instance_health(unavailable_hours: int = 0, limit: int = 20,
     `config_entry_state` joins Home Assistant's own verdict onto the same
     row, matching the entry's domain to the entity's platform, so the two
     halves of the diagnosis arrive together instead of in two sections a
-    reader has to cross-reference by hand. It is null when the integration
-    has no unloaded entry - the interesting case where every entity is down
-    and Home Assistant still believes the entry is loaded.
+    reader has to cross-reference by hand. It is null only when the
+    integration has no config entry at all - a helper platform such as
+    `automation` or `group` - so "Home Assistant considers this healthy"
+    and "this question does not apply" stay distinguishable.
+
+    Rows are ordered by Home Assistant's verdict, not by size: an entry in
+    trouble first (`setup_error`, then `not_loaded`, then `setup_retry`),
+    then everything-down-but-loaded, then partial outages, and within each
+    by how many entities are affected. An earlier version called
+    everything-down-with-a-loaded-entry the case to look at hardest. Real
+    data says otherwise: it is usually an integration whose entities are
+    transient by design - 1424 of 1424 ibeacon entities unavailable is
+    beacons out of range, not a fault - and ranking it first buried the
+    cameras and the NAS that had actually stopped.
 
     `sample_entity_ids` is at most ten ids per integration, not the whole
     set: the count in `unavailable` is the finding, and the ids are there
@@ -172,15 +210,23 @@ def instance_health(unavailable_hours: int = 0, limit: int = 20,
         {"type": "config_entries/get"},
         {"type": "repairs/list_issues"},
     ])
+    entry_state: dict[str, str] = {}
     if ws_error(ws_results[0]):
         unreadable.append("config_entries")
     else:
-        config_entries = [
+        all_entries = [
             {"entry_id": e.get("entry_id"), "domain": e.get("domain"),
              "title": e.get("title"), "state": e.get("state")}
             for e in ws_results[0]["result"]
-            if e.get("state") != "loaded"
         ]
+        # Built from EVERY entry, before the filter below. Built from the
+        # filtered list instead, a loaded entry came back as None - the same
+        # value a platform with no entry at all gets, like automation or
+        # group. One field cannot mean both "Home Assistant considers this
+        # healthy" and "this question does not apply here": a reader cannot
+        # act on a difference it can no longer see.
+        entry_state = {e["domain"]: e["state"] for e in all_entries if e["domain"]}
+        config_entries = [e for e in all_entries if e["state"] != "loaded"]
     if ws_error(ws_results[1]):
         unreadable.append("repairs")
     else:
@@ -197,10 +243,7 @@ def instance_health(unavailable_hours: int = 0, limit: int = 20,
     # state says what. Home Assistant keys entries by domain and the entity
     # registry keys entities by platform; for an integration that owns its
     # own entities those are the same string, which is what this join
-    # assumes. A platform with no unloaded entry keeps None - including the
-    # case worth looking at hardest, where everything is down and Home
-    # Assistant still considers the entry loaded.
-    entry_state = {e["domain"]: e["state"] for e in config_entries if e["domain"]}
+    # assumes. Only a platform with no entry at all keeps None.
     for group in groups.values():
         group["all_unavailable"] = (
             group["unavailable"] > 0 and group["unavailable"] == group["total"])
@@ -230,10 +273,11 @@ def instance_health(unavailable_hours: int = 0, limit: int = 20,
         (g for g in affected
          if g["oldest_unavailable_hours"] is None
          or g["oldest_unavailable_hours"] >= unavailable_hours),
-        # Wholly-down first, then by how much is down. Deliberately NOT by
-        # age: see oldest_unavailable_hours in the docstring - ranking on a
-        # number that is the same for every row is ranking on nothing.
-        key=lambda g: (not g["all_unavailable"], -g["unavailable"], g["platform"]),
+        # Home Assistant's verdict first (see _tier), then size within it.
+        # Deliberately NOT by age: see oldest_unavailable_hours in the
+        # docstring - ranking on a number that is the same for every row is
+        # ranking on nothing.
+        key=lambda g: (_tier(g), -g["unavailable"], g["platform"]),
     )
     excluded = len(affected) - len(listed)
 

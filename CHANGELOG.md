@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **`instance_health` ranks by Home Assistant's verdict, not by size.** An
+  entry in trouble comes first (`setup_error`, then `not_loaded`, then
+  `setup_retry` — decreasing chance of recovering unattended), then
+  everything-down-with-a-healthy-entry, then partial outages.
+
+  Measured on a real instance: `ibeacon` had 1424 of 1424 entities
+  unavailable with a loaded entry — beacons out of range, their ordinary
+  resting state — and sorting by count put it above `reolink` 32/32 in
+  `setup_retry`, a camera that had actually stopped. Size is how loud a
+  fault is, not how wrong it is.
+
+- **`config_entry_state` no longer conflates two answers.** The join was
+  built from the list already filtered to unloaded entries, so a healthy
+  integration came back as `null` — the same value a platform with no
+  config entry at all gets, like `automation` or `group`. `loaded` is now a
+  value, and `null` means only "no entry exists".
+
+- **A docstring claim the data contradicted, corrected.** It called
+  everything-down-with-a-loaded-entry the case to look at hardest. It is
+  usually an integration whose entities are transient by design.
+
 - **The image now proves it can start, at build time.** `build_check.py`
   runs inside the image and imports every module `server.py` names —
   reading them from the AST, so the ones inside `if __name__ ==

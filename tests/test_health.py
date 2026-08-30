@@ -262,3 +262,117 @@ def test_the_hours_filter_says_how_much_it_hid(fake_ha):
     assert result["excluded_below_threshold"] == 1
     assert "100000" in result["note"]
     assert "not listed" in result["note"]
+
+
+def _entries(fake_ha, *rows):
+    fake_ha.ws_responses["config_entries/get"] = {
+        "id": 1, "type": "result", "success": True, "result": list(rows)}
+
+
+def _down(fake_ha, platform, n):
+    for i in range(n):
+        eid = f"sensor.{platform}_{i}"
+        fake_ha.states.append(
+            {"entity_id": eid, "state": "unavailable", "attributes": {}})
+        fake_ha.registry.append(
+            {"entity_id": eid, "platform": platform,
+             "area_id": None, "device_id": None, "labels": []})
+
+
+def test_a_loaded_entry_says_loaded_instead_of_nothing(fake_ha):
+    """`null` used to mean two different things.
+
+    The join was built from the list already filtered to unloaded entries,
+    so an integration Home Assistant considers healthy came back with
+    config_entry_state: null - indistinguishable from a platform that has
+    no config entry at all, like automation or group. A reader cannot act
+    on a field that conflates "fine" with "not applicable".
+    """
+    from tools.health import instance_health
+
+    _entries(fake_ha, {"entry_id": "e1", "domain": "ibeacon",
+                       "title": "iBeacon", "state": "loaded"})
+    _down(fake_ha, "ibeacon", 3)
+
+    result = instance_health()
+
+    row = next(g for g in result["integrations"] if g["platform"] == "ibeacon")
+    assert row["config_entry_state"] == "loaded"
+
+
+def test_no_entry_at_all_is_the_only_thing_that_stays_null(fake_ha):
+    from tools.health import instance_health
+
+    _entries(fake_ha)
+    _down(fake_ha, "some_helper_platform", 2)
+
+    result = instance_health()
+
+    row = next(g for g in result["integrations"]
+               if g["platform"] == "some_helper_platform")
+    assert row["config_entry_state"] is None
+
+
+def test_a_broken_entry_outranks_a_much_larger_healthy_one(fake_ha):
+    """Home Assistant's verdict decides the order, not the entity count.
+
+    Measured on a real instance: ibeacon had 1424 of 1424 entities down with
+    a loaded entry - the ordinary resting state of beacons out of range -
+    and sorting by size put it above reolink 32/32 in setup_retry, which was
+    an actual fault. Size is how loud a thing is, not how wrong it is.
+    """
+    from tools.health import instance_health
+
+    _entries(fake_ha,
+             {"entry_id": "e1", "domain": "ibeacon",
+              "title": "iBeacon", "state": "loaded"},
+             {"entry_id": "e2", "domain": "reolink",
+              "title": "Camera", "state": "setup_retry"})
+    _down(fake_ha, "ibeacon", 200)
+    _down(fake_ha, "reolink", 3)
+
+    result = instance_health()
+
+    order = [g["platform"] for g in result["integrations"]]
+    assert order.index("reolink") < order.index("ibeacon")
+
+
+def test_a_permanent_failure_outranks_one_home_assistant_is_retrying(fake_ha):
+    """setup_error is not setup_retry.
+
+    A retry may fix itself; setup_error will not - it is typically expired
+    authentication, and it stays broken until a person acts.
+    """
+    from tools.health import instance_health
+
+    _entries(fake_ha,
+             {"entry_id": "e1", "domain": "big_retry",
+              "title": "Retrying", "state": "setup_retry"},
+             {"entry_id": "e2", "domain": "small_error",
+              "title": "Broken", "state": "setup_error"})
+    _down(fake_ha, "big_retry", 50)
+    _down(fake_ha, "small_error", 1)
+
+    result = instance_health()
+
+    order = [g["platform"] for g in result["integrations"]]
+    assert order.index("small_error") < order.index("big_retry")
+
+
+def test_a_partial_outage_ranks_below_a_wholly_down_integration(fake_ha):
+    from tools.health import instance_health
+
+    _entries(fake_ha)
+    _down(fake_ha, "all_gone", 2)
+    _down(fake_ha, "half_gone", 3)
+    for i in range(9):
+        eid = f"sensor.half_gone_ok_{i}"
+        fake_ha.states.append({"entity_id": eid, "state": "on", "attributes": {}})
+        fake_ha.registry.append(
+            {"entity_id": eid, "platform": "half_gone",
+             "area_id": None, "device_id": None, "labels": []})
+
+    result = instance_health()
+
+    order = [g["platform"] for g in result["integrations"]]
+    assert order.index("all_gone") < order.index("half_gone")
