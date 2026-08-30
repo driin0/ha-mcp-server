@@ -281,3 +281,47 @@ async def test_a_successful_call_is_returned_untouched():
     tool_tracking.install_call_tracking(fake)
 
     assert await fake._tool_manager.call_tool("some_tool", {}) == {"ok": True}
+
+
+def test_httpx_attaches_the_request_to_a_timeout_it_raises(fake_ha):
+    """The library property the whole read/write distinction rests on.
+
+    timeout_message() reads exc.request.method rather than consulting a
+    hand-kept list of write tools, precisely so there is no list to go
+    stale. That trade is only sound while httpx keeps attaching the request
+    to a transport error - it does so in Client._send_single_request, and
+    it is not something this codebase controls. If a future httpx stops,
+    every write would silently take the cautious default and every read
+    would be described as possibly-applied; this test is what says so out
+    loud instead.
+    """
+    from tools.lights import set_light
+
+    fake_ha.raise_rest("/api/services/light/", httpx.ReadTimeout("timed out"))
+
+    with pytest.raises(httpx.ReadTimeout) as caught:
+        set_light("light.kitchen", "off")
+
+    assert caught.value.request.method == "POST"
+
+
+def test_a_real_write_tool_timing_out_is_described_as_a_write(fake_ha):
+    from tools.lights import set_light
+
+    fake_ha.raise_rest("/api/services/light/", httpx.ReadTimeout("timed out"))
+
+    with pytest.raises(httpx.ReadTimeout) as caught:
+        set_light("light.kitchen", "off")
+
+    assert "write_outcome_unknown" in timeout_message(caught.value, "set_light")
+
+
+def test_a_real_read_tool_timing_out_is_described_as_a_read(fake_ha):
+    from tools.diagnostics import get_entity
+
+    fake_ha.raise_rest("/api/states/", httpx.ReadTimeout("timed out"))
+
+    with pytest.raises(httpx.ReadTimeout) as caught:
+        get_entity("light.kitchen")
+
+    assert "read_timeout" in timeout_message(caught.value, "get_entity")
