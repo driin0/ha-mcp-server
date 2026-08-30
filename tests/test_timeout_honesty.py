@@ -143,3 +143,41 @@ def test_the_read_list_holds_only_commands_this_codebase_sends():
 
     unsent = [cmd for cmd in WS_READ_COMMANDS if f'"{cmd}"' not in sources]
     assert unsent == []
+
+
+def test_ws_multi_names_the_commands_that_did_not_come_back(monkeypatch):
+    """A WS timeout used to reach the caller as an empty string.
+
+    concurrent.futures.TimeoutError's str() is '', so the SDK rendered
+    `Error executing tool <name>: ` - an error with no stated cause. The
+    command types are the cheapest thing that makes it say something.
+    """
+    import tools._base as base
+
+    class _NeverFinishes:
+        def submit(self, _fn, coro, *args, **kwargs):
+            # Never scheduled, so close it explicitly: an un-awaited
+            # coroutine raises a ResourceWarning that belongs to this fake,
+            # not to the code under test, and noise in a suite is how a real
+            # warning stops being noticed.
+            coro.close()
+
+            class _F:
+                def result(self, timeout=None):
+                    raise concurrent.futures.TimeoutError()
+            return _F()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor",
+                        lambda *a, **k: _NeverFinishes())
+
+    with pytest.raises(WsTimeout) as caught:
+        base._ws_multi([{"type": "config/area_registry/create", "name": "x"}])
+
+    assert caught.value.command_types == ("config/area_registry/create",)
+    assert str(caught.value) != ""
