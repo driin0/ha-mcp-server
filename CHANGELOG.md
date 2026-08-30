@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased
+## 2.3.0
+
+`instance_health` shipped in 2.2.0 ranking by how many entities an
+integration had down. On a real instance that put `ibeacon` first with 1424
+of 1424 unavailable — beacons out of range, their ordinary resting state —
+and buried the camera, the NAS and the printer that had actually stopped.
+Size is how loud a fault is, not how wrong it is.
+
+- **An integration with several entries reports its worst one.** The join
+  was a dict comprehension, so the state shown was whichever entry Home
+  Assistant happened to return last: it could say `loaded` with a broken
+  entry of the same integration sitting right there, and could change
+  between two calls with nothing having changed. An unrecognised state now
+  ranks ahead of `loaded` rather than behind it — Home Assistant may add
+  one at any time, and a state this code does not know is not evidence of
+  health.
 
 - **`instance_health` ranks by Home Assistant's verdict, not by size.** An
   entry in trouble comes first (`setup_error`, then `not_loaded`, then
