@@ -1,4 +1,5 @@
 import os
+import re
 import urllib.parse
 
 import httpx
@@ -93,6 +94,66 @@ _SECRET_HINTS = (
 # Names that are a credential on their own rather than as part of a word.
 _SECRET_EXACT = {"key", "auth", "pass", "pin", "certificate", "cert"}
 
+_REDACTED = "<redacted>"
+
+
+def _is_secret_name(name) -> bool:
+    # "--api-key", "api.key" and "API_KEY" are the same name.
+    lowered = str(name).lower().lstrip("-").replace("-", "_").replace(".", "_")
+    return lowered in _SECRET_EXACT or any(h in lowered for h in _SECRET_HINTS)
+
+
+def _is_unset(value) -> bool:
+    # An unset credential is shown as unset: that is the one thing the caller
+    # is entitled to learn about it. (0 == False, so 0 counts as unset too.)
+    return value in (None, "", False) or value == [] or value == {}
+
+
+# Credentials embedded in free text — an install command, a URL, a header.
+# The option's name says nothing there ("install_command"), so the text
+# itself is searched for the shapes a credential takes.
+_VALUE_END = r"[^\s&#;'\"]+"
+# name=value: a URL query parameter, an env assignment, --flag=value.
+_ASSIGNMENT = re.compile(r"(?<![\w-])(-{0,2}[A-Za-z][\w.-]*)=(" + _VALUE_END + ")")
+# --flag value
+_FLAG = re.compile(r"(?<![\w-])(--?[A-Za-z][\w-]*)(\s+)(?!-)(" + _VALUE_END + ")")
+# scheme://user:password@host
+_USERINFO = re.compile(r"(://[^/\s:@]+:)[^/\s@]+(@)")
+# Authorization: <scheme> <credential>, and a bearer token anywhere.
+_AUTH_HEADER = re.compile(
+    r"(authorization\s*[:=]\s*(?:bearer|basic|token|digest)?\s*)" + _VALUE_END, re.I)
+_BEARER = re.compile(r"(\bbearer\s+)" + _VALUE_END, re.I)
+
+
+def _redact_text(text: str) -> str:
+    text = _USERINFO.sub(r"\1" + _REDACTED + r"\2", text)
+    text = _AUTH_HEADER.sub(r"\1" + _REDACTED, text)
+    text = _BEARER.sub(r"\1" + _REDACTED, text)
+    text = _ASSIGNMENT.sub(
+        lambda m: f"{m[1]}={_REDACTED}" if _is_secret_name(m[1]) else m[0], text)
+    text = _FLAG.sub(
+        lambda m: f"{m[1]}{m[2]}{_REDACTED}" if _is_secret_name(m[1]) else m[0], text)
+    return text
+
+
+def _redact(value):
+    """Walk an options tree, hiding credentials at any depth.
+
+    A credential-named key hides its whole value, whatever its shape. Anything
+    else is walked into: dicts and lists at any depth, and strings are
+    searched for credentials embedded in them.
+    """
+    if isinstance(value, dict):
+        return {
+            name: (_REDACTED if _is_secret_name(name) and not _is_unset(v) else _redact(v))
+            for name, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    if isinstance(value, str):
+        return _redact_text(value)
+    return value
+
 
 def _redact_options(options: dict) -> dict:
     """Replace option values that look like credentials.
@@ -102,16 +163,13 @@ def _redact_options(options: dict) -> dict:
     endpoint. Returning them verbatim hands a credential to whoever asks, so
     the value is replaced while the key stays visible: the caller still learns
     that the option is set.
+
+    Options are not flat: the SSH add-on keeps its password at
+    options.ssh.password, Mosquitto a list of login objects, and an install
+    command can carry a token in a URL. Checking top-level names only let all
+    three through, so the whole tree is walked.
     """
-    redacted = {}
-    for name, value in (options or {}).items():
-        lowered = name.lower()
-        sensitive = lowered in _SECRET_EXACT or any(h in lowered for h in _SECRET_HINTS)
-        if sensitive and value not in (None, "", False):
-            redacted[name] = "<redacted>"
-        else:
-            redacted[name] = value
-    return redacted
+    return _redact(options or {})
 
 
 @mcp.tool()
