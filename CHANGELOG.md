@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.4.1
+
+- **`get_addon` redacts credentials at any depth, and inside text.** The
+  redaction promised by the docstring only looked at top-level option
+  names, so two shapes went through in clear:
+
+  - credentials one level down — the SSH add-on keeps its password at
+    `options.ssh.password`, Mosquitto keeps a list of login objects;
+  - credentials embedded in a value whose name says nothing about them —
+    an `install_command` carrying `?enroll_token=…` in a URL.
+
+  The whole options tree is now walked (dicts and lists, any depth), and
+  string values are searched for the shapes a credential takes: a
+  credential-named URL query parameter, `name=value` assignment or
+  `name: value` line (YAML, JSON, headers such as `X-API-Key:`), quoted or
+  not; `--token value` / `--api-key=value` flags; `user:password@` in a URL;
+  `Authorization:` headers and `Bearer` tokens. The rest of the text stays
+  readable. A credential-named option holding an object is hidden whole.
+
+  Names are now matched word by word as well, so `mqtt_pass`, `wifi_psk`
+  and Zigbee2MQTT's `network_key` are caught, while `passive_mode` and
+  `authorized_keys` are not. `apiKey`, `api-key` and `API_KEY` are the
+  same name.
+
+  Still not caught, and not catchable from text alone: a secret with
+  nothing around it to say what it is, or passed to a one-letter flag
+  (`-p value`).
+
+  `get_supervisor_info`, `list_config_entries` and `get_config` were checked
+  too: they return a fixed set of fields and never pass options through.
+
 ## 2.4.0
 
 - **`list_repairs` reports what the repair actually says.** Home Assistant
