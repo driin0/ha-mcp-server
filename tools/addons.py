@@ -88,19 +88,25 @@ def list_addons(search: str = "") -> dict:
 # "mcp_secret" and "telegram_api_token" are both caught — but not
 # "alexa_keywords", which a bare "key" would have swallowed.
 _SECRET_HINTS = (
-    "secret", "token", "password", "passwd", "passphrase",
-    "credential", "api_key", "apikey", "private_key", "access_key",
+    "secret", "token", "password", "passwd", "passphrase", "passcode",
+    "credential", "api_key", "apikey", "private_key", "access_key", "privkey",
 )
-# Names that are a credential on their own rather than as part of a word.
-_SECRET_EXACT = {"key", "auth", "pass", "pin", "certificate", "cert"}
+# Words that are a credential on their own rather than as part of a longer
+# word. Matched against each word of the name, so "mqtt_pass" and
+# Zigbee2MQTT's "network_key" are caught, "passive_mode" and
+# "authorized_keys" are not.
+_SECRET_WORDS = {"key", "auth", "pass", "pin", "psk", "pwd", "certificate", "cert"}
 
 _REDACTED = "<redacted>"
 
 
 def _is_secret_name(name) -> bool:
-    # "--api-key", "api.key" and "API_KEY" are the same name.
-    lowered = str(name).lower().lstrip("-").replace("-", "_").replace(".", "_")
-    return lowered in _SECRET_EXACT or any(h in lowered for h in _SECRET_HINTS)
+    # "apiKey", "--api-key", "api.key", "api%5Fkey" and "API_KEY" are one name.
+    text = urllib.parse.unquote(str(name))
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text).lower()
+    words = [w for w in re.split(r"[^a-z0-9]+", text) if w]
+    joined = "_".join(words)
+    return any(w in _SECRET_WORDS for w in words) or any(h in joined for h in _SECRET_HINTS)
 
 
 def _is_unset(value) -> bool:
@@ -109,20 +115,27 @@ def _is_unset(value) -> bool:
     return value in (None, "", False) or value == [] or value == {}
 
 
-# Credentials embedded in free text — an install command, a URL, a header.
-# The option's name says nothing there ("install_command"), so the text
-# itself is searched for the shapes a credential takes.
-_VALUE_END = r"[^\s&#;'\"]+"
-# name=value: a URL query parameter, an env assignment, --flag=value.
-_ASSIGNMENT = re.compile(r"(?<![\w-])(-{0,2}[A-Za-z][\w.-]*)=(" + _VALUE_END + ")")
+# Credentials embedded in free text — an install command, a URL, a header,
+# a JSON or YAML snippet. The option's name says nothing there
+# ("install_command"), so the text itself is searched for the shapes a
+# credential takes. A value is a quoted string (spaces and all) or a run of
+# characters up to the next separator.
+_VALUE = r"""(?:"[^"\n]*"|'[^'\n]*'|[^\s&#;'",}]+)"""
+_NAME = r"""(["']?)(-{0,2}[A-Za-z][\w.%-]*)\1"""
+# name=value (a query parameter, an env assignment, --flag=value) and
+# name: value (a header, YAML, JSON).
+# A colon counts only when followed by a space or a quote, as in YAML and
+# JSON: otherwise "https:" reads as a name and swallows the whole URL.
+_ASSIGNMENT = re.compile(
+    r"(?<![\w-])" + _NAME + r"(\s*=\s*|\s*:(?=[\s\"'])\s*)(" + _VALUE + ")")
 # --flag value
-_FLAG = re.compile(r"(?<![\w-])(--?[A-Za-z][\w-]*)(\s+)(?!-)(" + _VALUE_END + ")")
+_FLAG = re.compile(r"(?<![\w-])(--?[A-Za-z][\w-]*)(\s+)(?!-)(" + _VALUE + ")")
 # scheme://user:password@host
 _USERINFO = re.compile(r"(://[^/\s:@]+:)[^/\s@]+(@)")
 # Authorization: <scheme> <credential>, and a bearer token anywhere.
 _AUTH_HEADER = re.compile(
-    r"(authorization\s*[:=]\s*(?:bearer|basic|token|digest)?\s*)" + _VALUE_END, re.I)
-_BEARER = re.compile(r"(\bbearer\s+)" + _VALUE_END, re.I)
+    r"(authorization\s*[:=]\s*(?:bearer|basic|token|digest)?\s*)" + _VALUE, re.I)
+_BEARER = re.compile(r"(\bbearer\s+)" + _VALUE, re.I)
 
 
 def _redact_text(text: str) -> str:
@@ -130,7 +143,8 @@ def _redact_text(text: str) -> str:
     text = _AUTH_HEADER.sub(r"\1" + _REDACTED, text)
     text = _BEARER.sub(r"\1" + _REDACTED, text)
     text = _ASSIGNMENT.sub(
-        lambda m: f"{m[1]}={_REDACTED}" if _is_secret_name(m[1]) else m[0], text)
+        lambda m: f"{m[1]}{m[2]}{m[1]}{m[3]}{_REDACTED}" if _is_secret_name(m[2]) else m[0],
+        text)
     text = _FLAG.sub(
         lambda m: f"{m[1]}{m[2]}{_REDACTED}" if _is_secret_name(m[1]) else m[0], text)
     return text

@@ -85,6 +85,13 @@ def test_a_token_in_a_url_query_string_is_redacted(addon):
     "agent --token {s} --verbose",
     "agent --api-key={s}",
     "TOKEN={s} ./run.sh",
+    'TOKEN="{s}" ./run.sh',
+    "agent --token '{s}'",
+    'agent --password "{s} with spaces"',
+    '{{"token": "{s}"}}',
+    "password: {s}",
+    "X-API-Key: {s}",
+    "https://h/p?api%5Fkey={s}",
 ])
 def test_credential_shapes_inside_free_text_are_redacted(addon, template):
     options = addon({"command": template.format(s=PLANTED)})
@@ -101,6 +108,25 @@ def test_credential_shapes_inside_free_text_are_redacted(addon, template):
 ])
 def test_ordinary_text_is_left_alone(addon, text):
     assert addon({"command": text})["command"] == text
+
+
+@pytest.mark.parametrize("name", [
+    "mqtt_pass", "network_key", "encryption_key", "wifi_psk", "apiKey",
+    "admin_pwd", "MQTT-PASS",
+])
+def test_names_whose_last_word_is_a_credential_are_redacted(addon, name):
+    # Zigbee2MQTT's network_key is a list of numbers, not a string.
+    options = addon({name: [1, 2, 3] if name == "network_key" else PLANTED})
+
+    assert options[name] == "<redacted>"
+
+
+@pytest.mark.parametrize("name", [
+    "alexa_keywords", "keyboard_layout", "authorized_keys", "certfile",
+    "passive_mode", "spinner",
+])
+def test_names_merely_containing_a_credential_word_are_left_alone(addon, name):
+    assert addon({name: "visible"})[name] == "visible"
 
 
 def test_an_empty_nested_credential_still_reads_as_unset(addon):
