@@ -232,7 +232,8 @@ def get_logbook(hours: int = 6, entity_id: str = "") -> dict:
 # [logger] message". A line that does not start like this (a traceback) belongs
 # to the record above it.
 _RECORD_START = re.compile(
-    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? (DEBUG|INFO|WARNING|ERROR|CRITICAL) ")
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})? "
+    r"(DEBUG|INFO|WARNING|ERROR|CRITICAL) ")
 # Lines the add-on container itself writes into the same journal (s6
 # overlay, init scripts). They are not continuations of the HA record above
 # them, so each starts a record of its own.
@@ -274,7 +275,8 @@ def _min_level(level: str) -> tuple[int, dict | None]:
 
 
 @mcp.tool()
-def get_core_logs(lines: int = 100, grep: str = "", level: str = "", scan: int = 2000) -> dict:
+def get_core_logs(lines: int = 100, grep: str = "", level: str = "", scan: int = 2000,
+                  max_chars: int = 40000) -> dict:
     """
     Read Home Assistant Core's log through the Supervisor, filtered before
     it reaches you.
@@ -288,6 +290,9 @@ def get_core_logs(lines: int = 100, grep: str = "", level: str = "", scan: int =
     level: minimum level - DEBUG, INFO, WARNING, ERROR or CRITICAL.
     scan:  how many journal lines to fetch and search, the most recent
            (default 2000, 2..10000). Raise it to look further back.
+    max_chars: ceiling on the size of `log` (default 40000, min 1000).
+           Records are kept newest first until the next would not fit;
+           a single record larger than the ceiling is cut at its end.
 
     Requires the Supervisor (Home Assistant OS / Supervised, add-on with
     manager role). Without one, use get_system_log(), which reads the
@@ -326,6 +331,18 @@ def get_core_logs(lines: int = 100, grep: str = "", level: str = "", scan: int =
     matching = [rec for rec in records
                 if _record_level(rec) >= min_level and (not needle or needle in rec.casefold())]
     kept = matching[-lines:] if lines > 0 else matching
+    max_chars = max(1000, max_chars)
+    budget, fitted = max_chars, []
+    for rec in reversed(kept):
+        cost = len(rec) + (1 if fitted else 0)
+        if cost > budget:
+            if not fitted:  # one huge record: keep its head
+                fitted.append(rec[:max_chars])
+            break
+        fitted.append(rec)
+        budget -= cost
+    capped = len(fitted) < len(kept) or (fitted and len(fitted[0]) < len(kept[-1]))
+    kept = list(reversed(fitted))
     if not matching:
         note = (f"no matching record in the last {scan} lines - raise scan to look further back"
                 if scanned >= scan else
@@ -335,6 +352,10 @@ def get_core_logs(lines: int = 100, grep: str = "", level: str = "", scan: int =
                 "raise lines or narrow with grep/level")
     else:
         note = ""
+    if capped:
+        note = (note + "; " if note else "") + (
+            f"output capped at max_chars={max_chars} - narrow with grep/level "
+            "or raise max_chars")
     out = {"scanned_lines": scanned, "records_scanned": len(records),
            "matched": len(matching), "returned": len(kept)}
     if note:

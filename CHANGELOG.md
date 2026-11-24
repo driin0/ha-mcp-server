@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.6.1
+
+- **`get_core_logs` recognises the log format Home Assistant OS actually
+  writes.** The record prefix carries a UTC offset
+  (`2026-11-24 15:26:00.109+01:00 ERROR (MainThread) [...]`), which the
+  parser did not accept: on a real instance not one line was recognised as
+  the start of a record, the whole scan became one record, and
+  `grep="smartthinq"` returned 691 KB instead of the 28 matching records.
+  Found verifying 2.6.0 through the updated add-on; the tests had used the
+  format without an offset.
+- `get_core_logs` gains `max_chars` (default 40000): the most recent
+  records are kept until the next one would not fit, with a note, so a
+  page of long tracebacks cannot exceed what an MCP client accepts.
+
 ## 2.6.0
 
 - **`get_history` returns the window it was asked for.** Home Assistant's
