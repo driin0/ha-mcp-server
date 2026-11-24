@@ -69,12 +69,13 @@ def _resolve_category(scope: str, category: str,
         if other == scope:
             continue
         other_entries, err = _list_categories(other)
-        if not err and any(e["name"].casefold() == category.casefold()
+        if not err and any(e["category_id"] == category
+                           or e["name"].casefold() == category.casefold()
                            for e in other_entries):
             elsewhere.append(other)
     detail = f"No category {category!r} in scope {scope!r}."
     if elsewhere:
-        detail += (f" A category with that name exists in {', '.join(elsewhere)} - "
+        detail += (f" A category with that name or id exists in {', '.join(elsewhere)} - "
                    "category ids differ per scope; create it in "
                    f"{scope!r} too with create_category().")
     return None, error("category_not_found", detail, scope=scope, category=category,
@@ -369,7 +370,7 @@ def set_entity_category(entity_id: str, category: str) -> dict:
 
 
 @mcp.tool()
-def bulk_set_entity_category(entity_ids: list, category: str) -> dict:
+def bulk_set_entity_category(entity_ids: list[str], category: str) -> dict:
     """
     Put many entities in a category (or take them out with category="").
 
@@ -383,7 +384,10 @@ def bulk_set_entity_category(entity_ids: list, category: str) -> dict:
     Everything is resolved before anything is sent; entities that cannot
     take the category (not in the registry, not categorisable, category
     missing in their scope) are listed in `failed` with the reason and are
-    not written. The rest go in one WebSocket batch.
+    not written. The rest go in one WebSocket batch, and each reply is
+    checked: an update Home Assistant accepted but returned without the
+    intended category is in `failed` as config_write_unverified, the same
+    check set_entity_category() makes.
 
     Returns: {total, succeeded, failed: [{entity_id, reason}]}, or an
     error() envelope - "too_many_entities" (over 200, nothing sent), a
@@ -419,25 +423,37 @@ def bulk_set_entity_category(entity_ids: list, category: str) -> dict:
                 resolved[scope] = (None, None)
             else:
                 target, err = _resolve_category(scope, category)
+                if err and err["error"] != "category_not_found":
+                    # The registry itself could not be read: one systemic
+                    # failure, not a per-entity verdict. Nothing sent yet.
+                    return err
                 resolved[scope] = ((target["category_id"], None) if target
                                    else (None, f"{err['error']}: {err['detail']}"))
         target_id, reason = resolved[scope]
         if reason:
             failed.append({"entity_id": eid, "reason": reason})
             continue
-        to_send.append((eid, {"type": "config/entity_registry/update", "entity_id": eid,
-                              "categories": {scope: target_id}}))
+        to_send.append((eid, scope, target_id,
+                        {"type": "config/entity_registry/update", "entity_id": eid,
+                         "categories": {scope: target_id}}))
 
-    results = _ws_multi([m for _, m in to_send]) if to_send else []
+    results = _ws_multi([m for *_, m in to_send]) if to_send else []
     if results and (transport_err := ws_transport_error(results[0])):
         return transport_err
     succeeded = 0
-    for (eid, _), res in zip(to_send, results):
-        if res.get("success"):
-            succeeded += 1
-        else:
+    for (eid, scope, target_id, _), res in zip(to_send, results):
+        if not res.get("success"):
             msg = (res.get("error") or {}).get("message", "rejected")
             failed.append({"entity_id": eid, "reason": f"home_assistant_error: {msg}"})
+            continue
+        stored = (((res.get("result") or {}).get("entity_entry") or {})
+                  .get("categories") or {}).get(scope)
+        if stored != target_id:
+            failed.append({"entity_id": eid, "reason":
+                           f"config_write_unverified: accepted, but returned with "
+                           f"{stored!r} in scope {scope!r} instead of {target_id!r}"})
+            continue
+        succeeded += 1
     return {"total": len(entity_ids), "succeeded": succeeded, "failed": failed}
 
 

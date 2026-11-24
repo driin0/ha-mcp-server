@@ -296,7 +296,7 @@ def test_bulk_by_id_fails_the_entities_of_other_scopes(reg):
     assert r["succeeded"] == 1
     failed = {f["entity_id"]: f["reason"] for f in r["failed"]}
     assert set(failed) == {"timer.lavatrice", "sensor.lavatrice"}
-    assert "helpers" in failed["timer.lavatrice"]
+    assert "exists in automation" in failed["timer.lavatrice"]
     assert "not_categorizable" in failed["sensor.lavatrice"]
     sent = {w["entity_id"] for w in _writes(reg, "config/entity_registry/update")}
     assert "timer.lavatrice" not in sent
@@ -319,3 +319,43 @@ def test_bulk_transport_failure_is_one_error(reg):
     r = bulk_set_entity_category(["automation.morning"], "A")
 
     assert r["error"] == "websocket_error"
+
+
+# ---- review gate fixes ------------------------------------------------------
+
+def test_bulk_turns_an_unreadable_category_registry_into_one_error(reg):
+    """A systemic read failure must not read as N entity-level rejections."""
+    reg.fail_ws("config/category_registry/list", code="unknown_command", message="Unknown command.")
+
+    r = bulk_set_entity_category(["automation.morning", "script.wash"], "A")
+
+    assert r["error"] == "unknown_command"
+
+
+def test_bulk_reports_a_write_that_did_not_land(reg):
+    _mk(reg, "automation", "A")
+    reg.ws_result("config/entity_registry/update",
+                  {"entity_entry": {"entity_id": "automation.morning", "categories": {}}})
+
+    r = bulk_set_entity_category(["automation.morning"], "A")
+
+    assert r["succeeded"] == 0
+    assert r["failed"][0]["reason"].startswith("config_write_unverified")
+
+
+def test_an_id_from_another_scope_names_the_scope_it_belongs_to(reg):
+    helpers_id = _mk(reg, "helpers", "Elettrodomestici")
+
+    r = set_entity_category("automation.morning", helpers_id)
+
+    assert r["error"] == "category_not_found"
+    assert r["exists_in_scopes"] == ["helpers"]
+
+
+def test_bulk_rejects_non_string_entity_ids_at_the_schema():
+    from tools._base import mcp
+
+    tool = mcp._tool_manager.get_tool("bulk_set_entity_category")
+    schema = tool.parameters["properties"]["entity_ids"]
+
+    assert schema.get("items", {}).get("type") == "string"
