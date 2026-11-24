@@ -297,6 +297,7 @@ WS_READ_COMMANDS = frozenset({
     "backup/info",
     "blueprint/list",
     "config/area_registry/list",
+    "config/category_registry/list",
     "config/auth/list",
     "config/device_registry/list",
     "config/entity_registry/get",
