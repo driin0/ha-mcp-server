@@ -305,3 +305,13 @@ def test_a_non_numeric_list_insert_is_a_bad_path(ha):
     r = patch_dashboard("casa", f"{SEC}.x", {"type": "a"}, op="insert", expect={"type": "tile"})
 
     assert r["error"] == "bad_path"
+
+
+def test_an_unverified_write_whose_read_back_differs_does_not_claim_it_landed(ha):
+    ha.lovelace_save_discarded = True
+
+    r = patch_dashboard("casa", "button_card_templates.wm_btn.show_icon", False)
+
+    assert r["error"] == "config_write_unverified"
+    assert "DID happen" not in r["detail"]
+    assert "does not contain" in r["detail"]

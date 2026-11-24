@@ -142,3 +142,49 @@ def test_list_automations_keeps_its_truncation_note_with_categories(home, fake_h
     r = list_automations(limit=1)
 
     assert "1 of 2" in r["note"]
+
+
+# ---- final review ---------------------------------------------------------------
+
+def test_a_category_read_timeout_does_not_break_an_unfiltered_list(home, monkeypatch):
+    """list_scripts/scenes/helpers were REST-only before categories; a
+    timeout on the optional category read must not fail the listing."""
+    from tools import categories
+    from tools._base import WsTimeout
+
+    def boom(*a, **k):
+        raise WsTimeout(command_types=("config/category_registry/list",))
+
+    monkeypatch.setattr(categories, "_ws", boom)
+    monkeypatch.setattr(categories, "_ws_multi", boom)
+
+    r = list_scripts()
+
+    assert {row["entity_id"] for row in r["scripts"]} >= {"script.wash", "script.dry"}
+    assert "categor" in r["note"]
+
+
+def test_a_category_read_timeout_with_a_filter_still_raises(home, monkeypatch):
+    from tools import categories
+    from tools._base import WsTimeout
+
+    def boom(*a, **k):
+        raise WsTimeout(command_types=("config/category_registry/list",))
+
+    monkeypatch.setattr(categories, "_ws", boom)
+    monkeypatch.setattr(categories, "_ws_multi", boom)
+
+    with pytest.raises(WsTimeout):
+        list_scripts(category="Elettrodomestici")
+
+
+def test_list_helpers_by_category_includes_disabled_helpers(home, fake_ha):
+    row = next(e for e in fake_ha.registry if e["entity_id"] == "timer.lavatrice")
+    row["disabled_by"] = "user"
+    fake_ha.states = [s for s in fake_ha.states if s["entity_id"] != "timer.lavatrice"]
+
+    r = list_helpers(category="Elettrodomestici")
+
+    rows = _by_id(r["helpers"])
+    assert rows["timer.lavatrice"]["state"] is None
+    assert rows["timer.lavatrice"]["disabled_by"] == "user"

@@ -123,8 +123,12 @@ def get_history(entity_id: str, hours: int = 24, start: str = "", end: str = "",
     changed attributes but not the state.
 
     Errors: {error: "invalid_window"} for hours <= 0, an unparseable
-    start/end, or start not before end. Nothing is requested in that case.
+    start/end, or start not before end; {error: "invalid_limit"} for a
+    negative limit. Nothing is requested in either case.
     """
+    if limit < 0:
+        return error("invalid_limit", f"limit must be >= 0 (0 = no limit), got {limit}.",
+                     entity_id=entity_id)
     now = datetime.now(timezone.utc)
     try:
         end_dt = min(_parse_utc(end), now) if end else now

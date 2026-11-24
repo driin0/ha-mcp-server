@@ -15,7 +15,9 @@ helpers/category_registry.py, components/config/entity_registry.py):
   and then never shown anywhere in the UI. Resolving and validating the
   category is therefore this module's job, done before anything is sent.
 """
-from tools._base import mcp, _ws, _ws_multi, envelope, error, ws_error, ws_transport_error
+from tools._base import (
+    mcp, _ws, _ws_multi, envelope, error, ws_error, ws_transport_error, WsTimeout,
+)
 
 CATEGORY_SCOPES = ("automation", "script", "scene", "helpers")
 
@@ -467,36 +469,45 @@ def category_context(scope: str, category: str = "",
 
     Returns {"error": envelope} when a `category` filter was given and it
     cannot be honoured (unknown in this scope, or a read failed) - a filter
-    must never degrade into "nothing matched". Otherwise {"names": {id:
-    name}, "assigned": {entity_id: id}, "filter_id": id | None, "note":
-    str}; without a filter, a failed read yields empty maps and a note
-    rather than failing the whole listing.
+    must never degrade into "nothing matched"; a timeout with a filter is
+    raised, as for any read. Otherwise {"names": {id: name}, "assigned":
+    {entity_id: id}, "registry": {entity_id: entry}, "filter_id": id |
+    None, "note": str}. Without a filter, ANY failure of these reads -
+    an error answer, a timeout, a dropped connection - yields empty maps
+    and a note: the category is an optional column, and list_scripts /
+    list_scenes / list_helpers listed fine before it existed.
     """
-    def failed(err):
-        if category:
-            return {"error": err}
-        return {"names": {}, "assigned": {}, "filter_id": None,
-                "note": f"categories could not be read ({err['error']}: "
-                        f"{err['detail']}) - category shown as null"}
+    def failed(code, detail):
+        return {"names": {}, "assigned": {}, "registry": registry or {},
+                "filter_id": None,
+                "note": f"categories could not be read ({code}: {detail}) - "
+                        "category shown as null"}
 
-    entries, err = _list_categories(scope)
-    if err:
-        return failed(err)
+    msgs = [{"type": "config/category_registry/list", "scope": scope}]
+    if registry is None:
+        msgs.append({"type": "config/entity_registry/list"})
+    try:
+        results = _ws_multi(msgs) if len(msgs) > 1 else [_ws(msgs[0])]
+    except (WsTimeout, OSError) as exc:
+        if category:
+            raise
+        return failed(type(exc).__name__, str(exc))
+    for res in results:
+        if err := ws_error(res):
+            return {"error": err} if category else failed(err["error"], err["detail"])
+    entries = list(results[0]["result"])
+    if registry is None:
+        registry = {e["entity_id"]: e for e in results[1]["result"]}
     filter_id = None
     if category:
         target, err = _resolve_category(scope, category, entries)
         if err:
             return {"error": err}
         filter_id = target["category_id"]
-    if registry is None:
-        r = _ws({"type": "config/entity_registry/list"})
-        if err := ws_error(r):
-            return failed(err)
-        registry = {e["entity_id"]: e for e in r["result"]}
     assigned = {eid: cid for eid, e in registry.items()
                 if (cid := (e.get("categories") or {}).get(scope))}
     return {"names": {e["category_id"]: e["name"] for e in entries},
-            "assigned": assigned, "filter_id": filter_id, "note": ""}
+            "assigned": assigned, "registry": registry, "filter_id": filter_id, "note": ""}
 
 
 def with_note(out: dict, note: str) -> dict:

@@ -585,11 +585,19 @@ def patch_dashboard(
         # would be reported as "a read, nothing changed, safe to repeat" -
         # and a retried insert would add the card twice.
         stored, err = None, error("read_timeout", str(exc))
-    if err or stored != config:
+    if err:
         return error("config_write_unverified",
-                     "The save was accepted, but reading the dashboard back "
-                     + ("failed" if err else "does not show the intended config")
-                     + " - the write DID happen; check it with get_dashboard().",
+                     "The save was accepted, so the write DID happen, but reading "
+                     f"the dashboard back failed ({err['error']}). Check it with "
+                     "get_dashboard() before retrying - an insert retried blindly "
+                     "would add the card twice.",
+                     url_path=shown, path=path, old=old, new=new)
+    if stored != config:
+        return error("config_write_unverified",
+                     "Home Assistant accepted the save, but the stored dashboard "
+                     "does not contain this change - it was discarded, or another "
+                     "write replaced it straight after. Check it with get_dashboard() "
+                     "and patch again if the change is missing.",
                      url_path=shown, path=path, old=old, new=new)
 
     out = {"url_path": shown, "op": op, "path": path, "old": old, "new": new,

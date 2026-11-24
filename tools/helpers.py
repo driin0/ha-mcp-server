@@ -94,7 +94,8 @@ def list_helpers(domain: str = "", category: str = "") -> dict:
     list comes from the entity registry - every entity in that category -
     so helpers created by helper integrations (template, utility_meter,
     group, derivative, ...) carrying it are included too, under their own
-    domain (e.g. "sensor").
+    domain (e.g. "sensor"), and so are disabled helpers, which have no
+    state: those rows have state null and a `disabled_by` field.
 
     Returns: {total, returned, offset, note?, helpers: [{entity_id, domain,
              name, state, attributes, category}]} - category is the
@@ -107,7 +108,19 @@ def list_helpers(domain: str = "", category: str = "") -> dict:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
         helpers = []
-        for s in r.json():
+        states = r.json()
+        if cats["filter_id"]:
+            # From the registry, so a disabled helper (no state at all)
+            # carrying the category is listed too, with state null.
+            seen = {s["entity_id"] for s in states}
+            for eid, cid in cats["assigned"].items():
+                if cid == cats["filter_id"] and eid not in seen:
+                    entry = cats["registry"].get(eid, {})
+                    states.append({"entity_id": eid, "state": None,
+                                   "attributes": {"friendly_name": entry.get("name")
+                                                  or entry.get("original_name") or eid},
+                                   "_disabled_by": entry.get("disabled_by")})
+        for s in states:
             d = s["entity_id"].split(".")[0]
             cid = cats["assigned"].get(s["entity_id"])
             if cats["filter_id"]:
@@ -116,6 +129,14 @@ def list_helpers(domain: str = "", category: str = "") -> dict:
             elif d not in HELPER_DOMAINS:
                 continue
             if domain and d != domain:
+                continue
+            if "_disabled_by" in s:
+                helpers.append({
+                    "entity_id": s["entity_id"], "domain": d,
+                    "name": s["attributes"]["friendly_name"], "state": None,
+                    "attributes": {}, "disabled_by": s["_disabled_by"],
+                    "category": cats["names"].get(cid),
+                })
                 continue
             helpers.append({
                 "entity_id": s["entity_id"],

@@ -123,3 +123,9 @@ def test_empty_window_note_names_the_bounds(fake_ha):
     assert r["total"] == 0
     assert r["window"]["start"] in r["note"]
     assert r["window"]["end"] in r["note"]
+
+
+def test_a_negative_limit_is_refused(fake_ha):
+    _rows(fake_ha, "sensor.x", [(3, "a"), (2, "b"), (1, "c")])
+
+    assert get_history("sensor.x", limit=-3)["error"] == "invalid_limit"
