@@ -922,11 +922,14 @@ def test_get_states_by_domain_says_when_nothing_matches(fake_ha):
 def test_history_is_a_series_and_has_no_offset(fake_ha):
     from tools.diagnostics import get_history
 
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
     fake_ha.history["light.kitchen"] = [
         {"entity_id": "light.kitchen", "state": "off",
-         "last_changed": "2026-08-22T20:00:00+00:00"},
+         "last_changed": (now - timedelta(hours=11)).isoformat()},
         {"entity_id": "light.kitchen", "state": "on",
-         "last_changed": "2026-08-23T07:00:00+00:00"},
+         "last_changed": (now - timedelta(hours=1)).isoformat()},
     ]
 
     result = get_history("light.kitchen")
@@ -936,16 +939,17 @@ def test_history_is_a_series_and_has_no_offset(fake_ha):
     assert [p["state"] for p in result["history"]] == ["off", "on"]
 
 
-def test_history_note_points_at_hours_not_pagination(fake_ha):
-    """No history recorded for this entity - the note must send the caller
-    to `hours`, not to an offset/limit that does not exist on this tool."""
+def test_history_note_names_the_window_not_pagination(fake_ha):
+    """No history recorded for this entity - the note must name the window
+    that was asked for, not an offset that does not exist on this tool. It
+    used to say "widen `hours`", which was wrong advice: widening past a
+    day was exactly what returned nothing (see tests/test_history.py)."""
     from tools.diagnostics import get_history
 
     result = get_history("light.kitchen", hours=1)
 
     assert result["total"] == 0
-    assert "widen" in result["note"]
-    assert "hours" in result["note"]
+    assert result["window"]["start"] in result["note"]
     assert "offset" not in result["note"]
 
 

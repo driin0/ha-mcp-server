@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from tools._base import (
     mcp, HA_URL, HEADERS, default_language, entity_area_map, _ws, _ws_multi,
-    envelope, ws_error,
+    envelope, error, ws_error,
 )
 
 
@@ -76,29 +76,97 @@ def get_states_by_domain(domain: str) -> dict:
     return envelope(out, key="entities")
 
 
+def _parse_utc(value: str) -> datetime:
+    """ISO 8601 -> aware UTC datetime; a naive value is taken as UTC."""
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 @mcp.tool()
-def get_history(entity_id: str, hours: int = 24) -> dict:
+def get_history(entity_id: str, hours: int = 24, start: str = "", end: str = "",
+                limit: int = 500) -> dict:
     """
-    Get state history for an entity over the last N hours (default 24).
+    Get the recorded state changes of one entity over a time window.
 
-    Returns: {total, returned, note?, history: [...]}
+    entity_id: the entity, e.g. 'sensor.lavatrice_run_state'.
+    hours:     window length ending now (default 24). Ignored when `start`
+               is given. Must be > 0.
+    start/end: optional ISO 8601 datetimes for an explicit window, e.g.
+               '2026-11-14T00:00:00+00:00'. A value without an offset is
+               read as UTC, not as the instance's local time. `end`
+               defaults to now; an `end` in the future is clamped to now.
+    limit:     maximum rows returned (default 500, 0 = no limit). When the
+               series is longer, the MOST RECENT rows are kept and the note
+               says how many were left out.
 
-    A series is not paginated by offset - if it is too short or too long,
-    narrow it with `hours` instead.
+    Returns: {total, returned, offset, note?, entity_id, window: {start,
+    end}, history: [...]} - `window` is the exact UTC range Home Assistant
+    was asked for. With minimal_response only the first row of the full
+    series carries entity_id and attributes; after truncation that row may
+    be gone, which is why entity_id is also given at the top level.
+
+    The end of the window is always sent. Home Assistant's
+    /api/history/period/<start> answers for start + 1 day when it is not -
+    so this tool used to return only the oldest day of any window longer
+    than 24 h, and nothing at all once the window began before the
+    recorder's retention (measured on a real instance: hours=72 stopped two
+    days ago, hours=2160 returned 0 rows while ten days were recorded).
+
+    A window that begins before the oldest recorded state is fine: Home
+    Assistant returns what exists after it. Rows are state changes only -
+    Home Assistant's default significant_changes_only drops updates that
+    changed attributes but not the state.
+
+    Errors: {error: "invalid_window"} for hours <= 0, an unparseable
+    start/end, or start not before end. Nothing is requested in that case.
     """
-    start = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    now = datetime.now(timezone.utc)
+    try:
+        end_dt = min(_parse_utc(end), now) if end else now
+        if start:
+            start_dt = _parse_utc(start)
+        else:
+            if hours <= 0:
+                return error("invalid_window", f"hours must be > 0, got {hours}.",
+                             entity_id=entity_id)
+            start_dt = end_dt - timedelta(hours=hours)
+    except ValueError as exc:
+        return error("invalid_window", f"start/end must be ISO 8601 datetimes: {exc}",
+                     entity_id=entity_id, start=start, end=end)
+    if start_dt >= end_dt:
+        return error("invalid_window",
+                     f"start ({start_dt.isoformat()}) is not before end "
+                     f"({end_dt.isoformat()}).", entity_id=entity_id)
+
+    window = {"start": start_dt.isoformat(), "end": end_dt.isoformat()}
     with httpx.Client() as client:
         r = client.get(
-            f"{HA_URL}/api/history/period/{start}",
+            f"{HA_URL}/api/history/period/{window['start']}",
             headers=HEADERS,
-            params={"filter_entity_id": entity_id, "minimal_response": "true"},
+            params={"filter_entity_id": entity_id, "end_time": window["end"],
+                    "minimal_response": "true"},
             timeout=20,
         )
         r.raise_for_status()
         result = r.json()
         series = result[0] if result else []
-    return envelope(series, key="history",
-                    note="" if series else "no history in the window - widen `hours`")
+
+    total = len(series)
+    rows = series[-limit:] if limit and total > limit else series
+    if not total:
+        note = (f"no state changes recorded between {window['start']} and "
+                f"{window['end']} - the recorder may not keep data that far back")
+    elif len(rows) < total:
+        note = (f"{len(rows)} of {total} shown - most recent kept; narrow the "
+                "window or raise limit")
+    else:
+        note = ""
+    out = envelope(rows, key="history", total=total, note=note)
+    out["entity_id"] = entity_id
+    out["window"] = window
+    return out
 
 
 @mcp.tool()

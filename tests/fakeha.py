@@ -5,6 +5,8 @@ WebSocket API. This module answers both from the same in-memory dataset, so a
 test can say "the registry contains X" once and have every tool see it.
 """
 import copy
+import urllib.parse
+from datetime import datetime, timedelta
 import json
 
 import httpx
@@ -160,6 +162,15 @@ class FakeHA:
         # reported as a top-level [] rather than an empty inner list, the
         # same way Home Assistant omits entities with nothing to show.
         self.history = {}
+        # The window is applied the way Home Assistant applies it
+        # (homeassistant/components/history/__init__.py): rows with
+        # start < last_changed <= end, where end is the `end_time` query
+        # parameter or - when it is absent - start + 1 day, NOT now. That
+        # default is the reason get_history() once returned only the first
+        # day of any window longer than 24 h. history_oldest models
+        # recorder retention: rows older than it are gone. Rows without a
+        # last_changed are always returned (fixtures that predate windows).
+        self.history_oldest = None
         # /api/logbook/<start>: a flat list of event dicts, optionally
         # filtered server-side by the `entity` query param.
         self.logbook = []
@@ -330,9 +341,7 @@ class FakeHA:
         if path.startswith("/api/services/"):
             return httpx.Response(200, json=[])
         if path.startswith("/api/history/period/"):
-            entity_id = request.url.params.get("filter_entity_id", "")
-            points = self.history.get(entity_id)
-            return httpx.Response(200, json=[points] if points else [])
+            return self._history(request, path)
         if path.startswith("/api/logbook/"):
             entity = request.url.params.get("entity", "")
             entries = self.logbook
@@ -452,6 +461,24 @@ class FakeHA:
         return httpx.Response(200, json={"type": "create_entry", "flow_id": flow_id,
                                          "handler": entry_id, "description": None,
                                          "description_placeholders": None})
+
+    def _history(self, request: httpx.Request, path: str) -> httpx.Response:
+        raw_start = urllib.parse.unquote(path.removeprefix("/api/history/period/"))
+        start = datetime.fromisoformat(raw_start)
+        raw_end = request.url.params.get("end_time")
+        end = datetime.fromisoformat(raw_end) if raw_end else start + timedelta(days=1)
+        entity_id = request.url.params.get("filter_entity_id", "")
+        points = []
+        for p in self.history.get(entity_id) or []:
+            changed = p.get("last_changed")
+            if changed:
+                when = datetime.fromisoformat(changed)
+                if self.history_oldest and when < self.history_oldest:
+                    continue
+                if not (start < when <= end):
+                    continue
+            points.append(p)
+        return httpx.Response(200, json=[points] if points else [])
 
     # ---- WebSocket -----------------------------------------------------
     def ws(self, msg: dict) -> dict:
