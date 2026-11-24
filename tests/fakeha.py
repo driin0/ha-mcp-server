@@ -77,6 +77,57 @@ DEFAULT_DEVICES = [
     {"id": "device_kitchen", "name": "Kitchen", "area_id": "stanza_del_dispositivo", "manufacturer": None, "model": None, "labels": []},
 ]
 
+# /api/config/config_entries/entry rows. Two UI-created template helpers and
+# one entry of another domain, so a tool can be shown refusing a config
+# entry that is not a template helper.
+DEFAULT_CONFIG_ENTRIES = [
+    {"entry_id": "01TEMPLATESENSOR", "domain": "template",
+     "title": "HACS update disponibili", "state": "loaded", "supports_options": True},
+    {"entry_id": "01TEMPLATEBINARY", "domain": "template",
+     "title": "HACS has update", "state": "loaded", "supports_options": True},
+    {"entry_id": "01SUNENTRY", "domain": "sun", "title": "Sun",
+     "state": "loaded", "supports_options": False},
+]
+
+# The stored options of each template entry, in the shape the options flow
+# takes on submit: top-level fields, plus the `additional_options` section
+# as a nested dict. `template_type` is not a form field - it selects the
+# form, and the options flow's step_id is that type.
+DEFAULT_TEMPLATE_OPTIONS = {
+    "01TEMPLATESENSOR": {
+        "template_type": "sensor",
+        "options": {
+            "state": "{{ integration_entities('hacs') | count }}",
+            "unit_of_measurement": "updates",
+            "state_class": "measurement",
+            "additional_options": {"availability": "{{ true }}"},
+        },
+    },
+    "01TEMPLATEBINARY": {
+        "template_type": "binary_sensor",
+        "options": {"state": "{{ false }}", "device_class": "update"},
+    },
+}
+
+# The options-flow form of each template type, as Home Assistant 2026.11.3
+# returns it (measured against a throwaway instance): (name, required)
+# pairs, and a section as ("additional_options", [(name, required), ...]).
+# `name` is never in the options form - it is set at creation only.
+TEMPLATE_OPTION_FIELDS = {
+    "sensor": [("state", True), ("device_class", False), ("state_class", False),
+               ("unit_of_measurement", False), ("device_id", False),
+               ("additional_options", [("availability", False)])],
+    "binary_sensor": [("state", True), ("device_class", False), ("device_id", False),
+                      ("additional_options", [("availability", False),
+                                              ("delay_on", False), ("delay_off", False)])],
+    "switch": [("value_template", False), ("turn_on", False), ("turn_off", False),
+               ("device_id", False), ("additional_options", [("availability", False)])],
+    "button": [("press", False), ("device_class", False), ("device_id", False),
+               ("additional_options", [("availability", False)])],
+}
+
+_STATE_CLASSES = ["measurement", "measurement_angle", "total", "total_increasing"]
+
 
 class FakeHA:
     """Answers REST and WebSocket calls from one dataset."""
@@ -150,6 +201,21 @@ class FakeHA:
         # script_configs has no such default seed.
         self.automation_configs = copy.deepcopy(DEFAULT_AUTOMATION_CONFIGS)
         self.script_configs = {}
+        # Config entries and the template options flow. options_flows maps
+        # an open flow_id to its entry_id: a flow stays here until it is
+        # either submitted successfully or aborted with DELETE, exactly as
+        # Home Assistant keeps it in memory (measured: a 400 on submit
+        # leaves the flow open, a DELETE afterwards answers 200).
+        self.config_entries = [dict(e) for e in DEFAULT_CONFIG_ENTRIES]
+        self.template_options = copy.deepcopy(DEFAULT_TEMPLATE_OPTIONS)
+        self.options_flows = {}
+        self._next_flow = 0
+        # Test hooks for the options-flow submit: an exception to raise
+        # instead of answering (a dropped connection mid-write), and a
+        # switch that accepts a submit without storing it (a write that
+        # does not land, for read-back verification).
+        self.options_submit_raises = None
+        self.options_submit_discarded = False
         # Everything the tools sent, for assertions.
         self.rest_calls = []
         self.ws_calls = []
@@ -255,6 +321,12 @@ class FakeHA:
                         ]
                         return httpx.Response(200, json={"result": "ok"})
                     return httpx.Response(400, json={"message": "Resource not found"})
+        if path == "/api/config/config_entries/entry" and request.method == "GET":
+            domain = request.url.params.get("domain")
+            return httpx.Response(200, json=[
+                e for e in self.config_entries if not domain or e["domain"] == domain])
+        if path.startswith("/api/config/config_entries/options/flow"):
+            return self._options_flow(request, path)
         if path.startswith("/api/services/"):
             return httpx.Response(200, json=[])
         if path.startswith("/api/history/period/"):
@@ -275,6 +347,111 @@ class FakeHA:
             entity_id = path.removeprefix("/api/calendars/")
             return httpx.Response(200, json=self.calendar_events.get(entity_id, []))
         return httpx.Response(404, json={"message": f"No fake route for {path}"})
+
+    # ---- template options flow ---------------------------------------------
+    def _options_form(self, flow_id: str, entry_id: str) -> dict:
+        """The form the template options flow opens with: straight on the
+        entry's own type (no menu, unlike the config flow), each field that
+        has a stored value carrying it as description.suggested_value."""
+        stored = self.template_options[entry_id]
+        options = stored["options"]
+
+        def field(name, required, values):
+            f = {"selector": {"template": {}}, "name": name, "required": required}
+            if not required:
+                f["optional"] = True
+            if name in values:
+                f["description"] = {"suggested_value": values[name]}
+            return f
+
+        schema = []
+        for name, spec in TEMPLATE_OPTION_FIELDS[stored["template_type"]]:
+            if isinstance(spec, list):
+                section = options.get(name, {})
+                schema.append({"type": "expandable", "name": name, "expanded": False,
+                               "required": False, "optional": True,
+                               "schema": [field(n, r, section) for n, r in spec]})
+            else:
+                schema.append(field(name, spec, options))
+        return {"type": "form", "flow_id": flow_id, "handler": entry_id,
+                "data_schema": schema, "errors": None,
+                "description_placeholders": None, "last_step": True,
+                "preview": "template", "step_id": stored["template_type"]}
+
+    def _options_flow(self, request: httpx.Request, path: str) -> httpx.Response:
+        base = "/api/config/config_entries/options/flow"
+        if path == base and request.method == "POST":
+            handler = json.loads(request.content or b"{}").get("handler")
+            entry = next((e for e in self.config_entries if e["entry_id"] == handler), None)
+            if entry is None:
+                # Measured: an unknown entry_id is not a 404 but a 500
+                # with a plain-text body.
+                return httpx.Response(
+                    500, text="500 Internal Server Error\n\nServer got itself in trouble")
+            if entry["entry_id"] not in self.template_options:
+                if entry.get("supports_options"):
+                    return httpx.Response(200, json={"type": "form", "flow_id": "other",
+                                                     "handler": handler, "data_schema": [],
+                                                     "step_id": "init"})
+                return httpx.Response(404, json={"message": "Invalid handler specified"})
+            self._next_flow += 1
+            flow_id = f"optflow{self._next_flow}"
+            self.options_flows[flow_id] = handler
+            return httpx.Response(200, json=self._options_form(flow_id, handler))
+
+        flow_id = path.removeprefix(base + "/")
+        if flow_id not in self.options_flows:
+            return httpx.Response(404, json={"message": "Invalid flow specified"})
+        entry_id = self.options_flows[flow_id]
+        if request.method == "DELETE":
+            del self.options_flows[flow_id]
+            return httpx.Response(200, json={"message": "Flow aborted"})
+        if request.method == "GET":
+            return httpx.Response(200, json=self._options_form(flow_id, entry_id))
+        if request.method != "POST":
+            return httpx.Response(405, text="405: Method Not Allowed")
+
+        if self.options_submit_raises is not None:
+            raise self.options_submit_raises
+        body = json.loads(request.content or b"{}")
+        stored = self.template_options[entry_id]
+        spec = dict(TEMPLATE_OPTION_FIELDS[stored["template_type"]])
+        for key, value in body.items():
+            if key not in spec:
+                return httpx.Response(
+                    400, json={"errors": {"base": [f"not a valid option at '{key}'"]}})
+            allowed = ({n for n, _ in spec[key]} if isinstance(spec[key], list) else None)
+            if allowed is not None and set(value) - allowed:
+                bad = sorted(set(value) - allowed)[0]
+                return httpx.Response(
+                    400, json={"errors": {"base": [f"not a valid option at '{key}.{bad}'"]}})
+        for key, required in spec.items():
+            if required is True and not body.get(key):
+                return httpx.Response(400, json={"errors": {key: "required key not provided"}})
+        for key, value in body.items():
+            if isinstance(value, str) and value.count("{{") != value.count("}}"):
+                return httpx.Response(400, json={"errors": {key: (
+                    "invalid template (TemplateSyntaxError: unexpected end of "
+                    "template, expected 'end of print statement'.)")}})
+        section = body.get("additional_options", {})
+        for key in ("delay_on", "delay_off"):
+            # Measured: a duration selector takes {"hours", "minutes",
+            # "seconds"}, and answers a "00:00:05" string with this.
+            if key in section and not isinstance(section[key], dict):
+                return httpx.Response(400, json={"errors": {"base": [
+                    f"expected dict at 'additional_options.{key}'"]}})
+        if "state_class" in body and body["state_class"] not in _STATE_CLASSES:
+            return httpx.Response(400, json={"errors": {
+                "state_class": f"value must be one of {_STATE_CLASSES}"}})
+
+        # Measured: the submitted form REPLACES the stored options - a
+        # field left out of the payload is gone afterwards, not kept.
+        del self.options_flows[flow_id]
+        if not self.options_submit_discarded:
+            stored["options"] = body
+        return httpx.Response(200, json={"type": "create_entry", "flow_id": flow_id,
+                                         "handler": entry_id, "description": None,
+                                         "description_placeholders": None})
 
     # ---- WebSocket -----------------------------------------------------
     def ws(self, msg: dict) -> dict:

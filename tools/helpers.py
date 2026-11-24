@@ -494,6 +494,382 @@ def delete_template_sensor(entry_id: str) -> dict:
         return {"deleted": entry_id, "status": r.status_code}
 
 
+# ---- template helpers: read and edit in place, via the options flow -------
+#
+# A UI-created template helper is a config entry of domain "template", and
+# the UI edits one through that entry's options flow. Measured against a
+# real Home Assistant 2026.11.3 (sensor, binary_sensor, switch, button,
+# select, number, image, light, cover, event):
+#   - POST .../options/flow {"handler": entry_id} opens straight on a form
+#     whose step_id is the template type - no menu, unlike the config flow
+#     create_template_sensor() drives.
+#   - Each field that has a stored value carries it as
+#     description.suggested_value; a field with no value has no description.
+#   - Some fields (availability, delay_on, delay_off...) live in an
+#     "additional_options" section: a nested schema on read, a nested dict
+#     on submit.
+#   - A submit REPLACES the stored options: a field left out of the payload
+#     is wiped, not kept - which is why an edit must resend every current
+#     value, not only the changed one.
+#   - A 400 (JSON {"errors": {...}}, or a plain-text "400: Bad Request")
+#     leaves the flow open; a create_entry closes it. An open flow is
+#     aborted with DELETE .../options/flow/{flow_id}.
+#   - An unknown entry_id answers a bare 500, not a 404 - so the entry is
+#     looked up in the config-entry list before any flow is opened.
+#   - name is not in the options form: a helper cannot be renamed this way.
+# entry_id, the entities' entity_id and unique_id, their labels and icon
+# were read back unchanged after an edit.
+
+_OPTIONS_FLOW = "/api/config/config_entries/options/flow"
+
+
+def _resolve_template_entry(client: httpx.Client, ref: str) -> tuple[dict | None, dict | None]:
+    """Find the template config entry `ref` names - an entry_id, or the
+    entity_id of one of its entities. Returns (entry, None) or (None, error)."""
+    entry_id = ref
+    if "." in ref:
+        res = _ws({"type": "config/entity_registry/get", "entity_id": ref})
+        if err := ws_error(res):
+            if err["error"] == "not_found":
+                return None, error("entity_not_found",
+                                   f"{ref} is not in the entity registry.", entity_id=ref)
+            return None, err
+        entry_id = res["result"].get("config_entry_id")
+        if not entry_id:
+            return None, error(
+                "not_a_template_helper",
+                f"{ref} has no config entry, so it is not a UI-created template "
+                "helper (a YAML-defined template entity cannot be edited here).",
+                entity_id=ref)
+    r = client.get(f"{HA_URL}/api/config/config_entries/entry", headers=HEADERS, timeout=15)
+    if err := rest_error(r):
+        return None, err
+    entry = next((e for e in r.json() if e.get("entry_id") == entry_id), None)
+    if entry is None:
+        return None, error("entry_not_found", f"No config entry with id {entry_id!r}.",
+                           entry_id=entry_id)
+    if entry.get("domain") != "template":
+        return None, error(
+            "not_a_template_helper",
+            f"Config entry {entry_id!r} belongs to {entry.get('domain')!r}, not to "
+            "'template'.",
+            entry_id=entry_id, domain=entry.get("domain"))
+    return entry, None
+
+
+def _entry_entity_ids(entry_id: str) -> list:
+    res = _ws({"type": "config/entity_registry/list"})
+    if ws_error(res):
+        return []
+    return sorted(e["entity_id"] for e in res.get("result", [])
+                  if e.get("config_entry_id") == entry_id)
+
+
+def _form_values(schema: list) -> tuple[dict, dict, list]:
+    """From an options-flow data_schema: (values, layout, available).
+
+    values: the current value of every field that has one, flat by name.
+    layout: field name -> the section holding it, or None at top level.
+    available: [{name, required, section}] for every field in the form.
+    """
+    values, layout, available = {}, {}, []
+
+    def visit(fields, section):
+        for f in fields:
+            if f.get("type") == "expandable":
+                visit(f.get("schema", []), f["name"])
+                continue
+            name = f["name"]
+            layout[name] = section
+            available.append({"name": name, "required": bool(f.get("required")),
+                              "section": section})
+            desc = f.get("description") or {}
+            if "suggested_value" in desc:
+                values[name] = desc["suggested_value"]
+
+    visit(schema, None)
+    return values, layout, available
+
+
+def _form_payload(values: dict, layout: dict) -> dict:
+    """Flat values -> the nested shape the options flow takes on submit."""
+    payload: dict = {}
+    for name, value in values.items():
+        section = layout.get(name)
+        (payload.setdefault(section, {}) if section else payload)[name] = value
+    return payload
+
+
+def _close_flow(client: httpx.Client, flow_id: str) -> None:
+    """Abort an options flow without saving. Best effort: a flow that cannot
+    be aborted only lingers in Home Assistant's memory until it restarts,
+    and must not mask the outcome the caller is about to report."""
+    try:
+        client.delete(f"{HA_URL}{_OPTIONS_FLOW}/{flow_id}", headers=HEADERS, timeout=10)
+    except httpx.HTTPError:
+        pass
+
+
+def _read_template_form(client: httpx.Client, entry_id: str) -> tuple[dict | None, dict | None]:
+    """Open the options flow, read its form, close it. (form, None) or (None, error)."""
+    r = client.post(f"{HA_URL}{_OPTIONS_FLOW}", headers=HEADERS,
+                    json={"handler": entry_id}, timeout=15)
+    if err := rest_error(r):
+        return None, err
+    form = r.json()
+    flow_id = form.get("flow_id")
+    try:
+        if form.get("type") != "form":
+            return None, error(
+                "unexpected_flow_step",
+                f"The options flow of {entry_id!r} opened on a {form.get('type')!r} "
+                "step, not on the form this tool reads.",
+                entry_id=entry_id, flow=form)
+        values, layout, available = _form_values(form.get("data_schema", []))
+        return {"template_type": form.get("step_id"), "values": values,
+                "layout": layout, "available": available}, None
+    finally:
+        if flow_id:
+            _close_flow(client, flow_id)
+
+
+@mcp.tool()
+def get_template_helper(entry_id: str) -> dict:
+    """
+    Read a UI-created template helper (sensor, binary_sensor, switch, ...):
+    its template type and the current value of every field in its form.
+
+    entry_id: the helper's config entry id (as returned by
+              create_template_sensor, or list_config_entries), or the
+              entity_id of one of its entities, e.g.
+              'sensor.hacs_update_disponibili'.
+
+    Reads through the entry's options flow - the same form the UI opens
+    when you edit the helper - and always aborts that flow without saving.
+    Read-only: nothing is changed.
+
+    Returns: {entry_id, title, template_type, entity_ids, fields,
+    available_fields}.
+      - fields: {name: current value} for every field that has a value,
+        flat - fields the UI shows in its "additional options" section
+        (availability, delay_on, ...) appear by their own name. The main
+        template is `state` for most types, `value_template` for switch
+        and alarm_control_panel. A field with no value is absent here.
+      - available_fields: [{name, required, section}] - every field the
+        form accepts, which is exactly what update_template_helper() takes.
+        `name` is not among them: a helper cannot be renamed through this.
+      - entity_ids: the entities that belong to this entry (normally one).
+
+    Errors: "entry_not_found" for an unknown entry_id, "entity_not_found"
+    for an entity_id not in the registry; "not_a_template_helper"
+    for an entry of another domain, or an entity with no config entry (a
+    YAML-defined template entity); "home_assistant_error" when Home
+    Assistant refuses a call; "unexpected_flow_step" if the options flow
+    does not open on a form.
+    """
+    with httpx.Client() as client:
+        entry, err = _resolve_template_entry(client, entry_id)
+        if err:
+            return err
+        form, err = _read_template_form(client, entry["entry_id"])
+        if err:
+            return err
+    return {
+        "entry_id": entry["entry_id"],
+        "title": entry.get("title"),
+        "template_type": form["template_type"],
+        "entity_ids": _entry_entity_ids(entry["entry_id"]),
+        "fields": form["values"],
+        "available_fields": form["available"],
+    }
+
+
+@mcp.tool()
+def update_template_helper(
+    entry_id: str,
+    state_template: str = None,
+    unit_of_measurement: str = None,
+    device_class: str = None,
+    state_class: str = None,
+    availability_template: str = None,
+    fields: dict = None,
+) -> dict:
+    """
+    Edit a UI-created template helper in place, keeping its entry_id,
+    entity_id, history, labels and icon.
+
+    entry_id: the helper's config entry id, or the entity_id of one of its
+              entities (see get_template_helper).
+    state_template: the main template - written to `state`, or to
+              `value_template` on the types that call it that (switch,
+              alarm_control_panel).
+    unit_of_measurement, device_class, state_class: as in the UI.
+    availability_template: the `availability` template.
+    fields: any other field of this helper's form, by name, in the shape
+            its selector takes, e.g. {"options": "{{ ['a', 'b'] }}"} on a
+            select, {"max": 20} on a number, or
+            {"delay_on": {"hours": 0, "minutes": 0, "seconds": 5}} on a
+            binary_sensor (a duration is a dict; "00:00:05" is refused).
+            Actions (turn_on, press, ...) are lists of action steps. See
+            get_template_helper()'s available_fields for what a given
+            helper accepts.
+
+    Every argument left as None keeps its current value. An empty string
+    clears that field. Home Assistant's options form replaces the whole
+    stored configuration on submit, so this reads the current values first
+    and resends them all with only the given fields changed - a field not
+    passed here is never wiped.
+
+    Verified: after Home Assistant accepts the edit, the helper is read
+    back through a fresh options flow and compared field by field with
+    what was sent.
+
+    Measured on a real Home Assistant for sensor, binary_sensor, switch,
+    button, select, number, image, light, cover and event - every template
+    type's options flow works the same way, so the others are expected to
+    work too, but were not each tried.
+
+    Returns: {entry_id, title, template_type, entity_ids, changed, fields}
+    - `changed` is {name: {before, after}} for every field whose value
+    actually changed (after is None for a cleared field), `fields` the
+    values read back.
+
+    Errors (nothing written): "nothing_to_update" when no field is given;
+    "conflicting_fields" when a named argument and `fields` set the same
+    field; "entry_not_found"/"not_a_template_helper" as in
+    get_template_helper(); "unknown_fields" for a field this helper's form
+    does not have (with `allowed`); "validation_failed" when Home
+    Assistant rejects the values - its `errors`, the form's `schema` and
+    the `payload_sent`; "home_assistant_error" for any other refused call.
+    The options flow is always closed on these paths.
+
+    Errors (the edit WAS accepted): "config_write_unverified" when the
+    read-back does not match what was sent (`intended` and `observed`
+    both included); "config_read_failed" when the read-back itself fails.
+    Neither is rolled back.
+    """
+    named = {"unit_of_measurement": unit_of_measurement, "device_class": device_class,
+             "state_class": state_class, "availability": availability_template}
+    overrides = {k: v for k, v in named.items() if v is not None}
+    extra = dict(fields or {})
+    clash = sorted(set(overrides) & set(extra))
+    if state_template is not None and {"state", "value_template"} & set(extra):
+        clash.append("state_template")
+    if clash:
+        return error("conflicting_fields",
+                     f"Set both by a named argument and in `fields`: {clash}.",
+                     fields=clash)
+    overrides.update(extra)
+    if state_template is None and not overrides:
+        return error("nothing_to_update", "No field to change was given.")
+
+    with httpx.Client() as client:
+        entry, err = _resolve_template_entry(client, entry_id)
+        if err:
+            return err
+        entry_id = entry["entry_id"]
+
+        r = client.post(f"{HA_URL}{_OPTIONS_FLOW}", headers=HEADERS,
+                        json={"handler": entry_id}, timeout=15)
+        if err := rest_error(r):
+            return err
+        form = r.json()
+        flow_id = form.get("flow_id")
+        flow_open = bool(flow_id)
+        try:
+            if form.get("type") != "form":
+                return error("unexpected_flow_step",
+                             f"The options flow of {entry_id!r} opened on a "
+                             f"{form.get('type')!r} step, not on a form.",
+                             entry_id=entry_id, flow=form)
+            schema = form.get("data_schema", [])
+            before, layout, available = _form_values(schema)
+
+            if state_template is not None:
+                main = next((k for k in ("state", "value_template") if k in layout), None)
+                if main is None:
+                    return error(
+                        "unknown_fields",
+                        f"A {form.get('step_id')} template helper has no main state "
+                        "template; set its fields through `fields` instead.",
+                        unknown=["state_template"], allowed=sorted(layout))
+                overrides[main] = state_template
+
+            unknown = sorted(set(overrides) - set(layout))
+            if unknown:
+                return error("unknown_fields",
+                             f"Not a field of this {form.get('step_id')} helper's form: "
+                             f"{unknown}.",
+                             unknown=unknown, allowed=sorted(layout))
+
+            intended = dict(before)
+            for name, value in overrides.items():
+                if value == "":
+                    intended.pop(name, None)
+                else:
+                    intended[name] = value
+            payload = _form_payload(intended, layout)
+
+            r = client.post(f"{HA_URL}{_OPTIONS_FLOW}/{flow_id}", headers=HEADERS,
+                            json=payload, timeout=15)
+            if r.status_code == 400:
+                try:
+                    errors = r.json().get("errors", r.json())
+                except ValueError:
+                    errors = r.text.strip()
+                return error("validation_failed",
+                             "Home Assistant rejected the values; nothing was saved.",
+                             entry_id=entry_id, errors=errors, schema=schema,
+                             payload_sent=payload)
+            if err := rest_error(r):
+                return err
+            result = r.json()
+            if result.get("type") != "create_entry":
+                return error("unexpected_flow_step",
+                             "Home Assistant did not save the edit: the flow answered "
+                             f"with a {result.get('type')!r} step.",
+                             entry_id=entry_id, flow=result, payload_sent=payload)
+            flow_open = False
+        finally:
+            if flow_open:
+                _close_flow(client, flow_id)
+
+        try:
+            after_form, err = _read_template_form(client, entry_id)
+        except httpx.HTTPError as exc:
+            after_form, err = None, error("transport_error", str(exc))
+        if err:
+            return error(
+                "config_read_failed",
+                f"The edit of {entry_id!r} was accepted by Home Assistant, but reading "
+                "it back to confirm failed - it was NOT rolled back. Check with "
+                "get_template_helper().",
+                entry_id=entry_id, read_error=err)
+
+    observed = after_form["values"]
+    if observed != intended:
+        return error(
+            "config_write_unverified",
+            f"The edit of {entry_id!r} was accepted by Home Assistant, but the "
+            "values read back do not match what was sent - it was NOT rolled "
+            "back. Compare `intended` and `observed`.",
+            entry_id=entry_id, intended=intended, observed=observed)
+
+    changed = {
+        name: {"before": before.get(name), "after": observed.get(name)}
+        for name in sorted(set(before) | set(observed))
+        if before.get(name) != observed.get(name)
+    }
+    return {
+        "entry_id": entry_id,
+        "title": entry.get("title"),
+        "template_type": after_form["template_type"],
+        "entity_ids": _entry_entity_ids(entry_id),
+        "changed": changed,
+        "fields": observed,
+    }
+
+
 @mcp.tool()
 def set_number(entity_id: str, value: float) -> dict:
     """

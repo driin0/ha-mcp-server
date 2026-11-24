@@ -1,7 +1,7 @@
 # HA MCP Server
 
 An [MCP](https://modelcontextprotocol.io/) server that exposes Home Assistant's
-REST and WebSocket APIs as **189 tools** (185 registered by default — four are
+REST and WebSocket APIs as **192 tools** (188 registered by default — four are
 off until explicitly enabled, see [the registration
 gate](#the-registration-gate-three-groups-two-defaults) below), so an MCP
 client — Claude Code among others — can drive an instance directly.
@@ -289,7 +289,9 @@ Five tools exist to catch both shapes before they cause damage, and to surface t
   `tools/validation.py`'s own docstring for the measurement.
 - **`find_entity_usages`** — "if I rename or remove this entity, what
   breaks?", searched across automations and scripts only (not dashboards,
-  template entities or helpers).
+  template entities or helpers). A UI-created template helper's own
+  template can be read with `get_template_helper` and fixed in place with
+  `update_template_helper`.
 - **`list_orphan_entities`** — registry entries with no current state,
   exactly what a reconfigured integration leaves behind.
 - **`instance_health`** — entities with no usable state grouped by the

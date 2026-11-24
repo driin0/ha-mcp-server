@@ -879,6 +879,9 @@ def find_entity_usages(entity_id: str) -> dict:
     it, only that no automation or script does. Silence about the rest
     would read as full coverage; it is not, and staying quiet about that
     is the exact shape of the failure this whole module exists to fix.
+    A UI-created template helper's template is not searched here, but
+    can be read with get_template_helper() and edited in place with
+    update_template_helper() (tools/helpers.py).
 
     Returns: {total, returned, offset, note, usages: [...]}. Each `usages`
     entry: {source_kind: "automation" | "script", entity_id, name, where,

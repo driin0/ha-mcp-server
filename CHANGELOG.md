@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+- **Read and edit UI-created template helpers in place:
+  `get_template_helper` and `update_template_helper`.** Until now a
+  template helper could only be created (`create_template_sensor`) or
+  deleted (`delete_template_sensor`); fixing its template meant deleting
+  and recreating it, losing history, labels, icon and unique_id. Both new
+  tools work through the config entry's options flow — the form the UI
+  opens when you edit a helper — and take an entry_id or the entity_id of
+  one of the helper's entities.
+
+  - `get_template_helper` returns the template type and the current value
+    of every field, plus the list of fields the form accepts. The flow is
+    always aborted without saving.
+  - `update_template_helper` changes only the fields it is given. Home
+    Assistant's options form replaces the whole stored configuration on
+    submit (measured: a field left out is wiped), so the tool resends every
+    current value with the given ones changed; an empty string clears a
+    field. It reads the helper back afterwards and returns
+    `config_write_unverified` if what is stored is not what was sent. A
+    rejected edit returns `validation_failed` with Home Assistant's own
+    errors, the form schema and the payload sent, and closes the flow.
+
+  Measured against Home Assistant 2026.11.3 for sensor, binary_sensor,
+  switch, button, select, number, image, light, cover and event: every type
+  opens straight on its own form, so the remaining template types are
+  expected to work the same way but were not each tried. entry_id,
+  entity_id, unique_id, labels and icon were read back unchanged after an
+  edit. A helper cannot be renamed this way: `name` is not in the options
+  form.
+
+- The README's tool count was one behind; it now says 192 (188 registered
+  by default).
+
 ## 2.4.1
 
 - **`get_addon` redacts credentials at any depth, and inside text.** The
