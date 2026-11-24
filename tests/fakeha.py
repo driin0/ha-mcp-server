@@ -257,6 +257,13 @@ class FakeHA:
         self.lovelace_reads = 0
         self.lovelace_mutate_on_read = {}
         self.lovelace_save_discarded = False
+        # Supervisor GET /core/logs: the journal as text/plain. `lines=N`
+        # returns the last N lines (supervisor/api/host.py); `no_colors`
+        # strips ANSI codes, which are otherwise present - so the fake puts
+        # an ANSI code in every line when it is NOT sent.
+        self.core_log = ""
+        # system_log/list: newest first, Home Assistant's to_list() shape.
+        self.system_log = []
         # Everything the tools sent, for assertions.
         self.rest_calls = []
         self.ws_calls = []
@@ -370,6 +377,14 @@ class FakeHA:
             return self._options_flow(request, path)
         if path.startswith("/api/services/"):
             return httpx.Response(200, json=[])
+        if path == "/core/logs":
+            lines = self.core_log.splitlines()
+            n = int(request.url.params.get("lines", "100"))
+            lines = lines[-n:]
+            if "no_colors" not in request.url.params:
+                lines = [f"\x1b[32m{line}\x1b[0m" for line in lines]
+            return httpx.Response(200, text="\n".join(lines),
+                                  headers={"content-type": "text/plain"})
         if path.startswith("/api/history/period/"):
             return self._history(request, path)
         if path.startswith("/api/logbook/"):
@@ -538,6 +553,8 @@ class FakeHA:
             return self._lovelace_save(msg)
         if kind == "lovelace/dashboards/list":
             return self._ws_ok(copy.deepcopy(self.dashboards))
+        if kind == "system_log/list":
+            return self._ws_ok(copy.deepcopy(self.system_log))
         if kind == "manifest/list":
             return {"id": 1, "type": "result", "success": True, "result": self.manifests}
         if kind == "config/device_registry/list":

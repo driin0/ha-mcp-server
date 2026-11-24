@@ -1,6 +1,9 @@
+import re
+
 import httpx
 from datetime import datetime, timedelta, timezone
 
+from tools import addons
 from tools._base import (
     mcp, HA_URL, HEADERS, default_language, entity_area_map, _ws, _ws_multi,
     envelope, error, ws_error,
@@ -205,25 +208,205 @@ def get_logbook(hours: int = 6, entity_id: str = "") -> dict:
     return envelope(events, key="events")
 
 
+# ---- logs ----------------------------------------------------------------------
+
+# Home Assistant's default log line: "2026-11-18 03:12:02.300 ERROR (MainThread)
+# [logger] message". A line that does not start like this (a traceback) belongs
+# to the record above it.
+_RECORD_START = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? (DEBUG|INFO|WARNING|ERROR|CRITICAL) ")
+_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_SCAN_MIN, _SCAN_MAX = 2, 10000
+_EXCEPTION_MAX_LINES = 40
+
+
+def _parse_records(text: str) -> list[str]:
+    """Group log lines into records: a record starts at a line with Home
+    Assistant's log prefix; the lines after it (a traceback) are part of
+    it. Lines before the first prefix form one leading record."""
+    records: list[list[str]] = []
+    for line in text.splitlines():
+        if _RECORD_START.match(line) or not records:
+            records.append([line])
+        else:
+            records[-1].append(line)
+    return ["\n".join(r) for r in records]
+
+
+def _record_level(record: str) -> int:
+    m = _RECORD_START.match(record)
+    return _LEVELS[m.group(1)] if m else 0
+
+
+def _min_level(level: str) -> tuple[int, dict | None]:
+    if not level:
+        return 0, None
+    if level.upper() not in _LEVELS:
+        return 0, error("invalid_level",
+                        f"level must be one of {', '.join(_LEVELS)} (any case), got {level!r}.")
+    return _LEVELS[level.upper()], None
+
+
+@mcp.tool()
+def get_core_logs(lines: int = 100, grep: str = "", level: str = "", scan: int = 2000) -> dict:
+    """
+    Read Home Assistant Core's log through the Supervisor, filtered before
+    it reaches you.
+
+    lines: how many matching RECORDS to return, the most recent (default
+           100). A record is one log entry including its traceback.
+    grep:  case-insensitive substring searched in the whole record - so a
+           traceback that mentions 'smartthinq_sensors' is found even when
+           its first line names only homeassistant.config_entries.
+    level: minimum level - DEBUG, INFO, WARNING, ERROR or CRITICAL.
+    scan:  how many journal lines to fetch and search, the most recent
+           (default 2000, 2..10000). Raise it to look further back.
+
+    Requires the Supervisor (Home Assistant OS / Supervised, add-on with
+    manager role). Without one, use get_system_log(), which reads the
+    errors and warnings Home Assistant keeps in memory.
+
+    Returns: {scanned_lines, records_scanned, matched, returned, note?,
+    log} - `log` is the returned records joined by newlines, ANSI colours
+    removed. "matched": 0 with a note is "nothing matched in what was
+    scanned", not "the log is empty". Or an error() envelope:
+    "supervisor_not_available", "invalid_level", "supervisor_error".
+    """
+    if addons._SUPERVISOR_BASE is None:
+        return error("supervisor_not_available",
+                     "The core log is read through the Supervisor, which this "
+                     "installation does not have. Use get_system_log() for the "
+                     "errors and warnings Home Assistant keeps in memory.")
+    min_level, err = _min_level(level)
+    if err:
+        return err
+    scan = max(_SCAN_MIN, min(scan, _SCAN_MAX))
+    with httpx.Client() as client:
+        r = client.get(f"{addons._SUPERVISOR_BASE}/core/logs",
+                       headers={**addons._SUPERVISOR_HEADERS, "Accept": "text/plain"},
+                       params={"lines": scan, "no_colors": ""}, timeout=20)
+    if r.status_code >= 400:
+        return error("supervisor_error",
+                     f"The Supervisor answered {r.status_code} to /core/logs: {r.text[:300]}",
+                     status=r.status_code)
+    text = _ANSI.sub("", r.text)
+    scanned = len(text.splitlines())
+    records = _parse_records(text)
+    needle = grep.casefold()
+    matching = [rec for rec in records
+                if _record_level(rec) >= min_level and (not needle or needle in rec.casefold())]
+    kept = matching[-lines:] if lines > 0 else matching
+    if not matching:
+        note = (f"no matching record in the last {scan} lines - raise scan to look further back"
+                if scanned >= scan else
+                f"no matching record in the whole log available ({scanned} lines)")
+    elif len(kept) < len(matching):
+        note = (f"{len(kept)} of {len(matching)} matching records shown, the most recent - "
+                "raise lines or narrow with grep/level")
+    else:
+        note = ""
+    out = {"scanned_lines": scanned, "records_scanned": len(records),
+           "matched": len(matching), "returned": len(kept)}
+    if note:
+        out["note"] = note
+    out["log"] = "\n".join(kept)
+    return out
+
+
+def _iso(ts) -> str | None:
+    if not isinstance(ts, (int, float)):
+        return None
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
+def _short_exception(text: str) -> str:
+    lines = (text or "").splitlines()
+    if len(lines) <= _EXCEPTION_MAX_LINES:
+        return text or ""
+    return "\n".join([f"... ({len(lines) - _EXCEPTION_MAX_LINES} lines truncated)"]
+                     + lines[-_EXCEPTION_MAX_LINES:])
+
+
+@mcp.tool()
+def get_system_log(level: str = "", grep: str = "", limit: int = 50) -> dict:
+    """
+    The errors and warnings Home Assistant keeps in memory (Settings ->
+    System -> Logs, the condensed view): one entry per distinct problem,
+    with how many times it happened. Works on every installation type.
+
+    level: minimum level (WARNING, ERROR, CRITICAL; any case).
+    grep:  case-insensitive substring in logger name, message, source or
+           exception.
+    limit: max entries (default 50), newest first.
+
+    Only what Home Assistant has captured since its last start, and only
+    WARNING and above by default - for the full log with INFO lines and
+    everything before a deduplicated entry, use get_core_logs().
+
+    Returns: {total, returned, offset, note?, entries: [{name, level,
+    message, source: "path:line", timestamp, first_occurred, count,
+    exception}]} - timestamps ISO 8601 UTC, exception trimmed to its last
+    40 lines. Or an error() envelope (admin rights are required).
+    """
+    min_level, err = _min_level(level)
+    if err:
+        return err
+    r = _ws({"type": "system_log/list"})
+    if err := ws_error(r):
+        return err
+    needle = grep.casefold()
+    out = []
+    for e in r["result"]:
+        source = e.get("source") or []
+        entry = {
+            "name": e.get("name"),
+            "level": e.get("level"),
+            "message": "\n".join(e.get("message") or []),
+            "source": ":".join(str(p) for p in source) if isinstance(source, list) else source,
+            "timestamp": _iso(e.get("timestamp")),
+            "first_occurred": _iso(e.get("first_occurred")),
+            "count": e.get("count"),
+            "exception": _short_exception(e.get("exception") or ""),
+        }
+        if _LEVELS.get(str(entry["level"]).upper(), 0) < min_level:
+            continue
+        if needle and needle not in " ".join(
+                str(entry[k]) for k in ("name", "message", "source", "exception")).casefold():
+            continue
+        out.append(entry)
+    return envelope(out, key="entries", limit=limit)
+
+
 @mcp.tool()
 def get_error_log() -> str:
     """
-    Get the Home Assistant error log.
+    Get the Home Assistant error log as text.
 
-    Not every installation serves /api/error_log — it is absent on recent cores
-    and when the log is written elsewhere — so a missing endpoint is reported as
-    a message rather than raised.
+    Recent cores no longer serve /api/error_log. When it answers 404 and a
+    Supervisor is available, the last 200 records of the core log are
+    returned instead (the same as get_core_logs(lines=200)), with a first
+    line saying so. Without a Supervisor a message points at
+    get_system_log(). For filtering, use get_core_logs() directly.
     """
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/error_log", headers=HEADERS, timeout=10)
-        if r.status_code == 404:
-            return (
-                "error_log_not_available: this Home Assistant instance does not serve "
-                "/api/error_log. Read the log from Settings -> System -> Logs, or use "
-                "get_logbook() for entity activity."
-            )
-        r.raise_for_status()
-        return r.text
+        if r.status_code != 404:
+            r.raise_for_status()
+            return r.text
+    if addons._SUPERVISOR_BASE is None:
+        return (
+            "error_log_not_available: this Home Assistant instance does not serve "
+            "/api/error_log and has no Supervisor to read the core log from. Use "
+            "get_system_log() for the errors and warnings Home Assistant keeps in "
+            "memory, or get_logbook() for entity activity."
+        )
+    logs = get_core_logs(lines=200)
+    if "error" in logs:
+        return f"{logs['error']}: {logs['detail']}"
+    return ("# /api/error_log is not served by this Home Assistant - the last "
+            f"{logs['returned']} records of the core log, read from the Supervisor "
+            "(/core/logs):\n" + logs["log"])
 
 
 @mcp.tool()

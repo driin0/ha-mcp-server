@@ -323,6 +323,7 @@ WS_READ_COMMANDS = frozenset({
     "repairs/list_issues",
     "scheduler/items",
     "system_health/info",
+    "system_log/list",
     "tag/list",
     "trace/list",
 })
