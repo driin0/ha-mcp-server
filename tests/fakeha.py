@@ -241,6 +241,22 @@ class FakeHA:
             {"domain": "utility_meter", "integration_type": "helper"},
             {"domain": "hue", "integration_type": "hub"},
         ]
+        # Lovelace. lovelace: {url_path: config | None}, "" = the default
+        # dashboard; None = never saved from the UI (Home Assistant answers
+        # config_not_found "No config found."), absent = no such dashboard.
+        # dashboards: lovelace/dashboards/list rows ({url_path, mode, ...});
+        # a "yaml"-mode dashboard refuses saves with "Not supported", as
+        # LovelaceYAML does. Saving is last-write-wins, no version check -
+        # lovelace/dashboard.py LovelaceStorage.async_save.
+        # lovelace_mutate_on_read: {n: callable(config)} run on the stored
+        # config just before answering the n-th lovelace/config read (1-based)
+        # - a concurrent writer landing between a tool's reads.
+        # lovelace_save_discarded: accept saves without storing them.
+        self.lovelace = {"": None}
+        self.dashboards = []
+        self.lovelace_reads = 0
+        self.lovelace_mutate_on_read = {}
+        self.lovelace_save_discarded = False
         # Everything the tools sent, for assertions.
         self.rest_calls = []
         self.ws_calls = []
@@ -516,6 +532,12 @@ class FakeHA:
             return self._category_registry(kind.rsplit("/", 1)[1], msg)
         if kind == "config/entity_registry/update":
             return self._entity_registry_update(msg)
+        if kind == "lovelace/config":
+            return self._lovelace_read(msg)
+        if kind == "lovelace/config/save":
+            return self._lovelace_save(msg)
+        if kind == "lovelace/dashboards/list":
+            return self._ws_ok(copy.deepcopy(self.dashboards))
         if kind == "manifest/list":
             return {"id": 1, "type": "result", "success": True, "result": self.manifests}
         if kind == "config/device_registry/list":
@@ -568,6 +590,30 @@ class FakeHA:
                     del row["categories"][scope]
             return self._ws_ok(None)
         return self._ws_fail("unknown_command", f"No fake response for {action}")
+
+    def _lovelace_read(self, msg: dict) -> dict:
+        url_path = msg.get("url_path") or ""
+        if url_path not in self.lovelace:
+            return self._ws_fail("config_not_found", f"Unknown config specified: {url_path}")
+        self.lovelace_reads += 1
+        hook = self.lovelace_mutate_on_read.get(self.lovelace_reads)
+        if hook and self.lovelace[url_path] is not None:
+            hook(self.lovelace[url_path])
+        if self.lovelace[url_path] is None:
+            return self._ws_fail("config_not_found", "No config found.")
+        return self._ws_ok(copy.deepcopy(self.lovelace[url_path]))
+
+    def _lovelace_save(self, msg: dict) -> dict:
+        url_path = msg.get("url_path") or ""
+        if url_path not in self.lovelace:
+            return self._ws_fail("config_not_found", f"Unknown config specified: {url_path}")
+        mode = next((d.get("mode") for d in self.dashboards
+                     if d.get("url_path") == url_path), "storage")
+        if mode == "yaml":
+            return self._ws_fail("error", "Not supported")
+        if not self.lovelace_save_discarded:
+            self.lovelace[url_path] = copy.deepcopy(msg["config"])
+        return self._ws_ok(None)
 
     def _entity_registry_update(self, msg: dict) -> dict:
         row = next((e for e in self.registry if e.get("entity_id") == msg.get("entity_id")), None)
