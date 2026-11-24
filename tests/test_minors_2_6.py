@@ -264,3 +264,18 @@ def test_outline_docstring_mentions_the_header():
     from tools.dashboards import get_dashboard_outline
 
     assert "header" in get_dashboard_outline.__doc__
+
+
+def test_text_in_a_custom_fields_card_does_not_match_the_button_card_too(dash):
+    from tools.dashboards import find_dashboard_cards
+
+    dash.lovelace["casa"]["views"][0]["sections"][1]["cards"][1]["custom_fields"] = {
+        "f1": {"card": {"type": "tile", "entity": "sensor.x", "name": "Inner"}},
+        "label": "[[[ return 'Outer' ]]]"}
+
+    inner = find_dashboard_cards("casa", text="Inner")
+    outer = find_dashboard_cards("casa", text="Outer")
+
+    assert [m["path"] for m in inner["matches"]] == [
+        "views.0.sections.1.cards.1.custom_fields.f1.card"]
+    assert [m["path"] for m in outer["matches"]] == ["views.0.sections.1.cards.1"]

@@ -757,7 +757,14 @@ def _type_of(node):
 
 
 def _own_text(node) -> str:
+    """The node's JSON without its nested cards - including cards a
+    button-card embeds in custom_fields, which are matches of their own."""
     own = _own(node, _NESTED_CARD_KEYS) if isinstance(node, dict) else node
+    if isinstance(own, dict) and isinstance(own.get("custom_fields"), dict):
+        own["custom_fields"] = {
+            name: ({k: v for k, v in field.items() if k != "card"}
+                   if isinstance(field, dict) else field)
+            for name, field in own["custom_fields"].items()}
     return json.dumps(own, ensure_ascii=False).casefold()
 
 
