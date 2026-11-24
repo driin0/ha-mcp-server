@@ -377,7 +377,7 @@ def bulk_set_entity_category(entity_ids: list[str], category: str) -> dict:
     Put many entities in a category (or take them out with category="").
 
     entity_ids: up to 200 automations, scripts, scenes and helpers - they
-                may mix scopes.
+                may mix scopes. Repeated ids are counted and sent once.
     category:   a NAME resolves separately in each entity's scope, so
                 "Elettrodomestici" lands on the automation-scope id for
                 automations and the helpers-scope id for helpers. An ID
@@ -397,6 +397,7 @@ def bulk_set_entity_category(entity_ids: list[str], category: str) -> dict:
     connection never carried the batch (one systemic failure, not "every
     entity failed").
     """
+    entity_ids = list(dict.fromkeys(entity_ids))  # each entity once, order kept
     if len(entity_ids) > _BULK_CATEGORY_MAX:
         return error(
             "too_many_entities",

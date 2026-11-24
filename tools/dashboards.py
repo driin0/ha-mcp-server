@@ -338,13 +338,15 @@ def _read_config(url_path: str) -> tuple[dict | None, dict | None]:
     result = _ws(msg)
     if err := ws_error(result):
         if err["error"] == "config_not_found":
+            recovery = (" (Home Assistant answers the same way in recovery mode, "
+                        "when no dashboard config is loaded at all.)")
             if not url_path:
                 hint = ("The default dashboard has never been saved from the UI: "
                         "Home Assistant generates it on the fly and has no stored "
-                        "config to edit. Take control of it in the UI first.")
+                        "config to edit. Take control of it in the UI first." + recovery)
             elif "No config found" in err["detail"]:
                 hint = ("This dashboard has never been saved, so there is no "
-                        "stored config to edit yet.")
+                        "stored config to edit yet." + recovery)
             else:
                 hint = "No dashboard with that url_path. Use list_dashboards()."
             return None, error("not_found", f"{hint} ({err['detail']})",
@@ -457,7 +459,11 @@ def patch_dashboard(
     save is still lost.
 
     YAML-mode dashboards cannot be written through Home Assistant's API at
-    all. To replace a whole config use update_dashboard_config().
+    all. A registered dashboard's mode is checked before anything is read;
+    the default dashboard ("") is not listed by lovelace/dashboards/list,
+    so a YAML-mode default is only recognised when Home Assistant refuses
+    the save - still "not_editable", still nothing written. To replace a
+    whole config use update_dashboard_config().
 
     Returns: {url_path, op, path, old, new, saved: true, shifted?} - `old`
     is the value replaced or removed (null for insert), `new` the value
@@ -572,8 +578,13 @@ def patch_dashboard(
         if err["detail"] == "Not supported":
             return error("not_editable",
                          "Home Assistant refused to save this dashboard (\"Not "
-                         "supported\") - it is in YAML mode or recovery mode. "
-                         "Nothing was written.", url_path=shown)
+                         "supported\") - it is in YAML mode. Nothing was written.",
+                         url_path=shown)
+        if "recovery mode" in err["detail"]:
+            return error("not_editable",
+                         "Home Assistant is in recovery mode and refuses to save "
+                         "dashboards. Nothing was written; restart it normally first.",
+                         url_path=shown)
         return error("home_assistant_error",
                      f"Home Assistant rejected the save: {err['detail']}. Nothing "
                      "was written.", url_path=shown, path=path, ha_code=err["error"])
@@ -793,7 +804,8 @@ def find_dashboard_cards(url_path: str = "", entity: str = "", heading: str = ""
     path}, section: {index, heading} | null, container_path, siblings:
     [{path, type, summary}]} - siblings are the OTHER cards in the same
     list. Read them before replacing or removing anything: a section often
-    holds more than the block you are looking for. A section match has
+    holds more than the block you are looking for. A card nested inside a
+    stack also has `section_cards`: the top-level cards of its section. A section match has
     kind "section" and `children` instead of siblings.
 
     Returns: {total, returned, offset, note?, matches: [...]}, or an error()
@@ -850,6 +862,11 @@ def find_dashboard_cards(url_path: str = "", entity: str = "", heading: str = ""
             "siblings": [_card_brief(o) for o in by_container[c["container_path"]]
                          if o["path"] != c["path"]],
         })
+        if c["depth"] > 0 and c["section_index"] is not None:
+            # Nested in a stack: siblings are the stack's children. The
+            # section around it is where neighbours get lost, so show it too.
+            top = f"views.{c['view_index']}.sections.{c['section_index']}.cards"
+            matches[-1]["section_cards"] = [_card_brief(o) for o in by_container.get(top, [])]
     templates = config.get("button_card_templates")
     if isinstance(templates, dict) and not heading:
         for name, tpl in templates.items():
@@ -885,7 +902,9 @@ def get_dashboard_outline(url_path: str = "") -> dict:
     card is {path, type, summary, depth} (depth 1+ = inside a stack or
     another card, listed right after its parent). root_keys lists the
     other top-level keys - e.g. {"button_card_templates": ["wm_btn"]}
-    (the template names, addressable as button_card_templates.<name>).
+    (the template names, addressable as button_card_templates.<name>);
+    `unaddressable` lists the entries whose name contains "." - no dotted
+    path can reach them, so they need update_dashboard_config().
     A strategy dashboard has no stored views: `strategy` holds its config.
     Or an error() envelope ("not_found", "config_read_failed").
     """
@@ -922,7 +941,11 @@ def get_dashboard_outline(url_path: str = "") -> dict:
         })
     root_keys = {k: (sorted(val) if isinstance(val, dict) else type(val).__name__)
                  for k, val in config.items() if k not in ("views", "strategy")}
-    out = {"url_path": url_path or "default", "views": views, "root_keys": root_keys}
+    unaddressable = [f"{k}.{name}" for k, val in config.items()
+                     if isinstance(val, dict) and k not in ("views", "strategy")
+                     for name in sorted(val) if "." in name]
+    out = {"url_path": url_path or "default", "views": views, "root_keys": root_keys,
+           "unaddressable": unaddressable}
     if "strategy" in config:
         out["strategy"] = config["strategy"]
     return out

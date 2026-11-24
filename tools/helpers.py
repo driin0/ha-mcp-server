@@ -78,6 +78,12 @@ _HELPER_CREATE_FIELDS = {
 }
 
 
+# What list_helpers() shows without a filter: the settable HELPER_DOMAINS
+# plus schedule, which the UI lists as a helper (and the "helpers" category
+# scope covers) but set_helper() cannot set.
+_LISTED_HELPER_DOMAINS = HELPER_DOMAINS | {"schedule"}
+
+
 @mcp.tool()
 def list_helpers(domain: str = "", category: str = "") -> dict:
     """
@@ -85,7 +91,7 @@ def list_helpers(domain: str = "", category: str = "") -> dict:
 
     domain: leave empty for all, or one of:
       input_boolean, input_number, input_text, input_select,
-      input_datetime, counter, timer, input_button
+      input_datetime, counter, timer, input_button, schedule
     category: filter by category, by name or category_id in the "helpers"
       scope (see list_categories). An unknown category is an error, not an
       empty list.
@@ -126,7 +132,7 @@ def list_helpers(domain: str = "", category: str = "") -> dict:
             if cats["filter_id"]:
                 if cid != cats["filter_id"]:
                     continue
-            elif d not in HELPER_DOMAINS:
+            elif d not in _LISTED_HELPER_DOMAINS:
                 continue
             if domain and d != domain:
                 continue

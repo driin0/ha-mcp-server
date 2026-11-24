@@ -252,6 +252,16 @@ def _verify_write(automation_id: str, slug: str, intended_config: dict,
     try:
         with httpx.Client() as client:
             _, raw_after = _fetch_config(automation_id, slug, client)
+    except httpx.TransportError as exc:
+        # A timeout here would otherwise surface as "a read, nothing
+        # changed, safe to repeat" - but the write before it was accepted.
+        return error(
+            "config_read_failed",
+            f"{entity_id}'s write was accepted by Home Assistant, so it DID "
+            f"happen, but reading it back failed ({type(exc).__name__}). Do not "
+            "simply retry: check what is stored with get_automation() first.",
+            entity_id=entity_id,
+        )
     except httpx.HTTPStatusError as exc:
         return error(
             "config_read_failed",

@@ -419,7 +419,8 @@ def delete_floor(floor_id: str) -> dict:
 def get_entity_registry(entity_id: str) -> dict:
     """
     Get full entity registry info for an entity: area, platform, unique_id,
-    disabled_by, hidden_by, aliases, icon, device_id, and more.
+    disabled_by, hidden_by, labels, categories ({scope: {category_id,
+    name}}), aliases, icon, device_id, and more.
 
     Useful for diagnosing entity configuration or finding the device an entity belongs to.
     """
@@ -451,9 +452,22 @@ def get_entity_registry(entity_id: str) -> dict:
         "hidden_by": result.get("hidden_by"),
         "icon": result.get("icon") or result.get("original_icon"),
         "labels": list(result.get("labels", [])),
+        "categories": _named_categories(result.get("categories") or {}),
         "aliases": list(result.get("aliases", [])),
         "has_entity_name": result.get("has_entity_name", False),
     }
+
+
+def _named_categories(categories: dict) -> dict:
+    """{scope: category_id} -> {scope: {category_id, name}}; name is null
+    when the scope's registry cannot be read or no longer has that id."""
+    out = {}
+    for scope, cid in categories.items():
+        r = _ws({"type": "config/category_registry/list", "scope": scope})
+        names = ({} if ws_error(r) else
+                 {c["category_id"]: c["name"] for c in r["result"]})
+        out[scope] = {"category_id": cid, "name": names.get(cid)}
+    return out
 
 
 @mcp.tool()

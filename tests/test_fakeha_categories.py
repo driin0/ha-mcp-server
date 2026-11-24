@@ -84,9 +84,9 @@ def test_an_unknown_category_id_is_stored_as_sent(fake_ha):
 
 def test_labels_still_update_through_the_same_command(fake_ha):
     r = _ok(fake_ha.ws({"type": "config/entity_registry/update",
-                        "entity_id": "light.kitchen", "labels": ["x"]}))
+                        "entity_id": "light.kitchen", "labels": ["power"]}))
 
-    assert r["entity_entry"]["labels"] == ["x"]
+    assert r["entity_entry"]["labels"] == ["power"]
 
 
 def test_deleting_a_category_clears_it_from_entities(fake_ha):

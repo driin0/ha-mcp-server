@@ -234,6 +234,9 @@ class FakeHA:
         # ("categories": {scope: category_id}).
         self.categories = {}
         self._next_category = 0
+        # Label ids the label registry knows: config/entity_registry/update
+        # drops any other id it is sent.
+        self.known_labels = {"power"}
         # manifest/list: what tools/categories.py reads to tell a helper
         # integration (integration_type "helper") from any other.
         self.manifests = [
@@ -637,7 +640,9 @@ class FakeHA:
         if row is None:
             return self._ws_fail("not_found", f"Entity not found: {msg.get('entity_id')}")
         if "labels" in msg:
-            row["labels"] = list(msg["labels"])
+            # Unknown label ids are dropped, as Home Assistant does since
+            # core PR #173438 (lr.async_get_missing_label_ids).
+            row["labels"] = [lab for lab in msg["labels"] if lab in self.known_labels]
         if "categories" in msg:
             # Merged per scope, None removes, ids never validated - the
             # handler in homeassistant/components/config/entity_registry.py.

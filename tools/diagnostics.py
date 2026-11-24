@@ -94,8 +94,8 @@ def get_history(entity_id: str, hours: int = 24, start: str = "", end: str = "",
     Get the recorded state changes of one entity over a time window.
 
     entity_id: the entity, e.g. 'sensor.lavatrice_run_state'.
-    hours:     window length ending now (default 24). Ignored when `start`
-               is given. Must be > 0.
+    hours:     window length ending at `end` - now unless `end` is given
+               (default 24). Ignored when `start` is given. Must be > 0.
     start/end: optional ISO 8601 datetimes for an explicit window, e.g.
                '2026-11-14T00:00:00+00:00'. A value without an offset is
                read as UTC, not as the instance's local time. `end`
@@ -219,6 +219,10 @@ def get_logbook(hours: int = 6, entity_id: str = "") -> dict:
 # to the record above it.
 _RECORD_START = re.compile(
     r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? (DEBUG|INFO|WARNING|ERROR|CRITICAL) ")
+# Lines the add-on container itself writes into the same journal (s6
+# overlay, init scripts). They are not continuations of the HA record above
+# them, so each starts a record of its own.
+_FOREIGN_START = re.compile(r"^(s6-rc:|\[s6-|\[cont-|\[services\.d\]|\[\d\d:\d\d:\d\d\] )")
 _LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _SCAN_MIN, _SCAN_MAX = 2, 10000
@@ -227,11 +231,14 @@ _EXCEPTION_MAX_LINES = 40
 
 def _parse_records(text: str) -> list[str]:
     """Group log lines into records: a record starts at a line with Home
-    Assistant's log prefix; the lines after it (a traceback) are part of
-    it. Lines before the first prefix form one leading record."""
+    Assistant's log prefix, or at a line the container's init system wrote
+    (s6-rc, [s6-init], ...); the lines after an HA record (a traceback) are
+    part of it. Lines before the first prefix form one leading record.
+    Anything else without a prefix is taken as a continuation - that is the
+    rule's limit."""
     records: list[list[str]] = []
     for line in text.splitlines():
-        if _RECORD_START.match(line) or not records:
+        if _RECORD_START.match(line) or _FOREIGN_START.match(line) or not records:
             records.append([line])
         else:
             records[-1].append(line)
@@ -259,7 +266,8 @@ def get_core_logs(lines: int = 100, grep: str = "", level: str = "", scan: int =
     it reaches you.
 
     lines: how many matching RECORDS to return, the most recent (default
-           100). A record is one log entry including its traceback.
+           100; 0 = all matching records in the scan). A record is one log
+           entry including its traceback.
     grep:  case-insensitive substring searched in the whole record - so a
            traceback that mentions 'smartthinq_sensors' is found even when
            its first line names only homeassistant.config_entries.
@@ -275,13 +283,16 @@ def get_core_logs(lines: int = 100, grep: str = "", level: str = "", scan: int =
     log} - `log` is the returned records joined by newlines, ANSI colours
     removed. "matched": 0 with a note is "nothing matched in what was
     scanned", not "the log is empty". Or an error() envelope:
-    "supervisor_not_available", "invalid_level", "supervisor_error".
+    "supervisor_not_available", "invalid_level", "invalid_lines",
+    "supervisor_error".
     """
     if addons._SUPERVISOR_BASE is None:
         return error("supervisor_not_available",
                      "The core log is read through the Supervisor, which this "
                      "installation does not have. Use get_system_log() for the "
                      "errors and warnings Home Assistant keeps in memory.")
+    if lines < 0:
+        return error("invalid_lines", f"lines must be >= 0 (0 = all), got {lines}.")
     min_level, err = _min_level(level)
     if err:
         return err
@@ -376,7 +387,7 @@ def get_system_log(level: str = "", grep: str = "", limit: int = 50) -> dict:
         if _LEVELS.get(str(entry["level"]).upper(), 0) < min_level:
             continue
         if needle and needle not in " ".join(
-                str(entry[k]) for k in ("name", "message", "source", "exception")).casefold():
+                str(entry[k] or "") for k in ("name", "message", "source", "exception")).casefold():
             continue
         out.append(entry)
     return envelope(out, key="entries", limit=limit)

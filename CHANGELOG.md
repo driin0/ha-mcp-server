@@ -64,6 +64,14 @@
   `get_error_log` now falls back to the core log instead of answering
   only "not available".
 
+- Smaller changes to existing tools:
+  - `get_entity_registry` shows the entity's categories by scope, with names.
+  - `list_helpers` lists `schedule` helpers, which the UI shows as helpers.
+  - `patch_automation` / `update_automation`: when reading the config back
+    after an accepted write times out, the result says the write DID happen
+    (`config_read_failed`) instead of surfacing as a read timeout that
+    reads as "nothing changed, safe to repeat".
+
 - The README's tool count is 203 (199 registered by default).
 
 ## 2.5.0
