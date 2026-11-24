@@ -316,6 +316,7 @@ WS_READ_COMMANDS = frozenset({
     "lovelace/config",
     "lovelace/dashboards/list",
     "lovelace/resources/list",
+    "manifest/list",
     "media_player/browse_media",
     "persistent_notification/get",
     "recorder/statistics_during_period",

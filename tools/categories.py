@@ -15,7 +15,7 @@ helpers/category_registry.py, components/config/entity_registry.py):
   and then never shown anywhere in the UI. Resolving and validating the
   category is therefore this module's job, done before anything is sent.
 """
-from tools._base import mcp, _ws, envelope, error, ws_error
+from tools._base import mcp, _ws, _ws_multi, envelope, error, ws_error, ws_transport_error
 
 CATEGORY_SCOPES = ("automation", "script", "scene", "helpers")
 
@@ -224,3 +224,218 @@ def delete_category(scope: str, category: str) -> dict:
         return err
     return {"scope": scope, "category_id": entry["category_id"], "name": entry["name"],
             "deleted": True, "cleared_from": affected}
+
+
+# ---- assignment -------------------------------------------------------------
+
+# What the frontend's helpers page lists by domain (frontend
+# src/data/helpers/const.ts HELPER_DOMAINS). Deliberately local: _base's
+# HELPER_DOMAINS drives list_helpers()/set_helper() and has no `schedule`.
+_HELPER_DOMAINS = frozenset({
+    "input_boolean", "input_button", "input_text", "input_number",
+    "input_datetime", "input_select", "counter", "timer", "schedule",
+})
+_DOMAIN_SCOPES = {"automation": "automation", "script": "script", "scene": "scene"}
+
+# Same bound as bulk_set_entity_labels() (tools/areas.py) and for the same
+# reason: every command of a batch is sent before any reply is read.
+_BULK_CATEGORY_MAX = 200
+
+
+def _helper_platforms() -> tuple[set[str], dict | None]:
+    """Integrations whose manifest says integration_type == "helper"
+    (template, group, utility_meter, derivative, ...). The frontend lists
+    their entities on the helpers page, so they take the "helpers" scope."""
+    r = _ws({"type": "manifest/list"})
+    if err := ws_error(r):
+        return set(), err
+    return {m["domain"] for m in r["result"] if m.get("integration_type") == "helper"}, None
+
+
+def _scope_for(entity_id: str, entry: dict | None,
+               helper_platforms: set[str]) -> tuple[str | None, dict | None]:
+    """The category scope the UI shows `entity_id` under, or an error.
+
+    automation/script/scene by domain; the helper domains and entities of a
+    helper integration -> "helpers". Anything else is "not_categorizable":
+    Home Assistant would store a category on it, but no page shows it.
+    """
+    if entry is None:
+        return None, error(
+            "not_in_registry",
+            f"{entity_id!r} is not in the entity registry (an entity without a "
+            "unique_id, e.g. defined in YAML without one). Categories are "
+            "stored in the registry, so it cannot have one.",
+            entity_id=entity_id)
+    domain = entity_id.split(".", 1)[0]
+    if domain in _DOMAIN_SCOPES:
+        return _DOMAIN_SCOPES[domain], None
+    if domain in _HELPER_DOMAINS or entry.get("platform") in helper_platforms:
+        return "helpers", None
+    return None, error(
+        "not_categorizable",
+        f"{entity_id!r} (integration {entry.get('platform')!r}) is not an "
+        "automation, script, scene or helper. Home Assistant would accept a "
+        "category on it, but no page in the UI would ever show it. Use "
+        "labels (set_entity_labels) to group arbitrary entities.",
+        entity_id=entity_id, platform=entry.get("platform"))
+
+
+def _needs_manifests(entity_id: str) -> bool:
+    domain = entity_id.split(".", 1)[0]
+    return domain not in _DOMAIN_SCOPES and domain not in _HELPER_DOMAINS
+
+
+def _named(category_id: str | None, entries: list[dict]) -> dict | None:
+    if not category_id:
+        return None
+    name = next((e["name"] for e in entries if e["category_id"] == category_id), None)
+    return {"category_id": category_id, "name": name}
+
+
+@mcp.tool()
+def set_entity_category(entity_id: str, category: str) -> dict:
+    """
+    Put one automation, script, scene or helper in a category, or take it
+    out of its category.
+
+    entity_id: e.g. 'automation.lavatrice_fine', 'timer.lavatrice'.
+    category:  by category_id or exact name (case-insensitive) in the
+               entity's scope; "" removes the entity from its category.
+
+    The scope is derived from the entity: automation.* -> "automation",
+    script.* -> "script", scene.* -> "scene"; input_*, counter, timer,
+    schedule and entities of a helper integration (template, group,
+    utility_meter, ...) -> "helpers". A name is looked up in THAT scope,
+    so "Elettrodomestici" picks the helpers-scope id for a timer even if
+    you only ever saw the automation-scope id. Only this scope changes;
+    any category the entity has in another scope stays.
+
+    Home Assistant stores any category id it is sent without checking it,
+    so a wrong one would be saved and silently never shown. This tool
+    resolves the category first and sends nothing when it does not exist in
+    the entity's scope.
+
+    Returns: {entity_id, scope, old: {category_id, name} | null, new:
+    {category_id, name} | null}, or an error() envelope -
+    "not_in_registry", "not_categorizable" (any other entity: use labels),
+    "category_not_found" (with the names available in the scope and the
+    scopes where that name exists), Home Assistant's own error, or
+    "config_write_unverified" (the update was accepted but the registry
+    entry Home Assistant returned does not carry the intended category).
+    """
+    r = _ws({"type": "config/entity_registry/get", "entity_id": entity_id})
+    if err := ws_error(r):
+        if err["error"] != "not_found":
+            return err
+        entry = None
+    else:
+        entry = r["result"]
+    helper_platforms: set[str] = set()
+    if entry is not None and _needs_manifests(entity_id):
+        helper_platforms, err = _helper_platforms()
+        if err:
+            return err
+    scope, err = _scope_for(entity_id, entry, helper_platforms)
+    if err:
+        return err
+    entries, err = _list_categories(scope)
+    if err:
+        return err
+    target_id = None
+    if category:
+        target, err = _resolve_category(scope, category, entries)
+        if err:
+            err["entity_id"] = entity_id
+            return err
+        target_id = target["category_id"]
+    old_id = (entry.get("categories") or {}).get(scope)
+
+    w = _ws({"type": "config/entity_registry/update", "entity_id": entity_id,
+             "categories": {scope: target_id}})
+    if err := ws_error(w):
+        return err
+    stored = ((w["result"].get("entity_entry") or {}).get("categories") or {}).get(scope)
+    if stored != target_id:
+        return error(
+            "config_write_unverified",
+            f"Home Assistant accepted the update but returned {entity_id!r} "
+            f"with category {stored!r} in scope {scope!r}, not {target_id!r}. "
+            "The write may or may not have landed - read it back with "
+            "get_entity_registry() before retrying.",
+            entity_id=entity_id, scope=scope, intended=target_id, stored=stored)
+    return {"entity_id": entity_id, "scope": scope,
+            "old": _named(old_id, entries), "new": _named(target_id, entries)}
+
+
+@mcp.tool()
+def bulk_set_entity_category(entity_ids: list, category: str) -> dict:
+    """
+    Put many entities in a category (or take them out with category="").
+
+    entity_ids: up to 200 automations, scripts, scenes and helpers - they
+                may mix scopes.
+    category:   a NAME resolves separately in each entity's scope, so
+                "Elettrodomestici" lands on the automation-scope id for
+                automations and the helpers-scope id for helpers. An ID
+                belongs to one scope only: entities of other scopes fail.
+
+    Everything is resolved before anything is sent; entities that cannot
+    take the category (not in the registry, not categorisable, category
+    missing in their scope) are listed in `failed` with the reason and are
+    not written. The rest go in one WebSocket batch.
+
+    Returns: {total, succeeded, failed: [{entity_id, reason}]}, or an
+    error() envelope - "too_many_entities" (over 200, nothing sent), a
+    registry/manifest read failure, or ws_transport_error()'s code when the
+    connection never carried the batch (one systemic failure, not "every
+    entity failed").
+    """
+    if len(entity_ids) > _BULK_CATEGORY_MAX:
+        return error(
+            "too_many_entities",
+            f"{len(entity_ids)} entity_ids given, {_BULK_CATEGORY_MAX} max per "
+            "call - split the list into batches.",
+            entity_count=len(entity_ids), max_entities=_BULK_CATEGORY_MAX)
+    r = _ws({"type": "config/entity_registry/list"})
+    if err := ws_error(r):
+        return err
+    registry = {e["entity_id"]: e for e in r["result"]}
+    helper_platforms: set[str] = set()
+    if any(_needs_manifests(eid) for eid in entity_ids):
+        helper_platforms, err = _helper_platforms()
+        if err:
+            return err
+
+    resolved: dict[str, tuple[str | None, str | None]] = {}  # scope -> (id, reason)
+    failed, to_send = [], []
+    for eid in entity_ids:
+        scope, err = _scope_for(eid, registry.get(eid), helper_platforms)
+        if err:
+            failed.append({"entity_id": eid, "reason": f"{err['error']}: {err['detail']}"})
+            continue
+        if scope not in resolved:
+            if not category:
+                resolved[scope] = (None, None)
+            else:
+                target, err = _resolve_category(scope, category)
+                resolved[scope] = ((target["category_id"], None) if target
+                                   else (None, f"{err['error']}: {err['detail']}"))
+        target_id, reason = resolved[scope]
+        if reason:
+            failed.append({"entity_id": eid, "reason": reason})
+            continue
+        to_send.append((eid, {"type": "config/entity_registry/update", "entity_id": eid,
+                              "categories": {scope: target_id}}))
+
+    results = _ws_multi([m for _, m in to_send]) if to_send else []
+    if results and (transport_err := ws_transport_error(results[0])):
+        return transport_err
+    succeeded = 0
+    for (eid, _), res in zip(to_send, results):
+        if res.get("success"):
+            succeeded += 1
+        else:
+            msg = (res.get("error") or {}).get("message", "rejected")
+            failed.append({"entity_id": eid, "reason": f"home_assistant_error: {msg}"})
+    return {"total": len(entity_ids), "succeeded": succeeded, "failed": failed}
