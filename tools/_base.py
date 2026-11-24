@@ -297,6 +297,7 @@ WS_READ_COMMANDS = frozenset({
     "backup/info",
     "blueprint/list",
     "config/area_registry/list",
+    "config/category_registry/list",
     "config/auth/list",
     "config/device_registry/list",
     "config/entity_registry/get",
@@ -315,12 +316,14 @@ WS_READ_COMMANDS = frozenset({
     "lovelace/config",
     "lovelace/dashboards/list",
     "lovelace/resources/list",
+    "manifest/list",
     "media_player/browse_media",
     "persistent_notification/get",
     "recorder/statistics_during_period",
     "repairs/list_issues",
     "scheduler/items",
     "system_health/info",
+    "system_log/list",
     "tag/list",
     "trace/list",
 })
@@ -342,6 +345,17 @@ class WsTimeout(TimeoutError):
             + (", ".join(self.command_types) if self.command_types
                else "the WebSocket batch")
             + " in time")
+
+
+def ws_failures() -> tuple:
+    """The exceptions a WebSocket call can raise instead of answering: our
+    own timeout, a socket error, or any websockets-level failure (closed
+    connection, refused handshake). Callers that can degrade - an optional
+    column, a read-back after a write that already landed - catch these;
+    websockets.exceptions are not OSError subclasses, so catching OSError
+    alone misses a dropped connection."""
+    import websockets.exceptions
+    return (WsTimeout, OSError, websockets.exceptions.WebSocketException)
 
 
 def _ws(msg: dict) -> dict:

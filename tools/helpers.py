@@ -1,5 +1,6 @@
 import httpx
 
+from tools.categories import category_context, with_note
 from tools._base import (
     mcp, HA_URL, HEADERS, HELPER_DOMAINS, _slug, _ws, envelope, error, observe_actuation,
     rest_error, ws_error,
@@ -77,26 +78,71 @@ _HELPER_CREATE_FIELDS = {
 }
 
 
+# What list_helpers() shows without a filter: the settable HELPER_DOMAINS
+# plus schedule, which the UI lists as a helper (and the "helpers" category
+# scope covers) but set_helper() cannot set.
+_LISTED_HELPER_DOMAINS = HELPER_DOMAINS | {"schedule"}
+
+
 @mcp.tool()
-def list_helpers(domain: str = "") -> dict:
+def list_helpers(domain: str = "", category: str = "") -> dict:
     """
-    List helpers, optionally filtered by domain.
+    List helpers, optionally filtered by domain and/or category.
 
     domain: leave empty for all, or one of:
       input_boolean, input_number, input_text, input_select,
-      input_datetime, counter, timer, input_button
+      input_datetime, counter, timer, input_button, schedule
+    category: filter by category, by name or category_id in the "helpers"
+      scope (see list_categories). An unknown category is an error, not an
+      empty list.
 
-    Returns: {total, returned, offset, note?, helpers: [...]}
+    Without `category`, only the domains above are listed. WITH it, the
+    list comes from the entity registry - every entity in that category -
+    so helpers created by helper integrations (template, utility_meter,
+    group, derivative, ...) carrying it are included too, under their own
+    domain (e.g. "sensor"), and so are disabled helpers, which have no
+    state: those rows have state null and a `disabled_by` field.
+
+    Returns: {total, returned, offset, note?, helpers: [{entity_id, domain,
+             name, state, attributes, category}]} - category is the
+             category's name, or null.
     """
+    cats = category_context("helpers", category)
+    if "error" in cats:
+        return cats["error"]
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
         helpers = []
-        for s in r.json():
+        states = r.json()
+        if cats["filter_id"]:
+            # From the registry, so a disabled helper (no state at all)
+            # carrying the category is listed too, with state null.
+            seen = {s["entity_id"] for s in states}
+            for eid, cid in cats["assigned"].items():
+                if cid == cats["filter_id"] and eid not in seen:
+                    entry = cats["registry"].get(eid, {})
+                    states.append({"entity_id": eid, "state": None,
+                                   "attributes": {"friendly_name": entry.get("name")
+                                                  or entry.get("original_name") or eid},
+                                   "_disabled_by": entry.get("disabled_by")})
+        for s in states:
             d = s["entity_id"].split(".")[0]
-            if d not in HELPER_DOMAINS:
+            cid = cats["assigned"].get(s["entity_id"])
+            if cats["filter_id"]:
+                if cid != cats["filter_id"]:
+                    continue
+            elif d not in _LISTED_HELPER_DOMAINS:
                 continue
             if domain and d != domain:
+                continue
+            if "_disabled_by" in s:
+                helpers.append({
+                    "entity_id": s["entity_id"], "domain": d,
+                    "name": s["attributes"]["friendly_name"], "state": None,
+                    "attributes": {}, "disabled_by": s["_disabled_by"],
+                    "category": cats["names"].get(cid),
+                })
                 continue
             helpers.append({
                 "entity_id": s["entity_id"],
@@ -107,8 +153,10 @@ def list_helpers(domain: str = "") -> dict:
                     k: v for k, v in s.get("attributes", {}).items()
                     if k not in ("friendly_name", "icon", "editable")
                 },
+                "category": cats["names"].get(cid),
             })
-        return envelope(sorted(helpers, key=lambda x: (x["domain"], x["name"])), key="helpers")
+        return with_note(envelope(sorted(helpers, key=lambda x: (x["domain"], x["name"])),
+                                  key="helpers"), cats["note"])
 
 
 @mcp.tool()

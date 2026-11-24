@@ -1,6 +1,7 @@
 import httpx
 
 from tools._aliases import PathError, get_path, set_path, stored_format, to_modern, to_stored
+from tools.categories import category_context, with_note
 from tools._base import (
     mcp, HA_URL, HEADERS, _slug, _ws, confirm_entity_exists, envelope, error,
     observe_actuation, rest_error, wait_for_entity, ws_error,
@@ -251,6 +252,16 @@ def _verify_write(automation_id: str, slug: str, intended_config: dict,
     try:
         with httpx.Client() as client:
             _, raw_after = _fetch_config(automation_id, slug, client)
+    except httpx.TransportError as exc:
+        # A timeout here would otherwise surface as "a read, nothing
+        # changed, safe to repeat" - but the write before it was accepted.
+        return error(
+            "config_read_failed",
+            f"{entity_id}'s write was accepted by Home Assistant, so it DID "
+            f"happen, but reading it back failed ({type(exc).__name__}). Do not "
+            "simply retry: check what is stored with get_automation() first.",
+            entity_id=entity_id,
+        )
     except httpx.HTTPStatusError as exc:
         return error(
             "config_read_failed",
@@ -455,7 +466,7 @@ def _set_and_verify_enabled(entity_id: str, enabled: bool, *,
 
 @mcp.tool()
 def list_automations(search: str = "", label: str = "", limit: int = 50,
-                     offset: int = 0) -> dict:
+                     offset: int = 0, category: str = "") -> dict:
     """
     List automations with their state and last triggered time.
 
@@ -463,9 +474,13 @@ def list_automations(search: str = "", label: str = "", limit: int = 50,
     label:  filter by label ID (use list_labels() to find label IDs)
     limit:  max automations to return (default 50, 0 for no limit)
     offset: skip the first N (for pagination)
+    category: filter by category, by name or category_id in the
+            "automation" scope (see list_categories). An unknown category
+            is an error, not an empty list.
 
     Returns: {total, returned, offset, note?, automations: [{entity_id, name,
-             state, last_triggered, labels}]}
+             state, last_triggered, labels, category}]} - category is the
+             category's name, or null.
 
     `total` counts what matched the filters, not what was returned: when it
     exceeds `returned`, `note` says so. An instance with a few hundred
@@ -477,8 +492,13 @@ def list_automations(search: str = "", label: str = "", limit: int = 50,
         # Filtering by a label we could not read would silently return
         # nothing, which is the failure mode this work removes.
         return registry_err
+    if registry_err and category:
+        return registry_err
     registry = ({} if registry_err
                 else {e["entity_id"]: e for e in r["result"]})
+    cats = category_context("automation", category, None if registry_err else registry)
+    if "error" in cats:
+        return cats["error"]
 
     with httpx.Client() as client:
         resp = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
@@ -495,17 +515,21 @@ def list_automations(search: str = "", label: str = "", limit: int = 50,
         labels = list(registry.get(s["entity_id"], {}).get("labels", []))
         if label and label not in labels:
             continue
+        cid = cats["assigned"].get(s["entity_id"])
+        if cats["filter_id"] and cid != cats["filter_id"]:
+            continue
         automations.append({
             "entity_id": s["entity_id"],
             "name": name,
             "state": s["state"],
             "last_triggered": attrs.get("last_triggered"),
             "labels": labels,
+            "category": cats["names"].get(cid),
         })
 
     automations.sort(key=lambda x: x["name"])
-    return envelope(automations, key="automations", limit=limit, offset=offset,
-                    offset_paginated=True)
+    return with_note(envelope(automations, key="automations", limit=limit, offset=offset,
+                              offset_paginated=True), cats["note"])
 
 
 @mcp.tool()

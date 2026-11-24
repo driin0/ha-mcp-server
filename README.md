@@ -1,15 +1,16 @@
 # HA MCP Server
 
 An [MCP](https://modelcontextprotocol.io/) server that exposes Home Assistant's
-REST and WebSocket APIs as **192 tools** (188 registered by default — four are
+REST and WebSocket APIs as **203 tools** (199 registered by default — four are
 off until explicitly enabled, see [the registration
 gate](#the-registration-gate-three-groups-two-defaults) below), so an MCP
 client — Claude Code among others — can drive an instance directly.
 
 Lights, climate, covers, media, alarm and cameras; automations, scripts, scenes,
-helpers and dashboards; the area, floor, label, device and entity registries;
-add-ons, HACS, backups and system health; history, logbook, statistics and
-energy.
+helpers and dashboards (including partial, path-based dashboard edits); the
+area, floor, label, category, device and entity registries; add-ons, HACS,
+backups and system health; history, logbook, core and system logs, statistics
+and energy.
 
 A status dashboard shows what the server sees and which tools have been called.
 

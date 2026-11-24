@@ -1,5 +1,90 @@
 # Changelog
 
+## 2.6.0
+
+- **`get_history` returns the window it was asked for.** Home Assistant's
+  `/api/history/period/<start>` answers for *start + 1 day* when no
+  `end_time` is sent, and the tool never sent one. Any window longer than
+  24 hours therefore returned only its oldest day: stale rows a little over
+  a day, nothing at all once the window began before the recorder's
+  retention. Measured on a real instance: `hours=72` on `sun.sun` stopped
+  two days before the call; `hours=2160` returned 0 rows while ten days
+  were recorded. The end of the window is now always sent. The tool also
+  gains `start`/`end` (ISO 8601, a value without an offset is UTC) and
+  `limit` (default 500, the most recent rows kept, with a note when rows
+  are left out), and returns `entity_id` and `window: {start, end}` - the
+  exact range Home Assistant was asked for. `hours <= 0`, an unparseable
+  date or a start not before the end is `invalid_window`. The empty-result
+  note no longer tells the caller to widen `hours`.
+
+- **Categories: `list_categories`, `create_category`, `update_category`,
+  `delete_category`, `set_entity_category`, `bulk_set_entity_category`.**
+  Categories are per scope (`automation`, `script`, `scene`, `helpers`)
+  and the same name has a different id in each. Assignment derives the
+  scope from the entity (`helpers` covers input_*, counter, timer,
+  schedule and entities of helper integrations such as template and
+  utility_meter) and resolves a name in that scope, so one name lands on
+  the right id for automations and helpers alike. Home Assistant stores
+  any category id it is sent without checking it; these tools refuse an id
+  or name that does not exist in the entity's scope - naming the scopes
+  where it does - and refuse entities no category page shows. Every write
+  is checked against the registry entry Home Assistant returns
+  (`config_write_unverified`), in bulk too. `delete_category`
+  reports the entities that lose the category.
+  `list_automations`, `list_scripts`, `list_scenes` and `list_helpers`
+  show each row's `category` and accept a `category` filter; an unknown
+  category is an error, not an empty list. Filtered by category,
+  `list_helpers` also includes helper-integration entities.
+
+- **Partial dashboard edits: `patch_dashboard`, `find_dashboard_cards`,
+  `get_dashboard_outline`.** `update_dashboard_config` replaces the whole
+  config, so changing one field meant resending all of it - and replacing
+  cards by index once deleted neighbouring cards the caller did not know
+  were there. `patch_dashboard(url_path, path, value, op, expect)` changes
+  one dotted path (`set`, `insert`, `remove`), refuses a path that does
+  not resolve, refuses a target that does not match `expect`, re-reads the
+  config before saving (`concurrent_modification`) and reads it back after
+  (`config_write_unverified`), and returns the `old` value. `value` is
+  required, so a forgotten argument cannot write null over a card. Setting
+  or removing anything that holds other cards - a view, a section, a
+  stack, a `cards` list, a button-card embedding cards in `custom_fields`
+  - is refused as `container_target`, naming every
+  card that would go with it, unless `replace_container=True`: matching a
+  section's own `type` says nothing about what is inside it.
+  `find_dashboard_cards` searches by entity, heading, type or text and
+  returns each card's path together with its siblings in the same
+  section; `get_dashboard_outline` maps every view, section and card with
+  its path in a fraction of the full config.
+
+- **Logs: `get_core_logs` and `get_system_log`.** Recent cores serve no
+  `/api/error_log`. `get_core_logs(lines, grep, level, scan)` reads the
+  core log through the Supervisor, groups lines into records with their
+  tracebacks and filters before returning, so a traceback mentioning an
+  integration is found even when its first line does not.
+  `get_system_log` returns the deduplicated errors and warnings Home
+  Assistant keeps in memory and works without a Supervisor.
+  `get_error_log` now falls back to the core log instead of answering
+  only "not available".
+
+- **`set_entity_labels` / `bulk_set_entity_labels` no longer report a
+  label that was never stored.** Home Assistant drops label ids that do not
+  exist and still answers success, and both tools passed that success on: a
+  typo'd label silently never appeared. Every id is now checked against the
+  label registry first (`label_not_found`, with the unknown and the
+  available ids; nothing is written), and the labels Home Assistant returns
+  are compared with the ones sent (`config_write_unverified`; in bulk, the
+  entity is in `failed` and the new `reasons` map says why).
+
+- Smaller changes to existing tools:
+  - `get_entity_registry` shows the entity's categories by scope, with names.
+  - `list_helpers` lists `schedule` helpers, which the UI shows as helpers.
+  - `patch_automation` / `update_automation`: when reading the config back
+    after an accepted write times out, the result says the write DID happen
+    (`config_read_failed`) instead of surfacing as a read timeout that
+    reads as "nothing changed, safe to repeat".
+
+- The README's tool count is 203 (199 registered by default).
+
 ## 2.5.0
 
 - **Read and edit UI-created template helpers in place:

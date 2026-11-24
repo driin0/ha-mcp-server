@@ -1,15 +1,24 @@
 import httpx
 
+from tools.categories import category_context, with_note
 from tools._base import mcp, HA_URL, HEADERS, _slug, confirm_entity_exists, envelope
 
 
 @mcp.tool()
-def list_scenes() -> dict:
+def list_scenes(category: str = "") -> dict:
     """
     List all scenes with their entity list and current states.
 
-    Returns: {total, returned, offset, note?, scenes: [...]}
+    category: filter by category, by name or category_id in the "scene"
+              scope (see list_categories). An unknown category is an
+              error, not an empty list.
+
+    Returns: {total, returned, offset, note?, scenes: [{entity_id, name,
+             entities, category}]} - category is the category's name, or null.
     """
+    cats = category_context("scene", category)
+    if "error" in cats:
+        return cats["error"]
     with httpx.Client() as client:
         states_r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         states_r.raise_for_status()
@@ -18,14 +27,19 @@ def list_scenes() -> dict:
         for s in states_r.json():
             if not s["entity_id"].startswith("scene."):
                 continue
+            cid = cats["assigned"].get(s["entity_id"])
+            if cats["filter_id"] and cid != cats["filter_id"]:
+                continue
             attrs = s.get("attributes", {})
             entity_ids = attrs.get("entity_id", [])
             scenes.append({
                 "entity_id": s["entity_id"],
                 "name": attrs.get("friendly_name", s["entity_id"]),
                 "entities": {eid: all_states.get(eid, "unknown") for eid in entity_ids},
+                "category": cats["names"].get(cid),
             })
-        return envelope(sorted(scenes, key=lambda x: x["name"]), key="scenes")
+        return with_note(envelope(sorted(scenes, key=lambda x: x["name"]), key="scenes"),
+                         cats["note"])
 
 
 @mcp.tool()

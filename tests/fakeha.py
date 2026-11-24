@@ -5,6 +5,8 @@ WebSocket API. This module answers both from the same in-memory dataset, so a
 test can say "the registry contains X" once and have every tool see it.
 """
 import copy
+import urllib.parse
+from datetime import datetime, timedelta
 import json
 
 import httpx
@@ -160,6 +162,15 @@ class FakeHA:
         # reported as a top-level [] rather than an empty inner list, the
         # same way Home Assistant omits entities with nothing to show.
         self.history = {}
+        # The window is applied the way Home Assistant applies it
+        # (homeassistant/components/history/__init__.py): rows with
+        # start < last_changed <= end, where end is the `end_time` query
+        # parameter or - when it is absent - start + 1 day, NOT now. That
+        # default is the reason get_history() once returned only the first
+        # day of any window longer than 24 h. history_oldest models
+        # recorder retention: rows older than it are gone. Rows without a
+        # last_changed are always returned (fixtures that predate windows).
+        self.history_oldest = None
         # /api/logbook/<start>: a flat list of event dicts, optionally
         # filtered server-side by the `entity` query param.
         self.logbook = []
@@ -216,6 +227,46 @@ class FakeHA:
         # does not land, for read-back verification).
         self.options_submit_raises = None
         self.options_submit_discarded = False
+        # Category registry, per scope: {scope: [entry, ...]} where entry is
+        # {category_id, name, icon, created_at, modified_at} - Home
+        # Assistant's own _entry_dict shape, scope not included. Empty by
+        # default. Entity categories live on the registry rows themselves
+        # ("categories": {scope: category_id}).
+        self.categories = {}
+        self._next_category = 0
+        # Label ids the label registry knows: config/entity_registry/update
+        # drops any other id it is sent.
+        self.known_labels = {"power", "energia"}
+        # manifest/list: what tools/categories.py reads to tell a helper
+        # integration (integration_type "helper") from any other.
+        self.manifests = [
+            {"domain": "template", "integration_type": "helper"},
+            {"domain": "utility_meter", "integration_type": "helper"},
+            {"domain": "hue", "integration_type": "hub"},
+        ]
+        # Lovelace. lovelace: {url_path: config | None}, "" = the default
+        # dashboard; None = never saved from the UI (Home Assistant answers
+        # config_not_found "No config found."), absent = no such dashboard.
+        # dashboards: lovelace/dashboards/list rows ({url_path, mode, ...});
+        # a "yaml"-mode dashboard refuses saves with "Not supported", as
+        # LovelaceYAML does. Saving is last-write-wins, no version check -
+        # lovelace/dashboard.py LovelaceStorage.async_save.
+        # lovelace_mutate_on_read: {n: callable(config)} run on the stored
+        # config just before answering the n-th lovelace/config read (1-based)
+        # - a concurrent writer landing between a tool's reads.
+        # lovelace_save_discarded: accept saves without storing them.
+        self.lovelace = {"": None}
+        self.dashboards = []
+        self.lovelace_reads = 0
+        self.lovelace_mutate_on_read = {}
+        self.lovelace_save_discarded = False
+        # Supervisor GET /core/logs: the journal as text/plain. `lines=N`
+        # returns the last N lines (supervisor/api/host.py); `no_colors`
+        # strips ANSI codes, which are otherwise present - so the fake puts
+        # an ANSI code in every line when it is NOT sent.
+        self.core_log = ""
+        # system_log/list: newest first, Home Assistant's to_list() shape.
+        self.system_log = []
         # Everything the tools sent, for assertions.
         self.rest_calls = []
         self.ws_calls = []
@@ -329,10 +380,16 @@ class FakeHA:
             return self._options_flow(request, path)
         if path.startswith("/api/services/"):
             return httpx.Response(200, json=[])
+        if path == "/core/logs":
+            lines = self.core_log.splitlines()
+            n = int(request.url.params.get("lines", "100"))
+            lines = lines[-n:]
+            if "no_colors" not in request.url.params:
+                lines = [f"\x1b[32m{line}\x1b[0m" for line in lines]
+            return httpx.Response(200, text="\n".join(lines),
+                                  headers={"content-type": "text/plain"})
         if path.startswith("/api/history/period/"):
-            entity_id = request.url.params.get("filter_entity_id", "")
-            points = self.history.get(entity_id)
-            return httpx.Response(200, json=[points] if points else [])
+            return self._history(request, path)
         if path.startswith("/api/logbook/"):
             entity = request.url.params.get("entity", "")
             entries = self.logbook
@@ -453,6 +510,24 @@ class FakeHA:
                                          "handler": entry_id, "description": None,
                                          "description_placeholders": None})
 
+    def _history(self, request: httpx.Request, path: str) -> httpx.Response:
+        raw_start = urllib.parse.unquote(path.removeprefix("/api/history/period/"))
+        start = datetime.fromisoformat(raw_start)
+        raw_end = request.url.params.get("end_time")
+        end = datetime.fromisoformat(raw_end) if raw_end else start + timedelta(days=1)
+        entity_id = request.url.params.get("filter_entity_id", "")
+        points = []
+        for p in self.history.get(entity_id) or []:
+            changed = p.get("last_changed")
+            if changed:
+                when = datetime.fromisoformat(changed)
+                if self.history_oldest and when < self.history_oldest:
+                    continue
+                if not (start < when <= end):
+                    continue
+            points.append(p)
+        return httpx.Response(200, json=[points] if points else [])
+
     # ---- WebSocket -----------------------------------------------------
     def ws(self, msg: dict) -> dict:
         self.ws_calls.append(msg)
@@ -471,12 +546,117 @@ class FakeHA:
             return {"id": 1, "type": "result", "success": False,
                     "error": {"code": "not_found",
                               "message": f"Entity not found: {entity_id}"}}
+        if kind.startswith("config/category_registry/"):
+            return self._category_registry(kind.rsplit("/", 1)[1], msg)
+        if kind == "config/entity_registry/update":
+            return self._entity_registry_update(msg)
+        if kind == "lovelace/config":
+            return self._lovelace_read(msg)
+        if kind == "lovelace/config/save":
+            return self._lovelace_save(msg)
+        if kind == "lovelace/dashboards/list":
+            return self._ws_ok(copy.deepcopy(self.dashboards))
+        if kind == "system_log/list":
+            return self._ws_ok(copy.deepcopy(self.system_log))
+        if kind == "config/label_registry/list":
+            return self._ws_ok([{"label_id": lab, "name": lab.capitalize()}
+                                for lab in sorted(self.known_labels)])
+        if kind == "manifest/list":
+            return {"id": 1, "type": "result", "success": True, "result": self.manifests}
         if kind == "config/device_registry/list":
             return {"id": 1, "type": "result", "success": True,
                     "result": self.devices}
         return {"id": 1, "type": "result", "success": False,
                 "error": {"code": "unknown_command",
                           "message": f"No fake response for {kind}"}}
+
+    @staticmethod
+    def _ws_ok(result):
+        return {"id": 1, "type": "result", "success": True, "result": result}
+
+    @staticmethod
+    def _ws_fail(code, message):
+        return {"id": 1, "type": "result", "success": False,
+                "error": {"code": code, "message": message}}
+
+    def _category_registry(self, action: str, msg: dict) -> dict:
+        scope = msg.get("scope", "")
+        entries = self.categories.setdefault(scope, [])
+        if action == "list":
+            return self._ws_ok([dict(e) for e in entries])
+        if action == "create":
+            name = msg["name"]
+            if any(e["name"].casefold() == name.casefold() for e in entries):
+                return self._ws_fail("invalid_info", f"The name '{name}' is already in use")
+            self._next_category += 1
+            entry = {"category_id": f"cat{self._next_category:04d}", "name": name,
+                     "icon": msg.get("icon"), "created_at": 0.0, "modified_at": 0.0}
+            entries.append(entry)
+            return self._ws_ok(dict(entry))
+        entry = next((e for e in entries if e["category_id"] == msg.get("category_id")), None)
+        if entry is None:
+            return self._ws_fail("invalid_info", "Category ID doesn't exist")
+        if action == "update":
+            if "name" in msg:
+                name = msg["name"]
+                if any(e is not entry and e["name"].casefold() == name.casefold()
+                       for e in entries):
+                    return self._ws_fail("invalid_info", f"The name '{name}' is already in use")
+                entry["name"] = name
+            if "icon" in msg:
+                entry["icon"] = msg["icon"]
+            return self._ws_ok(dict(entry))
+        if action == "delete":
+            entries.remove(entry)
+            for row in self.registry:
+                if row.get("categories", {}).get(scope) == entry["category_id"]:
+                    del row["categories"][scope]
+            return self._ws_ok(None)
+        return self._ws_fail("unknown_command", f"No fake response for {action}")
+
+    def _lovelace_read(self, msg: dict) -> dict:
+        url_path = msg.get("url_path") or ""
+        if url_path not in self.lovelace:
+            return self._ws_fail("config_not_found", f"Unknown config specified: {url_path}")
+        self.lovelace_reads += 1
+        hook = self.lovelace_mutate_on_read.get(self.lovelace_reads)
+        if hook and self.lovelace[url_path] is not None:
+            hook(self.lovelace[url_path])
+        if self.lovelace[url_path] is None:
+            return self._ws_fail("config_not_found", "No config found.")
+        return self._ws_ok(copy.deepcopy(self.lovelace[url_path]))
+
+    def _lovelace_save(self, msg: dict) -> dict:
+        url_path = msg.get("url_path") or ""
+        if url_path not in self.lovelace:
+            return self._ws_fail("config_not_found", f"Unknown config specified: {url_path}")
+        mode = next((d.get("mode") for d in self.dashboards
+                     if d.get("url_path") == url_path), "storage")
+        if mode == "yaml":
+            return self._ws_fail("error", "Not supported")
+        if not self.lovelace_save_discarded:
+            self.lovelace[url_path] = copy.deepcopy(msg["config"])
+        return self._ws_ok(None)
+
+    def _entity_registry_update(self, msg: dict) -> dict:
+        row = next((e for e in self.registry if e.get("entity_id") == msg.get("entity_id")), None)
+        if row is None:
+            return self._ws_fail("not_found", f"Entity not found: {msg.get('entity_id')}")
+        if "labels" in msg:
+            # Unknown label ids are dropped, as Home Assistant does since
+            # core PR #173438 (lr.async_get_missing_label_ids).
+            row["labels"] = [lab for lab in msg["labels"] if lab in self.known_labels]
+        if "categories" in msg:
+            # Merged per scope, None removes, ids never validated - the
+            # handler in homeassistant/components/config/entity_registry.py.
+            categories = dict(row.get("categories", {}))
+            for scope, category_id in msg["categories"].items():
+                if scope in categories and category_id is None:
+                    del categories[scope]
+                elif category_id is not None:
+                    categories[scope] = category_id
+            row["categories"] = categories
+        return self._ws_ok({"entity_entry": dict(row)})
 
     def ws_multi(self, msgs: list) -> list:
         """Answer a batch of WebSocket commands the same way `ws` answers one.

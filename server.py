@@ -9,6 +9,7 @@ import tools.helpers
 import tools.notifications
 import tools.cameras
 import tools.areas
+import tools.categories
 import tools.lights
 import tools.switches
 import tools.sensors
