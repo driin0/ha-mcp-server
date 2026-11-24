@@ -2,7 +2,7 @@ import copy
 import json
 
 from tools import _jsonpath
-from tools._base import mcp, _ws, envelope, error, ws_error
+from tools._base import mcp, _ws, envelope, error, ws_error, WsTimeout
 
 
 def _dashboard_id(url_path: str) -> tuple[str, dict | None]:
@@ -356,11 +356,16 @@ def _read_config(url_path: str) -> tuple[dict | None, dict | None]:
     return result["result"], None
 
 
+def _same(a, b) -> bool:
+    """JSON equality: True is not 1, 1 is not "1"."""
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
 def _expect_mismatch(target, expect: dict) -> str | None:
     """None when every key of `expect` is in `target` with an equal value."""
     if not isinstance(target, dict):
         return f"the target is not a card or object but {_summary(target)}"
-    wrong = [k for k, v in expect.items() if target.get(k, object()) != v]
+    wrong = [k for k, v in expect.items() if k not in target or not _same(target[k], v)]
     if wrong:
         shown = {k: target.get(k) for k in wrong}
         return (f"the target is {_summary(target)} - {', '.join(wrong)} "
@@ -368,13 +373,44 @@ def _expect_mismatch(target, expect: dict) -> str | None:
     return None
 
 
+_CARD_LISTS = ("views", "sections", "cards", "badges")
+
+
+def _contained_cards(target, path: str) -> list[str]:
+    """Every view/section/card inside `target` (at `path`), as "path (summary)".
+    Empty when `target` holds none - then replacing or removing it cannot
+    take other cards with it."""
+    out: list[str] = []
+
+    def walk(node, at):
+        if isinstance(node, dict):
+            for key in _CARD_LISTS:
+                if isinstance(node.get(key), list):
+                    walk_list(node[key], f"{at}.{key}")
+            if isinstance(node.get("card"), dict):
+                out.append(f"{at}.card ({_summary(node['card'])})")
+                walk(node["card"], f"{at}.card")
+
+    def walk_list(items, at):
+        for i, item in enumerate(items):
+            out.append(f"{at}.{i} ({_summary(item)})")
+            walk(item, f"{at}.{i}")
+
+    if isinstance(target, list) and path.rsplit(".", 1)[-1] in _CARD_LISTS:
+        walk_list(target, path)
+    else:
+        walk(target, path)
+    return out
+
+
 @mcp.tool()
 def patch_dashboard(
     url_path: str,
     path: str,
-    value: dict | list | str | int | float | bool | None = None,
+    value: dict | list | str | int | float | bool | None,
     op: str = "set",
     expect: dict | None = None,
+    replace_container: bool = False,
 ) -> dict:
     """
     Change one value, card, section or view of a storage-mode dashboard by
@@ -387,19 +423,26 @@ def patch_dashboard(
               find_dashboard_cards() or get_dashboard_outline() to get paths
               rather than counting indices by hand. A key containing "." is
               not addressable.
-    value:    the new value (for set and insert). null is a real value.
+    value:    required. The new value for set and insert (null is a real
+              value and is written as null); null for remove.
     op:       "set"    - replace the value at `path`; the path must exist.
               "insert" - into a list: before index N, N == length appends;
                          into an object: a new key that must not exist yet.
                          The only way this tool ever creates anything.
               "remove" - delete the list element or key at `path`; `value`
-                         must be omitted.
+                         must be null.
     expect:   strongly recommended for set/remove on list elements: keys the
               CURRENT target must have with these exact values, e.g.
               {"type": "tile", "entity": "sensor.lavatrice"}. If the card at
               that index is anything else, nothing is written. For an insert
               into a list it is checked against the element now at that
-              index (an append has none, so expect is refused there).
+              index (an append, or a new object key, has none, so expect is
+              refused there). An empty expect is refused.
+    replace_container: set and remove refuse, by default, a target that
+              holds other cards - a view, a section, a stack, a `cards`
+              list - and name every card that would go with it. Matching
+              the container's own `type` says nothing about what is inside
+              it. Pass True only after reading that list.
 
     A path that does not resolve is refused before anything is written, and
     the error names what IS there. Inserting into or removing from a list
@@ -419,6 +462,7 @@ def patch_dashboard(
     Returns: {url_path, op, path, old, new, saved: true, shifted?} - `old`
     is the value replaced or removed (null for insert), `new` the value
     written (null for remove). Or an error() envelope: "invalid_op",
+    "container_target" (the target holds other cards - nothing written),
     "protected_path" (path ""), "not_found" (no such dashboard, or one never
     saved), "not_editable" (YAML mode), "bad_path", "path_exists" (insert on
     an existing key), "unexpected_target" (expect did not match - nothing
@@ -432,7 +476,11 @@ def patch_dashboard(
         return error("invalid_op", f"op must be one of {', '.join(_PATCH_OPS)}, got {op!r}.",
                      url_path=shown, path=path)
     if op == "remove" and value is not None:
-        return error("invalid_op", "op='remove' takes no value - omit it.",
+        return error("invalid_op", "op='remove' takes value=null.",
+                     url_path=shown, path=path)
+    if expect is not None and not expect:
+        return error("invalid_op", "An empty expect checks nothing - name at least "
+                     "one key the target must have, or omit expect.",
                      url_path=shown, path=path)
     if not path:
         return error("protected_path",
@@ -460,8 +508,17 @@ def patch_dashboard(
         if op == "insert":
             parent_path, _, last = path.rpartition(".")
             parent = _jsonpath.get(config, parent_path) if parent_path else config
+            if isinstance(parent, list) and not _jsonpath.is_index(last):
+                raise _jsonpath.PathError(f"{last!r} is not a list index - "
+                                          f"{parent_path or '<root>'} is a list of "
+                                          f"length {len(parent)}")
+            if isinstance(parent, dict) and expect is not None:
+                return error("invalid_op",
+                             "expect checks an existing target, and a new key has "
+                             "none. Omit expect when inserting a key.",
+                             url_path=shown, path=path)
             if isinstance(parent, list) and expect is not None:
-                if not last.isdigit() or int(last) >= len(parent):
+                if int(last) >= len(parent):
                     return error("unexpected_target",
                                  "expect was given for an append: there is no element "
                                  "at that index to check. Drop expect, or insert at an "
@@ -480,6 +537,16 @@ def patch_dashboard(
             if expect is not None and (why := _expect_mismatch(current, expect)):
                 return error("unexpected_target", f"Nothing written: {why}.",
                              url_path=shown, path=path, expect=expect)
+            if not replace_container and (inside := _contained_cards(current, path)):
+                return error(
+                    "container_target",
+                    f"Nothing written: {path} holds {len(inside)} other "
+                    f"view(s)/section(s)/card(s) that this {op} would "
+                    f"{'replace' if op == 'set' else 'remove'}: "
+                    + "; ".join(inside)
+                    + ". Patch the one card you mean (its path is above), or pass "
+                    "replace_container=True if all of these should go.",
+                    url_path=shown, path=path, would_affect=inside)
             if op == "set":
                 old, new = _jsonpath.set_(config, path, value), value
             else:
@@ -511,7 +578,13 @@ def patch_dashboard(
                      f"Home Assistant rejected the save: {err['detail']}. Nothing "
                      "was written.", url_path=shown, path=path, ha_code=err["error"])
 
-    stored, err = _read_config(url_path)
+    try:
+        stored, err = _read_config(url_path)
+    except WsTimeout as exc:
+        # The save already landed. Left to propagate, this read's timeout
+        # would be reported as "a read, nothing changed, safe to repeat" -
+        # and a retried insert would add the card twice.
+        stored, err = None, error("read_timeout", str(exc))
     if err or stored != config:
         return error("config_write_unverified",
                      "The save was accepted, but reading the dashboard back "
@@ -522,7 +595,7 @@ def patch_dashboard(
     out = {"url_path": shown, "op": op, "path": path, "old": old, "new": new,
            "saved": True}
     parent_path, _, last = path.rpartition(".")
-    if op in ("insert", "remove") and last.isdigit() and isinstance(
+    if op in ("insert", "remove") and _jsonpath.is_index(last) and isinstance(
             _jsonpath.get(config, parent_path) if parent_path else config, list):
         out["shifted"] = (f"every element of {parent_path} after index {last} moved "
                           f"{'down' if op == 'insert' else 'up'} by one - paths into "
@@ -552,44 +625,68 @@ def _section_heading(section: dict) -> str | None:
         return section["title"]
     for card in section.get("cards") or []:
         if isinstance(card, dict) and card.get("type") == "heading":
-            return card.get("heading")
+            heading = card.get("heading")
+            return heading if isinstance(heading, str) else None
     return None
 
 
 def _walk_cards(config: dict):
     """Yield every card as {path, node, depth, container_path, view_index,
     section_index}. Containers are walked, not yielded."""
-    def cards_in(items, base, depth, ctx):
+    def cards_in(items, base, depth, ctx, strings=False):
         for i, card in enumerate(items if isinstance(items, list) else []):
+            if isinstance(card, str) and strings:
+                # Old-style badge: just an entity_id.
+                yield {"path": f"{base}.{i}", "node": card, "depth": depth,
+                       "container_path": base, **ctx}
+                continue
             if not isinstance(card, dict):
                 continue
             path = f"{base}.{i}"
             yield {"path": path, "node": card, "depth": depth, "container_path": base, **ctx}
             yield from nested(card, path, depth + 1, ctx)
 
+    def one(card, path, depth, container, ctx):
+        yield {"path": path, "node": card, "depth": depth, "container_path": container, **ctx}
+        yield from nested(card, path, depth + 1, ctx)
+
     def nested(card, path, depth, ctx):
         if isinstance(card.get("cards"), list):
             yield from cards_in(card["cards"], f"{path}.cards", depth, ctx)
         if isinstance(card.get("card"), dict):
-            sub = f"{path}.card"
-            yield {"path": sub, "node": card["card"], "depth": depth,
-                   "container_path": path, **ctx}
-            yield from nested(card["card"], sub, depth + 1, ctx)
+            yield from one(card["card"], f"{path}.card", depth, path, ctx)
+        fields = card.get("custom_fields")
+        if isinstance(fields, dict):  # custom:button-card embedding cards
+            for name, field in fields.items():
+                if isinstance(field, dict) and isinstance(field.get("card"), dict):
+                    yield from one(field["card"], f"{path}.custom_fields.{name}.card",
+                                   depth, f"{path}.custom_fields.{name}", ctx)
 
     for v, view in enumerate(config.get("views") or []):
         if not isinstance(view, dict):
             continue
         ctx = {"view_index": v, "section_index": None}
+        header = view.get("header")
+        if isinstance(header, dict) and isinstance(header.get("card"), dict):
+            yield from one(header["card"], f"views.{v}.header.card", 0,
+                           f"views.{v}.header", ctx)
         yield from cards_in(view.get("cards"), f"views.{v}.cards", 0, ctx)
         for s, section in enumerate(view.get("sections") or []):
             if isinstance(section, dict):
                 yield from cards_in(section.get("cards"), f"views.{v}.sections.{s}.cards", 0,
                                     {"view_index": v, "section_index": s})
-        yield from cards_in(view.get("badges"), f"views.{v}.badges", 0, ctx)
+        yield from cards_in(view.get("badges"), f"views.{v}.badges", 0, ctx, strings=True)
 
 
-def _references(card: dict, entity: str) -> bool:
-    """The card itself (not a nested card) names `entity`."""
+def _references(card, entity: str) -> bool:
+    """The card itself (not a nested card) names `entity`: entity /
+    entity_id / target.entity_id, a row of `entities`, a picture-elements
+    element, or a conditional card's condition."""
+    if isinstance(card, str):  # old-style badge
+        return card == entity
+    if not isinstance(card, dict):
+        return False
+
     def hit(value):
         return value == entity or (isinstance(value, list) and entity in value)
 
@@ -598,9 +695,11 @@ def _references(card: dict, entity: str) -> bool:
     target = card.get("target")
     if isinstance(target, dict) and hit(target.get("entity_id")):
         return True
-    for row in card.get("entities") or []:
-        if row == entity or (isinstance(row, dict) and row.get("entity") == entity):
-            return True
+    for key in ("entities", "elements", "conditions"):
+        rows = card.get(key)
+        for row in rows if isinstance(rows, list) else []:
+            if row == entity or (isinstance(row, dict) and hit(row.get("entity"))):
+                return True
     return False
 
 
@@ -609,9 +708,11 @@ def _is_js_template(value) -> bool:
     return isinstance(value, str) and value.lstrip().startswith("[[[")
 
 
-def _label(node: dict) -> str:
+def _label(node) -> str:
     """The card's human-readable heading/title/name, skipping JS templates
     (searched by `text`, not `heading`)."""
+    if not isinstance(node, dict):
+        return ""
     for key in ("heading", "title", "name"):
         value = node.get(key)
         if isinstance(value, str) and value and not _is_js_template(value):
@@ -624,8 +725,17 @@ def _view_info(config: dict, index: int) -> dict:
     return {"index": index, "title": view.get("title"), "path": view.get("path")}
 
 
+def _type_of(node):
+    return node.get("type") if isinstance(node, dict) else "badge"
+
+
+def _own_text(node) -> str:
+    own = _own(node, _NESTED_CARD_KEYS) if isinstance(node, dict) else node
+    return json.dumps(own, ensure_ascii=False).casefold()
+
+
 def _card_brief(card: dict) -> dict:
-    return {"path": card["path"], "type": card["node"].get("type"),
+    return {"path": card["path"], "type": _type_of(card["node"]),
             "summary": _summary(card["node"])}
 
 
@@ -651,18 +761,25 @@ def find_dashboard_cards(url_path: str = "", entity: str = "", heading: str = ""
                a row of `entities`, or target.entity_id. Exact match. A
                stack does not match through the cards inside it; the inner
                card is its own match.
-      heading: case-insensitive substring of a card's heading/title/name.
-               Also matches a SECTION whose title, or first heading card,
-               contains it - returned with kind "section" and its cards.
+      heading: case-insensitive substring of a card's heading/title/name
+               (JS templates excluded - use text for those). When heading
+               is the ONLY filter, a SECTION whose title or first heading
+               card contains it matches too - kind "section", with its
+               cards in `children` (so a section and its heading card can
+               both appear).
       type:    exact card type, e.g. "tile", "custom:button-card".
       text:    case-insensitive substring anywhere in the card's own JSON
                (not its nested cards) - finds templates/JS that mention an
                entity without referencing it as a field.
     limit: max matches (default 50).
 
-    A card is anything in a `cards` list, under a `card` key, or in
-    `badges`. Rows of an entities card, tile features and header/footer are
-    part of their card, not cards of their own.
+    A card is anything in a `cards` list, under a `card` key (also in a
+    sections view's `header` and a button-card's `custom_fields`), or in
+    `badges` (including old-style entity_id strings). Rows of an entities
+    card, picture-elements elements and tile features are part of their
+    card, not cards of their own. Root `button_card_templates` entries are
+    searched too (kind "template"; a name containing "." has path null
+    and a `reason`).
 
     Each match: {path, kind: "card", type, summary, view: {index, title,
     path}, section: {index, heading} | null, container_path, siblings:
@@ -693,7 +810,11 @@ def find_dashboard_cards(url_path: str = "", entity: str = "", heading: str = ""
     matches = []
     if heading and not (entity or type or text):
         for v, view in enumerate(config.get("views") or []):
+            if not isinstance(view, dict):
+                continue
             for s, section in enumerate(view.get("sections") or []):
+                if not isinstance(section, dict):
+                    continue
                 title = _section_heading(section) or ""
                 if heading.casefold() in title.casefold():
                     base = f"views.{v}.sections.{s}"
@@ -708,20 +829,37 @@ def find_dashboard_cards(url_path: str = "", entity: str = "", heading: str = ""
         node = c["node"]
         if entity and not _references(node, entity):
             continue
-        if type and node.get("type") != type:
+        if type and _type_of(node) != type:
             continue
         if heading and heading.casefold() not in _label(node).casefold():
             continue
-        if text and text.casefold() not in json.dumps(
-                _own(node, _NESTED_CARD_KEYS), ensure_ascii=False).casefold():
+        if text and text.casefold() not in _own_text(node):
             continue
         matches.append({
-            "path": c["path"], "kind": "card", "type": node.get("type"),
+            "path": c["path"], "kind": "card", "type": _type_of(node),
             "summary": _summary(node), "view": _view_info(config, c["view_index"]),
             "section": section_info(c), "container_path": c["container_path"],
             "siblings": [_card_brief(o) for o in by_container[c["container_path"]]
                          if o["path"] != c["path"]],
         })
+    templates = config.get("button_card_templates")
+    if isinstance(templates, dict) and not heading:
+        for name, tpl in templates.items():
+            if entity and not _references(tpl, entity):
+                continue
+            if type and _type_of(tpl) != type:
+                continue
+            if text and text.casefold() not in _own_text(tpl):
+                continue
+            match = {"path": None if "." in name else f"button_card_templates.{name}",
+                     "kind": "template", "type": _type_of(tpl), "summary": f"template {name!r}",
+                     "view": None, "section": None, "container_path": "button_card_templates",
+                     "siblings": []}
+            if match["path"] is None:
+                match["reason"] = (f"the template name {name!r} contains '.', so no "
+                                   "dotted path can address it - edit it with "
+                                   "update_dashboard_config()")
+            matches.append(match)
     return envelope(matches, key="matches", limit=limit)
 
 
@@ -757,7 +895,7 @@ def get_dashboard_outline(url_path: str = "") -> dict:
         else:
             root = ".".join(parts[:3])          # views.V.cards / views.V.badges
         groups.setdefault(root, []).append({
-            "path": c["path"], "type": c["node"].get("type"),
+            "path": c["path"], "type": _type_of(c["node"]),
             "summary": _summary(c["node"]), "depth": c["depth"]})
     views = []
     for v, view in enumerate(config.get("views") or []):
@@ -770,6 +908,7 @@ def get_dashboard_outline(url_path: str = "") -> dict:
                           "cards": groups.get(f"views.{v}.sections.{s}.cards", [])}
                          for s, section in enumerate(view.get("sections") or [])
                          if isinstance(section, dict)],
+            "header": groups.get(f"views.{v}.header", []),
             "cards": groups.get(f"views.{v}.cards", []),
             "badges": groups.get(f"views.{v}.badges", []),
         })

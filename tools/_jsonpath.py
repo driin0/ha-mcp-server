@@ -16,8 +16,19 @@ path without re-reading the whole document.
 """
 
 
+import re
+
+_INDEX = re.compile(r"[0-9]+")
+
+
 class PathError(Exception):
     """A path that does not resolve the way the operation needs."""
+
+
+def is_index(segment: str) -> bool:
+    """ASCII digits only - str.isdigit() also accepts '²' (int() then
+    raises) and Arabic-Indic digits (int() silently reads them)."""
+    return bool(_INDEX.fullmatch(segment))
 
 
 def _describe(node) -> str:
@@ -35,7 +46,7 @@ def _step(node, segment: str, walked: str, *, allow_end: bool = False):
     if isinstance(node, dict):
         return segment
     if isinstance(node, list):
-        if not segment.isdigit():
+        if not is_index(segment):
             raise PathError(f"{segment!r} at {where} is not a list index - "
                             f"{where} is {_describe(node)}")
         index = int(segment)

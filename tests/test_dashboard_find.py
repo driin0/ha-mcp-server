@@ -105,7 +105,7 @@ def test_a_match_round_trips_through_patch_dashboard(ha):
 
     assert r["old"] == "Temp"
     expect = {"type": m["type"], "entity": "sensor.temperatura"}
-    assert patch_dashboard("casa", m["path"], op="remove", expect=expect)["saved"] is True
+    assert patch_dashboard("casa", m["path"], None, op="remove", expect=expect)["saved"] is True
 
 
 def test_outline_lists_every_card_with_depth(ha):
@@ -132,3 +132,71 @@ def test_outline_of_a_strategy_dashboard_says_so(ha):
 
 def test_outline_of_a_never_saved_default(ha):
     assert get_dashboard_outline("")["error"] == "not_found"
+
+
+# ---- review gate 2 ------------------------------------------------------------
+
+@pytest.fixture
+def odd(fake_ha):
+    """Real-world shapes the first walker missed or crashed on."""
+    fake_ha.lovelace["odd"] = {
+        "views": [
+            "not-a-view",
+            {"title": "V", "path": "v",
+             "header": {"card": {"type": "markdown", "content": "sensor.header_x"}},
+             "badges": ["sensor.badge_x"],
+             "sections": [{"type": "grid", "cards": [
+                 {"type": "heading", "heading": 42},
+                 {"type": "custom:button-card", "custom_fields": {
+                     "f1": {"card": {"type": "tile", "entity": "sensor.q"}}}},
+                 {"type": "picture-elements", "elements": [
+                     {"type": "state-icon", "entity": "sensor.pic"}]},
+                 {"type": "conditional", "conditions": [
+                     {"condition": "state", "entity": "sensor.cond", "state": "on"}],
+                  "card": {"type": "markdown", "content": "x"}},
+             ]}]},
+        ],
+        "button_card_templates": {"wm_btn": {"label": "[[[ return states['sensor.wm_power'].state ]]]"},
+                                  "a.b": {"x": 1}},
+    }
+    fake_ha.dashboards = [{"id": "odd", "url_path": "odd", "mode": "storage"}]
+    return fake_ha
+
+
+def test_a_non_string_heading_does_not_crash(odd):
+    assert "error" not in find_dashboard_cards("odd", heading="x")
+
+
+def test_a_non_dict_view_does_not_crash(odd):
+    assert "error" not in find_dashboard_cards("odd", heading="V")
+    assert "error" not in get_dashboard_outline("odd")
+
+
+def test_button_card_templates_are_searched(odd):
+    r = find_dashboard_cards("odd", text="sensor.wm_power")
+
+    assert [m["path"] for m in r["matches"]] == ["button_card_templates.wm_btn"]
+    assert r["matches"][0]["kind"] == "template"
+
+
+def test_a_template_name_with_a_dot_has_no_path(odd):
+    r = find_dashboard_cards("odd", text='"x": 1')
+
+    assert r["matches"][0]["path"] is None
+    assert "." in r["matches"][0]["reason"]
+
+
+@pytest.mark.parametrize("entity,path", [
+    ("sensor.badge_x", "views.1.badges.0"),
+    ("sensor.q", "views.1.sections.0.cards.1.custom_fields.f1.card"),
+    ("sensor.pic", "views.1.sections.0.cards.2"),
+    ("sensor.cond", "views.1.sections.0.cards.3"),
+])
+def test_entities_in_real_world_shapes_are_found(odd, entity, path):
+    assert [m["path"] for m in find_dashboard_cards("odd", entity=entity)["matches"]] == [path]
+
+
+def test_the_sections_view_header_card_is_searched(odd):
+    r = find_dashboard_cards("odd", text="sensor.header_x")
+
+    assert [m["path"] for m in r["matches"]] == ["views.1.header.card"]

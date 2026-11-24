@@ -43,7 +43,12 @@
   one dotted path (`set`, `insert`, `remove`), refuses a path that does
   not resolve, refuses a target that does not match `expect`, re-reads the
   config before saving (`concurrent_modification`) and reads it back after
-  (`config_write_unverified`), and returns the `old` value.
+  (`config_write_unverified`), and returns the `old` value. `value` is
+  required, so a forgotten argument cannot write null over a card. Setting
+  or removing anything that holds other cards - a view, a section, a
+  stack, a `cards` list - is refused as `container_target`, naming every
+  card that would go with it, unless `replace_container=True`: matching a
+  section's own `type` says nothing about what is inside it.
   `find_dashboard_cards` searches by entity, heading, type or text and
   returns each card's path together with its siblings in the same
   section; `get_dashboard_outline` maps every view, section and card with

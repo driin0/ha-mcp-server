@@ -111,7 +111,7 @@ def test_insert_on_an_existing_key_is_refused(ha):
 
 
 def test_remove_returns_the_removed_card_and_warns_about_shifted_indices(ha):
-    r = patch_dashboard("casa", f"{SEC}.2", op="remove", expect={"type": "clock"})
+    r = patch_dashboard("casa", f"{SEC}.2", None, op="remove", expect={"type": "clock"})
 
     assert r["old"] == {"type": "clock"}
     assert r["new"] is None
@@ -211,3 +211,97 @@ def test_home_assistant_rejecting_the_save_is_reported(ha):
 
     assert r["error"] == "home_assistant_error"
     assert "bad config" in r["detail"]
+
+
+# ---- review gate 2 ------------------------------------------------------------
+
+def test_value_is_required(ha):
+    """Omitting value used to write null over the target - a card replaced
+    by nothing. The tool now has no default for it."""
+    from tools._base import mcp
+
+    tool = mcp._tool_manager.get_tool("patch_dashboard")
+    assert "value" in tool.parameters["required"]
+
+
+def test_replacing_a_whole_section_is_refused_by_default(ha):
+    """The incident through the container: expect={"type": "grid"} matched,
+    and three neighbouring cards were dropped."""
+    r = patch_dashboard("casa", "views.0.sections.0",
+                        {"type": "grid", "cards": [{"type": "heading"}, {"type": "tile"}]},
+                        expect={"type": "grid"})
+
+    assert r["error"] == "container_target"
+    assert f"{SEC}.2" in r["detail"] and "clock" in r["detail"]
+    assert not _saves(ha)
+
+
+def test_replacing_a_cards_list_is_refused_by_default(ha):
+    r = patch_dashboard("casa", SEC, [{"type": "tile"}])
+
+    assert r["error"] == "container_target"
+    assert not _saves(ha)
+
+
+def test_removing_a_stack_is_refused_by_default(ha):
+    r = patch_dashboard("casa", f"{SEC}.4", None, op="remove",
+                        expect={"type": "vertical-stack"})
+
+    assert r["error"] == "container_target"
+    assert f"{SEC}.4.cards.0" in r["detail"]
+
+
+def test_a_container_can_be_replaced_when_asked_explicitly(ha):
+    r = patch_dashboard("casa", SEC, [{"type": "tile"}], replace_container=True)
+
+    assert r["saved"] is True
+    assert len(r["old"]) == 5
+
+
+def test_a_lost_read_back_after_the_save_is_not_reported_as_harmless(ha):
+    """The save landed; a timeout on the read-back must not become a
+    'read, nothing changed, safe to repeat' message (an insert retried
+    would duplicate the card)."""
+    from tools._base import WsTimeout
+
+    def timeout(config):
+        raise WsTimeout(command_types=("lovelace/config",))
+
+    ha.lovelace_mutate_on_read = {3: timeout}
+
+    r = patch_dashboard("casa", f"{SEC}.0", {"type": "markdown"}, op="insert")
+
+    assert r["error"] == "config_write_unverified"
+    assert "DID happen" in r["detail"]
+
+
+def test_expect_on_a_new_dict_key_is_refused(ha):
+    r = patch_dashboard("casa", "button_card_templates.new", {"x": 1}, op="insert",
+                        expect={"type": "zzz"})
+
+    assert r["error"] == "invalid_op"
+    assert not _saves(ha)
+
+
+def test_an_empty_expect_is_refused(ha):
+    r = patch_dashboard("casa", f"{SEC}.2", None, op="remove", expect={})
+
+    assert r["error"] == "invalid_op"
+
+
+def test_expect_does_not_confuse_true_with_one(ha):
+    r = patch_dashboard("casa", "button_card_templates.wm_btn", {"show_icon": False},
+                        expect={"show_icon": 1})
+
+    assert r["error"] == "unexpected_target"
+
+
+def test_a_non_ascii_digit_segment_is_a_bad_path(ha):
+    assert patch_dashboard("casa", "views.²", 1)["error"] == "bad_path"
+    assert patch_dashboard("casa", "views.١.title", "x")["error"] == "bad_path"
+
+
+def test_a_non_numeric_list_insert_is_a_bad_path(ha):
+    r = patch_dashboard("casa", f"{SEC}.x", {"type": "a"}, op="insert", expect={"type": "tile"})
+
+    assert r["error"] == "bad_path"
