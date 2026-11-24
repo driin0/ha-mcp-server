@@ -187,3 +187,41 @@ def test_error_log_without_supervisor_names_the_system_log(fake_ha):
 
     assert text.startswith("error_log_not_available")
     assert "get_system_log" in text
+
+
+def test_records_are_found_when_the_prefix_carries_a_utc_offset(sup):
+    """The format measured on a real HA OS 2026.11 instance: the timestamp
+    has a UTC offset. Without accepting it, not one line was recognised as
+    a record start, the whole scan became one record, and grep returned
+    691 KB for "smartthinq"."""
+    sup.core_log = (
+        "2026-11-24 15:26:00.109+01:00 ERROR (MainThread) [homeassistant.config_entries] "
+        "Error setting up entry LG ThinQ\n"
+        "Traceback (most recent call last):\n"
+        '  File "/config/custom_components/smartthinq_sensors/__init__.py", line 120\n'
+        "homeassistant.exceptions.ConfigEntryNotReady\n"
+        "2026-11-24 15:26:02.308+01:00 WARNING (MainThread) [custom_components.remote_homeassistant] "
+        "failed to fetch\n"
+        "2026-11-24 15:26:07.797Z INFO (MainThread) [homeassistant.core] Started\n")
+
+    r = get_core_logs(grep="smartthinq")
+
+    assert r["records_scanned"] == 3
+    assert r["matched"] == 1
+    assert r["log"].startswith("2026-11-24 15:26:00.109+01:00 ERROR")
+    assert "remote_homeassistant" not in r["log"]
+    assert get_core_logs(level="warning")["matched"] == 2
+
+
+def test_the_output_is_capped_keeping_the_most_recent_records(sup):
+    sup.core_log = "\n".join(
+        f"2026-11-24 15:26:{i:02d}.000+01:00 ERROR (MainThread) [x] e{i} " + "y" * 1000
+        for i in range(60))
+
+    r = get_core_logs(lines=100, max_chars=10_000, scan=200)
+
+    assert len(r["log"]) <= 10_000
+    assert r["log"].rstrip().endswith("y")
+    assert "e59" in r["log"] and "e0 " not in r["log"]
+    assert r["matched"] == 60 and r["returned"] < 60
+    assert "max_chars" in r["note"]
