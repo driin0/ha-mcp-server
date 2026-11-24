@@ -142,7 +142,8 @@ def create_category(scope: str, name: str, icon: str = "") -> dict:
            own id.
     icon:  optional MDI icon, e.g. "mdi:washing-machine".
 
-    Returns: {scope, category_id, name, icon}, or an error() envelope.
+    Returns: {scope, category_id, name, icon}, or an error() envelope -
+    "invalid_scope", or Home Assistant's own error (e.g. a duplicate name).
     """
     if err := _check_scope(scope):
         return err
@@ -391,8 +392,10 @@ def bulk_set_entity_category(entity_ids: list[str], category: str) -> dict:
     intended category is in `failed` as config_write_unverified, the same
     check set_entity_category() makes.
 
-    Returns: {total, succeeded, failed: [{entity_id, reason}]}, or an
-    error() envelope - "too_many_entities" (over 200, nothing sent), a
+    Returns: {total, succeeded, failed: [{entity_id, reason}]} - each reason
+    starts with a code: not_in_registry, not_categorizable,
+    category_not_found, home_assistant_error or config_write_unverified,
+    as set_entity_category() describes them. Or an error() envelope - "too_many_entities" (over 200, nothing sent), a
     registry/manifest read failure, or ws_transport_error()'s code when the
     connection never carried the batch (one systemic failure, not "every
     entity failed").

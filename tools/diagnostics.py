@@ -362,7 +362,8 @@ def get_system_log(level: str = "", grep: str = "", limit: int = 50) -> dict:
     Returns: {total, returned, offset, note?, entries: [{name, level,
     message, source: "path:line", timestamp, first_occurred, count,
     exception}]} - timestamps ISO 8601 UTC, exception trimmed to its last
-    40 lines. Or an error() envelope (admin rights are required).
+    40 lines. Or an error() envelope: "invalid_level", or Home Assistant's
+    own error (admin rights are required).
     """
     min_level, err = _min_level(level)
     if err:
