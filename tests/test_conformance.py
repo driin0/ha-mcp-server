@@ -70,7 +70,7 @@ def test_the_tool_census_does_not_silently_shrink():
     """A guard on the guard. A floor, not an equality: plans 2 and 3 add
     tools, and a test that has to be edited to stay true gets edited without
     being read."""
-    assert len(list(_tools())) >= 182
+    assert len(list(_tools())) >= 203
 
 
 def test_every_tool_returns_dict():
