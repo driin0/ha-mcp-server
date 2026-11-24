@@ -310,11 +310,8 @@ def _summary(node) -> str:
         text = json.dumps(node, ensure_ascii=False)
         return text if len(text) <= 60 else text[:57] + "..."
     parts = [str(node.get("type", "(no type)"))]
-    for key in ("heading", "title", "name"):
-        label = node.get(key)
-        if isinstance(label, str) and label and not label.lstrip().startswith("[[["):
-            parts.append(repr(label))
-            break
+    if label := _label(node):
+        parts.append(repr(label))
     if isinstance(node.get("entity"), str):
         parts.append(node["entity"])
     return " ".join(parts)
@@ -530,4 +527,255 @@ def patch_dashboard(
         out["shifted"] = (f"every element of {parent_path} after index {last} moved "
                           f"{'down' if op == 'insert' else 'up'} by one - paths into "
                           f"{parent_path} from before this call are stale")
+    return out
+
+
+# ---- finding things in a dashboard -------------------------------------------
+#
+# A CARD is a dict reached through a `cards` list, a `card` key or a `badges`
+# list, at any depth. Views and sections are containers. Every other dict -
+# rows of an entities card, tile features, header/footer, custom-card
+# internals - is content of the card holding it: searched as part of that
+# card, never a match or a sibling of its own (otherwise one entity yields
+# several matches for the same card and `siblings` fills with rows).
+
+_NESTED_CARD_KEYS = ("cards", "card")
+_CONTAINER_KEYS = ("cards", "sections", "badges")
+
+
+def _own(node: dict, nested: tuple) -> dict:
+    return {k: v for k, v in node.items() if k not in nested}
+
+
+def _section_heading(section: dict) -> str | None:
+    if isinstance(section.get("title"), str):
+        return section["title"]
+    for card in section.get("cards") or []:
+        if isinstance(card, dict) and card.get("type") == "heading":
+            return card.get("heading")
+    return None
+
+
+def _walk_cards(config: dict):
+    """Yield every card as {path, node, depth, container_path, view_index,
+    section_index}. Containers are walked, not yielded."""
+    def cards_in(items, base, depth, ctx):
+        for i, card in enumerate(items if isinstance(items, list) else []):
+            if not isinstance(card, dict):
+                continue
+            path = f"{base}.{i}"
+            yield {"path": path, "node": card, "depth": depth, "container_path": base, **ctx}
+            yield from nested(card, path, depth + 1, ctx)
+
+    def nested(card, path, depth, ctx):
+        if isinstance(card.get("cards"), list):
+            yield from cards_in(card["cards"], f"{path}.cards", depth, ctx)
+        if isinstance(card.get("card"), dict):
+            sub = f"{path}.card"
+            yield {"path": sub, "node": card["card"], "depth": depth,
+                   "container_path": path, **ctx}
+            yield from nested(card["card"], sub, depth + 1, ctx)
+
+    for v, view in enumerate(config.get("views") or []):
+        if not isinstance(view, dict):
+            continue
+        ctx = {"view_index": v, "section_index": None}
+        yield from cards_in(view.get("cards"), f"views.{v}.cards", 0, ctx)
+        for s, section in enumerate(view.get("sections") or []):
+            if isinstance(section, dict):
+                yield from cards_in(section.get("cards"), f"views.{v}.sections.{s}.cards", 0,
+                                    {"view_index": v, "section_index": s})
+        yield from cards_in(view.get("badges"), f"views.{v}.badges", 0, ctx)
+
+
+def _references(card: dict, entity: str) -> bool:
+    """The card itself (not a nested card) names `entity`."""
+    def hit(value):
+        return value == entity or (isinstance(value, list) and entity in value)
+
+    if hit(card.get("entity")) or hit(card.get("entity_id")):
+        return True
+    target = card.get("target")
+    if isinstance(target, dict) and hit(target.get("entity_id")):
+        return True
+    for row in card.get("entities") or []:
+        if row == entity or (isinstance(row, dict) and row.get("entity") == entity):
+            return True
+    return False
+
+
+def _is_js_template(value) -> bool:
+    """button-card style `[[[ ... ]]]` JavaScript, not a human label."""
+    return isinstance(value, str) and value.lstrip().startswith("[[[")
+
+
+def _label(node: dict) -> str:
+    """The card's human-readable heading/title/name, skipping JS templates
+    (searched by `text`, not `heading`)."""
+    for key in ("heading", "title", "name"):
+        value = node.get(key)
+        if isinstance(value, str) and value and not _is_js_template(value):
+            return value
+    return ""
+
+
+def _view_info(config: dict, index: int) -> dict:
+    view = config["views"][index]
+    return {"index": index, "title": view.get("title"), "path": view.get("path")}
+
+
+def _card_brief(card: dict) -> dict:
+    return {"path": card["path"], "type": card["node"].get("type"),
+            "summary": _summary(card["node"])}
+
+
+def _load_for_reading(url_path: str) -> tuple[dict | None, dict | None]:
+    mode, err = _dashboard_mode(url_path)
+    if err:
+        return None, err
+    if mode is None:
+        return None, error("not_found", "No dashboard with that url_path. Use list_dashboards().",
+                           url_path=url_path)
+    return _read_config(url_path)
+
+
+@mcp.tool()
+def find_dashboard_cards(url_path: str = "", entity: str = "", heading: str = "",
+                         type: str = "", text: str = "", limit: int = 50) -> dict:
+    """
+    Find cards in a dashboard and return their paths, for patch_dashboard().
+
+    url_path: as get_dashboard() - "" is the default dashboard.
+    Filters (at least one; all given filters must match):
+      entity:  the card itself names this entity_id - `entity`, `entity_id`,
+               a row of `entities`, or target.entity_id. Exact match. A
+               stack does not match through the cards inside it; the inner
+               card is its own match.
+      heading: case-insensitive substring of a card's heading/title/name.
+               Also matches a SECTION whose title, or first heading card,
+               contains it - returned with kind "section" and its cards.
+      type:    exact card type, e.g. "tile", "custom:button-card".
+      text:    case-insensitive substring anywhere in the card's own JSON
+               (not its nested cards) - finds templates/JS that mention an
+               entity without referencing it as a field.
+    limit: max matches (default 50).
+
+    A card is anything in a `cards` list, under a `card` key, or in
+    `badges`. Rows of an entities card, tile features and header/footer are
+    part of their card, not cards of their own.
+
+    Each match: {path, kind: "card", type, summary, view: {index, title,
+    path}, section: {index, heading} | null, container_path, siblings:
+    [{path, type, summary}]} - siblings are the OTHER cards in the same
+    list. Read them before replacing or removing anything: a section often
+    holds more than the block you are looking for. A section match has
+    kind "section" and `children` instead of siblings.
+
+    Returns: {total, returned, offset, note?, matches: [...]}, or an error()
+    envelope ("missing_filter", "not_found", "config_read_failed").
+    """
+    if not (entity or heading or type or text):
+        return error("missing_filter", "Give at least one of entity, heading, type, text.")
+    config, err = _load_for_reading(url_path)
+    if err:
+        return err
+    cards = list(_walk_cards(config))
+    by_container: dict[str, list] = {}
+    for c in cards:
+        by_container.setdefault(c["container_path"], []).append(c)
+
+    def section_info(c):
+        if c["section_index"] is None:
+            return None
+        section = config["views"][c["view_index"]]["sections"][c["section_index"]]
+        return {"index": c["section_index"], "heading": _section_heading(section)}
+
+    matches = []
+    if heading and not (entity or type or text):
+        for v, view in enumerate(config.get("views") or []):
+            for s, section in enumerate(view.get("sections") or []):
+                title = _section_heading(section) or ""
+                if heading.casefold() in title.casefold():
+                    base = f"views.{v}.sections.{s}"
+                    matches.append({
+                        "path": base, "kind": "section", "type": section.get("type"),
+                        "summary": f"section {title!r}", "view": _view_info(config, v),
+                        "section": {"index": s, "heading": title},
+                        "container_path": f"views.{v}.sections",
+                        "children": [_card_brief(c) for c in by_container.get(f"{base}.cards", [])],
+                    })
+    for c in cards:
+        node = c["node"]
+        if entity and not _references(node, entity):
+            continue
+        if type and node.get("type") != type:
+            continue
+        if heading and heading.casefold() not in _label(node).casefold():
+            continue
+        if text and text.casefold() not in json.dumps(
+                _own(node, _NESTED_CARD_KEYS), ensure_ascii=False).casefold():
+            continue
+        matches.append({
+            "path": c["path"], "kind": "card", "type": node.get("type"),
+            "summary": _summary(node), "view": _view_info(config, c["view_index"]),
+            "section": section_info(c), "container_path": c["container_path"],
+            "siblings": [_card_brief(o) for o in by_container[c["container_path"]]
+                         if o["path"] != c["path"]],
+        })
+    return envelope(matches, key="matches", limit=limit)
+
+
+@mcp.tool()
+def get_dashboard_outline(url_path: str = "") -> dict:
+    """
+    A compact map of a dashboard: every view, section and card with its
+    path and a one-line summary - a few hundred bytes per view instead of
+    the full config get_dashboard() returns.
+
+    url_path: as get_dashboard() - "" is the default dashboard.
+
+    Returns: {url_path, views: [{path, title, url, sections: [{path,
+    heading, cards}], cards, badges}], root_keys, strategy?} where each
+    card is {path, type, summary, depth} (depth 1+ = inside a stack or
+    another card, listed right after its parent). root_keys lists the
+    other top-level keys - e.g. {"button_card_templates": ["wm_btn"]}
+    (the template names, addressable as button_card_templates.<name>).
+    A strategy dashboard has no stored views: `strategy` holds its config.
+    Or an error() envelope ("not_found", "config_read_failed").
+    """
+    config, err = _load_for_reading(url_path)
+    if err:
+        return err
+    # Group cards by the top-level list they live under (view cards, a
+    # section's cards, badges), keeping walk order so children follow
+    # their parent.
+    groups: dict[str, list] = {}
+    for c in _walk_cards(config):
+        parts = c["path"].split(".")
+        if parts[2] == "sections":
+            root = ".".join(parts[:5])          # views.V.sections.S.cards
+        else:
+            root = ".".join(parts[:3])          # views.V.cards / views.V.badges
+        groups.setdefault(root, []).append({
+            "path": c["path"], "type": c["node"].get("type"),
+            "summary": _summary(c["node"]), "depth": c["depth"]})
+    views = []
+    for v, view in enumerate(config.get("views") or []):
+        if not isinstance(view, dict):
+            continue
+        views.append({
+            "path": f"views.{v}", "title": view.get("title"), "url": view.get("path"),
+            "sections": [{"path": f"views.{v}.sections.{s}",
+                          "heading": _section_heading(section),
+                          "cards": groups.get(f"views.{v}.sections.{s}.cards", [])}
+                         for s, section in enumerate(view.get("sections") or [])
+                         if isinstance(section, dict)],
+            "cards": groups.get(f"views.{v}.cards", []),
+            "badges": groups.get(f"views.{v}.badges", []),
+        })
+    root_keys = {k: (sorted(val) if isinstance(val, dict) else type(val).__name__)
+                 for k, val in config.items() if k not in ("views", "strategy")}
+    out = {"url_path": url_path or "default", "views": views, "root_keys": root_keys}
+    if "strategy" in config:
+        out["strategy"] = config["strategy"]
     return out
