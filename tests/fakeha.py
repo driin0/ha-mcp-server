@@ -227,6 +227,20 @@ class FakeHA:
         # does not land, for read-back verification).
         self.options_submit_raises = None
         self.options_submit_discarded = False
+        # Category registry, per scope: {scope: [entry, ...]} where entry is
+        # {category_id, name, icon, created_at, modified_at} - Home
+        # Assistant's own _entry_dict shape, scope not included. Empty by
+        # default. Entity categories live on the registry rows themselves
+        # ("categories": {scope: category_id}).
+        self.categories = {}
+        self._next_category = 0
+        # manifest/list: what tools/categories.py reads to tell a helper
+        # integration (integration_type "helper") from any other.
+        self.manifests = [
+            {"domain": "template", "integration_type": "helper"},
+            {"domain": "utility_meter", "integration_type": "helper"},
+            {"domain": "hue", "integration_type": "hub"},
+        ]
         # Everything the tools sent, for assertions.
         self.rest_calls = []
         self.ws_calls = []
@@ -498,12 +512,80 @@ class FakeHA:
             return {"id": 1, "type": "result", "success": False,
                     "error": {"code": "not_found",
                               "message": f"Entity not found: {entity_id}"}}
+        if kind.startswith("config/category_registry/"):
+            return self._category_registry(kind.rsplit("/", 1)[1], msg)
+        if kind == "config/entity_registry/update":
+            return self._entity_registry_update(msg)
+        if kind == "manifest/list":
+            return {"id": 1, "type": "result", "success": True, "result": self.manifests}
         if kind == "config/device_registry/list":
             return {"id": 1, "type": "result", "success": True,
                     "result": self.devices}
         return {"id": 1, "type": "result", "success": False,
                 "error": {"code": "unknown_command",
                           "message": f"No fake response for {kind}"}}
+
+    @staticmethod
+    def _ws_ok(result):
+        return {"id": 1, "type": "result", "success": True, "result": result}
+
+    @staticmethod
+    def _ws_fail(code, message):
+        return {"id": 1, "type": "result", "success": False,
+                "error": {"code": code, "message": message}}
+
+    def _category_registry(self, action: str, msg: dict) -> dict:
+        scope = msg.get("scope", "")
+        entries = self.categories.setdefault(scope, [])
+        if action == "list":
+            return self._ws_ok([dict(e) for e in entries])
+        if action == "create":
+            name = msg["name"]
+            if any(e["name"].casefold() == name.casefold() for e in entries):
+                return self._ws_fail("invalid_info", f"The name '{name}' is already in use")
+            self._next_category += 1
+            entry = {"category_id": f"cat{self._next_category:04d}", "name": name,
+                     "icon": msg.get("icon"), "created_at": 0.0, "modified_at": 0.0}
+            entries.append(entry)
+            return self._ws_ok(dict(entry))
+        entry = next((e for e in entries if e["category_id"] == msg.get("category_id")), None)
+        if entry is None:
+            return self._ws_fail("invalid_info", "Category ID doesn't exist")
+        if action == "update":
+            if "name" in msg:
+                name = msg["name"]
+                if any(e is not entry and e["name"].casefold() == name.casefold()
+                       for e in entries):
+                    return self._ws_fail("invalid_info", f"The name '{name}' is already in use")
+                entry["name"] = name
+            if "icon" in msg:
+                entry["icon"] = msg["icon"]
+            return self._ws_ok(dict(entry))
+        if action == "delete":
+            entries.remove(entry)
+            for row in self.registry:
+                if row.get("categories", {}).get(scope) == entry["category_id"]:
+                    del row["categories"][scope]
+            return self._ws_ok(None)
+        return self._ws_fail("unknown_command", f"No fake response for {action}")
+
+    def _entity_registry_update(self, msg: dict) -> dict:
+        row = next((e for e in self.registry if e.get("entity_id") == msg.get("entity_id")), None)
+        if row is None:
+            return self._ws_fail("not_found", f"Entity not found: {msg.get('entity_id')}")
+        if "labels" in msg:
+            row["labels"] = list(msg["labels"])
+        if "categories" in msg:
+            # Merged per scope, None removes, ids never validated - the
+            # handler in homeassistant/components/config/entity_registry.py.
+            categories = dict(row.get("categories", {}))
+            for scope, category_id in msg["categories"].items():
+                if scope in categories and category_id is None:
+                    del categories[scope]
+                elif category_id is not None:
+                    categories[scope] = category_id
+            row["categories"] = categories
+        return self._ws_ok({"entity_entry": dict(row)})
 
     def ws_multi(self, msgs: list) -> list:
         """Answer a batch of WebSocket commands the same way `ws` answers one.
