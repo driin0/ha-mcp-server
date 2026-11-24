@@ -439,3 +439,52 @@ def bulk_set_entity_category(entity_ids: list, category: str) -> dict:
             msg = (res.get("error") or {}).get("message", "rejected")
             failed.append({"entity_id": eid, "reason": f"home_assistant_error: {msg}"})
     return {"total": len(entity_ids), "succeeded": succeeded, "failed": failed}
+
+
+# ---- shared by the list tools -------------------------------------------------
+
+def category_context(scope: str, category: str = "",
+                     registry: dict | None = None) -> dict:
+    """What a list tool needs to show and filter by category in `scope`.
+
+    registry: {entity_id: registry entry}, when the caller already read it.
+
+    Returns {"error": envelope} when a `category` filter was given and it
+    cannot be honoured (unknown in this scope, or a read failed) - a filter
+    must never degrade into "nothing matched". Otherwise {"names": {id:
+    name}, "assigned": {entity_id: id}, "filter_id": id | None, "note":
+    str}; without a filter, a failed read yields empty maps and a note
+    rather than failing the whole listing.
+    """
+    def failed(err):
+        if category:
+            return {"error": err}
+        return {"names": {}, "assigned": {}, "filter_id": None,
+                "note": f"categories could not be read ({err['error']}: "
+                        f"{err['detail']}) - category shown as null"}
+
+    entries, err = _list_categories(scope)
+    if err:
+        return failed(err)
+    filter_id = None
+    if category:
+        target, err = _resolve_category(scope, category, entries)
+        if err:
+            return {"error": err}
+        filter_id = target["category_id"]
+    if registry is None:
+        r = _ws({"type": "config/entity_registry/list"})
+        if err := ws_error(r):
+            return failed(err)
+        registry = {e["entity_id"]: e for e in r["result"]}
+    assigned = {eid: cid for eid, e in registry.items()
+                if (cid := (e.get("categories") or {}).get(scope))}
+    return {"names": {e["category_id"]: e["name"] for e in entries},
+            "assigned": assigned, "filter_id": filter_id, "note": ""}
+
+
+def with_note(out: dict, note: str) -> dict:
+    """Append `note` to an envelope's own note instead of replacing it."""
+    if note:
+        out["note"] = f"{out['note']}; {note}" if out.get("note") else note
+    return out

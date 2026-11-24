@@ -1,15 +1,24 @@
 import httpx
 
+from tools.categories import category_context, with_note
 from tools._base import mcp, HA_URL, HEADERS, _slug, confirm_entity_exists, envelope, error
 
 
 @mcp.tool()
-def list_scripts() -> dict:
+def list_scripts(category: str = "") -> dict:
     """
     List all scripts with their state (on = running, off = idle).
 
-    Returns: {total, returned, offset, note?, scripts: [...]}
+    category: filter by category, by name or category_id in the "script"
+              scope (see list_categories). An unknown category is an
+              error, not an empty list.
+
+    Returns: {total, returned, offset, note?, scripts: [{entity_id, name,
+             state, category}]} - category is the category's name, or null.
     """
+    cats = category_context("script", category)
+    if "error" in cats:
+        return cats["error"]
     with httpx.Client() as client:
         r = client.get(f"{HA_URL}/api/states", headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -18,11 +27,15 @@ def list_scripts() -> dict:
                 "entity_id": s["entity_id"],
                 "name": s.get("attributes", {}).get("friendly_name", s["entity_id"]),
                 "state": s["state"],
+                "category": cats["names"].get(cats["assigned"].get(s["entity_id"])),
             }
             for s in r.json()
             if s["entity_id"].startswith("script.")
+            and (not cats["filter_id"]
+                 or cats["assigned"].get(s["entity_id"]) == cats["filter_id"])
         ]
-        return envelope(sorted(scripts, key=lambda x: x["name"]), key="scripts")
+        return with_note(envelope(sorted(scripts, key=lambda x: x["name"]), key="scripts"),
+                         cats["note"])
 
 
 @mcp.tool()
