@@ -347,6 +347,17 @@ class WsTimeout(TimeoutError):
             + " in time")
 
 
+def ws_failures() -> tuple:
+    """The exceptions a WebSocket call can raise instead of answering: our
+    own timeout, a socket error, or any websockets-level failure (closed
+    connection, refused handshake). Callers that can degrade - an optional
+    column, a read-back after a write that already landed - catch these;
+    websockets.exceptions are not OSError subclasses, so catching OSError
+    alone misses a dropped connection."""
+    import websockets.exceptions
+    return (WsTimeout, OSError, websockets.exceptions.WebSocketException)
+
+
 def _ws(msg: dict) -> dict:
     """Send one WS command over a single authenticated connection (sync, thread-safe)."""
     return _ws_multi([msg])[0]

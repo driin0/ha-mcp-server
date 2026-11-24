@@ -182,3 +182,85 @@ def test_entity_registry_shows_categories_by_name(fake_ha):
     r = get_entity_registry("automation.morning")
 
     assert r["categories"] == {"automation": {"category_id": cid, "name": "Elettrodomestici"}}
+
+
+# ---- pre-release review -------------------------------------------------------
+
+def test_a_button_card_holding_a_card_in_custom_fields_is_a_container(dash):
+    from tools.dashboards import patch_dashboard
+
+    dash.lovelace["casa"]["views"][0]["sections"][1]["cards"][1]["custom_fields"] = {
+        "inner": {"card": {"type": "tile", "entity": "sensor.x"}}}
+
+    r = patch_dashboard("casa", "views.0.sections.1.cards.1", {"type": "markdown"},
+                        expect={"type": "custom:button-card"})
+
+    assert r["error"] == "container_target"
+    assert "views.0.sections.1.cards.1.custom_fields.inner.card" in r["detail"]
+
+
+def _closed(*a, **k):
+    from websockets.exceptions import ConnectionClosedError
+    raise ConnectionClosedError(None, None)
+
+
+def test_a_dropped_websocket_does_not_break_an_unfiltered_list(fake_ha, monkeypatch):
+    from tools import categories
+    from tools.scripts import list_scripts
+
+    fake_ha.states.append({"entity_id": "script.wash", "state": "off",
+                           "attributes": {"friendly_name": "Wash"}})
+    monkeypatch.setattr(categories, "_ws", _closed)
+    monkeypatch.setattr(categories, "_ws_multi", _closed)
+
+    r = list_scripts()
+
+    assert [s["entity_id"] for s in r["scripts"]] == ["script.wash"]
+    assert "categor" in r["note"]
+
+
+def test_a_dropped_websocket_on_the_dashboard_read_back_says_the_write_landed(dash):
+    from tools.dashboards import patch_dashboard
+
+    dash.lovelace_mutate_on_read = {3: _closed}
+
+    r = patch_dashboard("casa", "views.0.sections.0.cards.0", {"type": "markdown"}, op="insert")
+
+    assert r["error"] == "config_write_unverified"
+    assert "DID happen" in r["detail"]
+
+
+def test_entity_registry_survives_a_dropped_category_read(fake_ha, monkeypatch):
+    from tools import areas
+
+    row = next(e for e in fake_ha.registry if e["entity_id"] == "automation.morning")
+    row["categories"] = {"automation": "c1"}
+    real = areas._ws
+
+    def ws(msg):
+        if msg["type"] == "config/category_registry/list":
+            _closed()
+        return real(msg)
+
+    monkeypatch.setattr(areas, "_ws", ws)
+
+    r = areas.get_entity_registry("automation.morning")
+
+    assert r["categories"] == {"automation": {"category_id": "c1", "name": None}}
+
+
+def test_a_history_timeout_says_to_narrow_the_window(fake_ha):
+    from tools.diagnostics import get_history
+
+    fake_ha.raise_rest("/api/history/period/", httpx.ReadTimeout("timed out"))
+
+    r = get_history("sensor.power", hours=720)
+
+    assert r["error"] == "history_timeout"
+    assert "narrow" in r["detail"]
+
+
+def test_outline_docstring_mentions_the_header():
+    from tools.dashboards import get_dashboard_outline
+
+    assert "header" in get_dashboard_outline.__doc__

@@ -4,7 +4,7 @@ Home Assistant's GET /api/history/period/<start> answers for start + 1 day
 when no end_time is sent - not up to now. get_history() used not to send
 one, so any window longer than 24 h returned only its oldest day: stale
 rows for a little over 24 h, nothing at all once the window began before
-recorder retention (hours=2160 on casa, 2026-11-24). tests/fakeha.py
+recorder retention (hours=2160 on a real instance, 2026-11-24). tests/fakeha.py
 reproduces that default, so these tests fail against the old code.
 """
 from datetime import datetime, timedelta, timezone

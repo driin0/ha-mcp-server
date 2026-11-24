@@ -16,7 +16,7 @@ helpers/category_registry.py, components/config/entity_registry.py):
   category is therefore this module's job, done before anything is sent.
 """
 from tools._base import (
-    mcp, _ws, _ws_multi, envelope, error, ws_error, ws_transport_error, WsTimeout,
+    mcp, _ws, _ws_multi, envelope, error, ws_error, ws_transport_error, ws_failures,
 )
 
 CATEGORY_SCOPES = ("automation", "script", "scene", "helpers")
@@ -234,7 +234,7 @@ def delete_category(scope: str, category: str) -> dict:
 
 # What the frontend's helpers page lists by domain (frontend
 # src/data/helpers/const.ts HELPER_DOMAINS). Deliberately local: _base's
-# HELPER_DOMAINS drives list_helpers()/set_helper() and has no `schedule`.
+# HELPER_DOMAINS is what set_helper() can set, and has no `schedule`.
 _HELPER_DOMAINS = frozenset({
     "input_boolean", "input_button", "input_text", "input_number",
     "input_datetime", "input_select", "counter", "timer", "schedule",
@@ -492,7 +492,7 @@ def category_context(scope: str, category: str = "",
         msgs.append({"type": "config/entity_registry/list"})
     try:
         results = _ws_multi(msgs) if len(msgs) > 1 else [_ws(msgs[0])]
-    except (WsTimeout, OSError) as exc:
+    except ws_failures() as exc:
         if category:
             raise
         return failed(type(exc).__name__, str(exc))

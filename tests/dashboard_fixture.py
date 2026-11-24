@@ -1,4 +1,4 @@
-"""A dashboard shaped like the one on casa where cards were replaced by
+"""A dashboard shaped like a real one where cards were replaced by
 index and the neighbours were lost: a section that holds the washing
 machine block AND a clock, a scheduler and a temperature stack."""
 import copy
@@ -30,7 +30,7 @@ CASA = {
                  "name": "[[[ return states['sensor.lavatrice'].state ]]]"},
             ],
         }],
-        "badges": [{"type": "entity", "entity": "person.riccardo"}],
+        "badges": [{"type": "entity", "entity": "person.resident"}],
     }],
     "button_card_templates": {"wm_btn": {"show_icon": True}},
 }

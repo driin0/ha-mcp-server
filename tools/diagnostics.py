@@ -124,7 +124,10 @@ def get_history(entity_id: str, hours: int = 24, start: str = "", end: str = "",
 
     Errors: {error: "invalid_window"} for hours <= 0, an unparseable
     start/end, or start not before end; {error: "invalid_limit"} for a
-    negative limit. Nothing is requested in either case.
+    negative limit. Nothing is requested in either case. {error:
+    "history_timeout"} when Home Assistant could not return the window in
+    60 s: `limit` trims only after the whole window has been fetched, so a
+    long window of a busy sensor needs a narrower window, not a retry.
     """
     if limit < 0:
         return error("invalid_limit", f"limit must be >= 0 (0 = no limit), got {limit}.",
@@ -148,17 +151,28 @@ def get_history(entity_id: str, hours: int = 24, start: str = "", end: str = "",
                      f"({end_dt.isoformat()}).", entity_id=entity_id)
 
     window = {"start": start_dt.isoformat(), "end": end_dt.isoformat()}
-    with httpx.Client() as client:
-        r = client.get(
-            f"{HA_URL}/api/history/period/{window['start']}",
-            headers=HEADERS,
-            params={"filter_entity_id": entity_id, "end_time": window["end"],
-                    "minimal_response": "true"},
-            timeout=20,
-        )
-        r.raise_for_status()
-        result = r.json()
-        series = result[0] if result else []
+    try:
+        with httpx.Client() as client:
+            r = client.get(
+                f"{HA_URL}/api/history/period/{window['start']}",
+                headers=HEADERS,
+                params={"filter_entity_id": entity_id, "end_time": window["end"],
+                        "minimal_response": "true"},
+                timeout=60,
+            )
+            r.raise_for_status()
+            result = r.json()
+    except httpx.TimeoutException:
+        # Home Assistant returns the whole window and `limit` only trims it
+        # afterwards, so a month of a busy power sensor can be more than it
+        # serialises in time. Repeating the same call would time out again.
+        return error("history_timeout",
+                     f"Home Assistant did not return {entity_id}'s history between "
+                     f"{window['start']} and {window['end']} within 60 s - too many "
+                     "rows for one request. Nothing was changed; narrow the window "
+                     "(fewer hours, or start/end) rather than repeating the call.",
+                     entity_id=entity_id, window=window)
+    series = result[0] if result else []
 
     total = len(series)
     rows = series[-limit:] if limit and total > limit else series

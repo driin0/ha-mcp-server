@@ -27,8 +27,9 @@
   the right id for automations and helpers alike. Home Assistant stores
   any category id it is sent without checking it; these tools refuse an id
   or name that does not exist in the entity's scope - naming the scopes
-  where it does - and refuse entities no category page shows. Writes are
-  read back (`config_write_unverified`), in bulk too. `delete_category`
+  where it does - and refuse entities no category page shows. Every write
+  is checked against the registry entry Home Assistant returns
+  (`config_write_unverified`), in bulk too. `delete_category`
   reports the entities that lose the category.
   `list_automations`, `list_scripts`, `list_scenes` and `list_helpers`
   show each row's `category` and accept a `category` filter; an unknown
@@ -46,7 +47,8 @@
   (`config_write_unverified`), and returns the `old` value. `value` is
   required, so a forgotten argument cannot write null over a card. Setting
   or removing anything that holds other cards - a view, a section, a
-  stack, a `cards` list - is refused as `container_target`, naming every
+  stack, a `cards` list, a button-card embedding cards in `custom_fields`
+  - is refused as `container_target`, naming every
   card that would go with it, unless `replace_container=True`: matching a
   section's own `type` says nothing about what is inside it.
   `find_dashboard_cards` searches by entity, heading, type or text and

@@ -91,7 +91,7 @@ def test_filters_combine(ha):
 
 
 def test_badges_are_cards(ha):
-    assert _paths(find_dashboard_cards("casa", entity="person.riccardo")) == ["views.0.badges.0"]
+    assert _paths(find_dashboard_cards("casa", entity="person.resident")) == ["views.0.badges.0"]
 
 
 def test_unknown_dashboard(ha):

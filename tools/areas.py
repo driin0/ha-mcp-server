@@ -2,7 +2,10 @@ import json
 
 import httpx
 
-from tools._base import mcp, HA_URL, HEADERS, _ws, _ws_multi, envelope, error, ws_error, ws_transport_error
+from tools._base import (
+    mcp, HA_URL, HEADERS, _ws, _ws_multi, envelope, error, ws_error, ws_transport_error,
+    ws_failures,
+)
 
 
 @mcp.tool()
@@ -460,11 +463,16 @@ def get_entity_registry(entity_id: str) -> dict:
 
 def _named_categories(categories: dict) -> dict:
     """{scope: category_id} -> {scope: {category_id, name}}; name is null
-    when the scope's registry cannot be read or no longer has that id."""
+    when the scope's registry cannot be read (an error, a timeout, a dropped
+    connection) or no longer has that id - the names are a convenience,
+    never a reason to fail the registry read itself."""
     out = {}
     for scope, cid in categories.items():
-        r = _ws({"type": "config/category_registry/list", "scope": scope})
-        names = ({} if ws_error(r) else
+        try:
+            r = _ws({"type": "config/category_registry/list", "scope": scope})
+        except ws_failures():
+            r = None
+        names = ({} if r is None or ws_error(r) else
                  {c["category_id"]: c["name"] for c in r["result"]})
         out[scope] = {"category_id": cid, "name": names.get(cid)}
     return out

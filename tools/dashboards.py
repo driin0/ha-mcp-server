@@ -2,7 +2,7 @@ import copy
 import json
 
 from tools import _jsonpath
-from tools._base import mcp, _ws, envelope, error, ws_error, WsTimeout
+from tools._base import mcp, _ws, envelope, error, ws_error, ws_failures
 
 
 def _dashboard_id(url_path: str) -> tuple[str, dict | None]:
@@ -392,6 +392,13 @@ def _contained_cards(target, path: str) -> list[str]:
             if isinstance(node.get("card"), dict):
                 out.append(f"{at}.card ({_summary(node['card'])})")
                 walk(node["card"], f"{at}.card")
+            fields = node.get("custom_fields")
+            if isinstance(fields, dict):  # button-card embedding cards
+                for name, field in fields.items():
+                    if isinstance(field, dict) and isinstance(field.get("card"), dict):
+                        sub = f"{at}.custom_fields.{name}.card"
+                        out.append(f"{sub} ({_summary(field['card'])})")
+                        walk(field["card"], sub)
 
     def walk_list(items, at):
         for i, item in enumerate(items):
@@ -471,7 +478,8 @@ def patch_dashboard(
     "container_target" (the target holds other cards - nothing written),
     "protected_path" (path ""), "not_found" (no such dashboard, or one never
     saved), "not_editable" (YAML mode), "bad_path", "path_exists" (insert on
-    an existing key), "unexpected_target" (expect did not match - nothing
+    an existing key), Home Assistant's own error when the dashboard list
+    cannot be read (nothing written), "unexpected_target" (expect did not match - nothing
     written), "config_read_failed", "concurrent_modification" (changed
     since read - nothing written), "home_assistant_error" (the save was
     rejected - nothing written), or "config_write_unverified" (the save was
@@ -591,7 +599,7 @@ def patch_dashboard(
 
     try:
         stored, err = _read_config(url_path)
-    except WsTimeout as exc:
+    except ws_failures() as exc:
         # The save already landed. Left to propagate, this read's timeout
         # would be reported as "a read, nothing changed, safe to repeat" -
         # and a retried insert would add the card twice.
@@ -809,7 +817,8 @@ def find_dashboard_cards(url_path: str = "", entity: str = "", heading: str = ""
     kind "section" and `children` instead of siblings.
 
     Returns: {total, returned, offset, note?, matches: [...]}, or an error()
-    envelope ("missing_filter", "not_found", "config_read_failed").
+    envelope ("missing_filter", "not_found", "config_read_failed", or Home
+    Assistant's own error when the dashboard list cannot be read).
     """
     if not (entity or heading or type or text):
         return error("missing_filter", "Give at least one of entity, heading, type, text.")
@@ -898,7 +907,8 @@ def get_dashboard_outline(url_path: str = "") -> dict:
     url_path: as get_dashboard() - "" is the default dashboard.
 
     Returns: {url_path, views: [{path, title, url, sections: [{path,
-    heading, cards}], cards, badges}], root_keys, strategy?} where each
+    heading, cards}], header, cards, badges}], root_keys, unaddressable,
+    strategy?} - `header` is a sections view's header card, if any - where each
     card is {path, type, summary, depth} (depth 1+ = inside a stack or
     another card, listed right after its parent). root_keys lists the
     other top-level keys - e.g. {"button_card_templates": ["wm_btn"]}
@@ -906,7 +916,8 @@ def get_dashboard_outline(url_path: str = "") -> dict:
     `unaddressable` lists the entries whose name contains "." - no dotted
     path can reach them, so they need update_dashboard_config().
     A strategy dashboard has no stored views: `strategy` holds its config.
-    Or an error() envelope ("not_found", "config_read_failed").
+    Or an error() envelope ("not_found", "config_read_failed", or Home
+    Assistant's own error when the dashboard list cannot be read).
     """
     config, err = _load_for_reading(url_path)
     if err:
