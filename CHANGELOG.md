@@ -66,6 +66,15 @@
   `get_error_log` now falls back to the core log instead of answering
   only "not available".
 
+- **`set_entity_labels` / `bulk_set_entity_labels` no longer report a
+  label that was never stored.** Home Assistant drops label ids that do not
+  exist and still answers success, and both tools passed that success on: a
+  typo'd label silently never appeared. Every id is now checked against the
+  label registry first (`label_not_found`, with the unknown and the
+  available ids; nothing is written), and the labels Home Assistant returns
+  are compared with the ones sent (`config_write_unverified`; in bulk, the
+  entity is in `failed` and the new `reasons` map says why).
+
 - Smaller changes to existing tools:
   - `get_entity_registry` shows the entity's categories by scope, with names.
   - `list_helpers` lists `schedule` helpers, which the UI shows as helpers.

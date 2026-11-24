@@ -1752,7 +1752,8 @@ def test_bulk_set_entity_labels_reports_per_entity_failures_normally(fake_ha, mo
     result = bulk_set_entity_labels(
         ["light.bed_light", "light.totally_bogus_entity_zzz"], ["energia"])
 
-    assert result == {"total": 2, "succeeded": 1, "failed": ["light.totally_bogus_entity_zzz"]}
+    assert result == {"total": 2, "succeeded": 1, "failed": ["light.totally_bogus_entity_zzz"],
+                      "reasons": {"light.totally_bogus_entity_zzz": "Entity not found"}}
     assert "error" not in result
 
 

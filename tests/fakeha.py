@@ -236,7 +236,7 @@ class FakeHA:
         self._next_category = 0
         # Label ids the label registry knows: config/entity_registry/update
         # drops any other id it is sent.
-        self.known_labels = {"power"}
+        self.known_labels = {"power", "energia"}
         # manifest/list: what tools/categories.py reads to tell a helper
         # integration (integration_type "helper") from any other.
         self.manifests = [
@@ -558,6 +558,9 @@ class FakeHA:
             return self._ws_ok(copy.deepcopy(self.dashboards))
         if kind == "system_log/list":
             return self._ws_ok(copy.deepcopy(self.system_log))
+        if kind == "config/label_registry/list":
+            return self._ws_ok([{"label_id": lab, "name": lab.capitalize()}
+                                for lab in sorted(self.known_labels)])
         if kind == "manifest/list":
             return {"id": 1, "type": "result", "success": True, "result": self.manifests}
         if kind == "config/device_registry/list":

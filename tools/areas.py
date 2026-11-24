@@ -289,17 +289,52 @@ def get_entity_labels(entity_id: str) -> dict:
     return {"entity_id": entity_id, "labels": list(r["result"].get("labels", []))}
 
 
+def _unknown_labels(labels: list) -> dict | None:
+    """None when every id in `labels` exists in the label registry; else an
+    error() envelope - "label_not_found" naming the unknown ids and the
+    available ones, or the registry read's own error. Nothing is sent.
+
+    Home Assistant drops unknown label ids from config/entity_registry/
+    update (core PR #173438) and still answers success, so without this
+    check a typo'd label silently never appears while the tool says it did.
+    """
+    if not labels:
+        return None
+    r = _ws({"type": "config/label_registry/list"})
+    if err := ws_error(r):
+        return err
+    known = {lab["label_id"] for lab in r["result"]}
+    unknown = [lab for lab in labels if lab not in known]
+    if not unknown:
+        return None
+    return error(
+        "label_not_found",
+        f"No label with id {', '.join(map(repr, unknown))}. Label ids, not names - "
+        "use list_labels(), or create_label() first. Nothing was written.",
+        unknown=unknown, available=sorted(known))
+
+
 @mcp.tool()
-def set_entity_labels(entity_id: str, labels: list) -> dict:
+def set_entity_labels(entity_id: str, labels: list[str]) -> dict:
     """
     Set labels on an entity (replaces existing labels).
 
     labels: list of label_id strings, e.g. ["energia", "illuminazione"]
-    Use list_labels() to discover available label IDs.
+    Use list_labels() to discover available label IDs; [] removes them all.
+
+    Every id is checked against the label registry before anything is sent:
+    Home Assistant would silently drop an unknown one and still answer
+    success. The labels Home Assistant returns are then compared with the
+    ones sent.
 
     Returns: {entity_id, labels, success: true} on success, or an error()
-    envelope with Home Assistant's actual error code/message on failure.
+    envelope - "label_not_found" (with `unknown` and `available`; nothing
+    written), "config_write_unverified" (accepted, but `missing` labels are
+    not on the entity), or Home Assistant's actual error code/message.
     """
+    if err := _unknown_labels(labels):
+        err["entity_id"] = entity_id
+        return err
     r = _ws({
         "type": "config/entity_registry/update",
         "entity_id": entity_id,
@@ -307,10 +342,17 @@ def set_entity_labels(entity_id: str, labels: list) -> dict:
     })
     if err := ws_error(r):
         return err
-    entry = r["result"].get("entity_entry", {})
+    stored = list((r["result"].get("entity_entry") or {}).get("labels", []))
+    missing = [lab for lab in labels if lab not in stored]
+    if missing:
+        return error(
+            "config_write_unverified",
+            f"Home Assistant accepted the update but returned {entity_id!r} "
+            f"without {', '.join(map(repr, missing))}.",
+            entity_id=entity_id, labels=stored, missing=missing)
     return {
         "entity_id": entity_id,
-        "labels": list(entry.get("labels", labels)),
+        "labels": stored,
         "success": True,
     }
 
@@ -327,7 +369,7 @@ _BULK_LABEL_MAX = 200
 
 
 @mcp.tool()
-def bulk_set_entity_labels(entity_ids: list, labels: list) -> dict:
+def bulk_set_entity_labels(entity_ids: list[str], labels: list[str]) -> dict:
     """
     Assign labels to multiple entities at once (replaces existing labels on each entity).
 
@@ -335,11 +377,19 @@ def bulk_set_entity_labels(entity_ids: list, labels: list) -> dict:
                 list into batches; see the error this returns above that)
     labels: list of label_id strings to assign to all entities
 
-    Returns: {total, succeeded, failed: [...]} on a batch that was sent, or
-    an error() envelope ("too_many_entities" without sending anything when
-    entity_ids exceeds the 200-entity limit; otherwise ws_transport_error()'s
-    own code/detail) when the WebSocket connection itself never reached
-    Home Assistant - that is one systemic failure, not "every entity
+    The label ids are checked once against the label registry before
+    anything is sent (an unknown id fails the whole call with
+    "label_not_found"), and each entity's reply is checked for the labels
+    actually stored.
+
+    Returns: {total, succeeded, failed: [entity_id, ...], reasons?:
+    {entity_id: reason}} on a batch that was sent - `reasons` explains each
+    failed entity (Home Assistant's rejection, or config_write_unverified
+    when it answered success without the labels). Or an error() envelope:
+    "too_many_entities" (over 200, nothing sent), "label_not_found"
+    (nothing sent), the label registry's own read error, or
+    ws_transport_error()'s code/detail when the WebSocket connection itself
+    never reached Home Assistant - one systemic failure, not "every entity
     failed": see ws_transport_error()'s docstring (tools/_base.py) for why
     a batch like this cannot tell the two apart on its own.
     """
@@ -352,6 +402,8 @@ def bulk_set_entity_labels(entity_ids: list, labels: list) -> dict:
             "rather than sent in one.",
             entity_count=len(entity_ids), max_entities=_BULK_LABEL_MAX,
         )
+    if err := _unknown_labels(labels):
+        return err
     msgs = [
         {"type": "config/entity_registry/update", "entity_id": eid, "labels": labels}
         for eid in entity_ids
@@ -359,13 +411,24 @@ def bulk_set_entity_labels(entity_ids: list, labels: list) -> dict:
     results = _ws_multi(msgs)
     if results and (transport_err := ws_transport_error(results[0])):
         return transport_err
-    succeeded, failed = 0, []
+    succeeded, failed, reasons = 0, [], {}
     for eid, r in zip(entity_ids, results):
-        if r.get("success"):
-            succeeded += 1
-        else:
+        if not r.get("success"):
             failed.append(eid)
-    return {"total": len(entity_ids), "succeeded": succeeded, "failed": failed}
+            reasons[eid] = (r.get("error") or {}).get("message", "rejected")
+            continue
+        stored = ((r.get("result") or {}).get("entity_entry") or {}).get("labels", [])
+        missing = [lab for lab in labels if lab not in stored]
+        if missing:
+            failed.append(eid)
+            reasons[eid] = (f"config_write_unverified: accepted, but stored without "
+                            f"{', '.join(missing)}")
+            continue
+        succeeded += 1
+    out = {"total": len(entity_ids), "succeeded": succeeded, "failed": failed}
+    if reasons:
+        out["reasons"] = reasons
+    return out
 
 
 @mcp.tool()
