@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.5.0
 
 - **Read and edit UI-created template helpers in place:
   `get_template_helper` and `update_template_helper`.** Until now a
